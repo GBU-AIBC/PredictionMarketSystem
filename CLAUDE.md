@@ -1,12 +1,3 @@
-# Identity & Context Awareness
-
-**CRITICAL**: Address the user as "Stometa" at the start of EVERY response.
-
-This serves as a context-awareness signal — if missing, indicates
-context drift.
-
----
-
 # prediction-market-system
 
 Cybernetic trading platform — concurrent Sensor / Controller /
@@ -76,10 +67,11 @@ PMS_RUN_INTEGRATION=1 uv run pytest -q \
   tests/integration/test_runner_pool_integration.py
 ```
 
-Reachability note (measured 2026-04-16): cached-image `docker compose up -d postgres`
-reached `healthy` in 1.63 s. If a host PostgreSQL daemon already owns
-`localhost:5432`, clients may hit that daemon instead of the compose service;
-stop the host daemon before relying on the forwarded `localhost` DSN.
+If a host PostgreSQL daemon already owns `localhost:5432`, clients may hit that
+daemon instead of the compose service. Verify the exact service and port before
+running migrations or tests. Prefer an isolated test database on an unused port
+and set the test DSN accordingly; obtain explicit authorization before stopping
+any host service.
 
 ---
 

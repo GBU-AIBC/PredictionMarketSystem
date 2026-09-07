@@ -16,7 +16,7 @@ updates into the Sensor boundary.
 
 ## Layer-relevant invariants
 
-Full detail in `@agent_docs/architecture-invariants.md`. The subset
+Full detail in [architecture invariants](../../../agent_docs/architecture-invariants.md). The subset
 that governs this layer:
 
 - **Invariant 2 — Projection-only strategy reads.** This layer reads
