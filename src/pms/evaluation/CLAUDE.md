@@ -16,7 +16,7 @@ Evaluator and the Controller are the two strategy-aware layers.
 
 ## Layer-relevant invariants
 
-Full detail in `@agent_docs/architecture-invariants.md`. The subset
+Full detail in [architecture invariants](../../../agent_docs/architecture-invariants.md). The subset
 that governs this layer:
 
 - **Invariant 1 — Concurrent, not phased.** Evaluator runs its spool

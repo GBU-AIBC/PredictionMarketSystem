@@ -16,7 +16,7 @@ context drift.
 
 ## Layer-relevant invariants
 
-Full detail in `@agent_docs/architecture-invariants.md`. The subset
+Full detail in [architecture invariants](../../../agent_docs/architecture-invariants.md). The subset
 that governs this layer:
 
 - **Invariant 1 — Concurrent, not phased.** Actuator runs as an
@@ -45,14 +45,14 @@ that governs this layer:
   applies risk check, emits `ActuatorFeedback` on rejection.
 - `risk.py` — `RiskManager`: exposure caps, drawdown breaker, min
   size. Piecewise-domain logic → see promoted rule *Piecewise-
-  domain functions* in `@agent_docs/promoted-rules.md`.
+  domain functions* in [promoted rules](../../../agent_docs/promoted-rules.md).
 - `feedback.py` — `ActuatorFeedback` generates `Feedback` items
   bound for `FeedbackStore`.
 - `adapters/backtest.py` — replays fills from fixture orderbooks.
 - `adapters/paper.py` — simulated fills from live orderbook depth.
 - `adapters/polymarket.py` — gated live adapter. It first enforces the
   `live_trading_enabled` gate, validates credential presence, requires
-  first-order operator approval, then submits through an injected
+  per-order operator approval (`operator_approval_mode=every_order`), then submits through an injected
   `PolymarketClient`.
 
 ## Do not
@@ -66,7 +66,7 @@ that governs this layer:
 - Never bypass Risk Manager for "special" decisions (no "admin
   mode" override).
 - Never bypass the `live_trading_enabled` gate, credential validation,
-  or first-order operator gate in the Polymarket adapter. The config
+  or per-order operator gate in the Polymarket adapter. The config
   gate is load-bearing and must remain the first runtime check in
   `PolymarketActuator.execute`.
 - Never acquire a lock, token, or position slot without a matching
