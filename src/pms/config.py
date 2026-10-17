@@ -25,6 +25,7 @@ class MissingPolymarketCredentialsError(LiveTradingDisabledError):
 SecretSource = Literal["fly", "local_file"]
 OperatorApprovalMode = Literal["first_order", "every_order"]
 DiscoveryOrder = Literal["volume24hr", "volumeNum", "liquidityNum", "createdAt"]
+ApiScope = Literal["read", "research", "paper_operate", "kill", "live_admin"]
 
 
 _LIVE_PAPER_REPORT_GENERATOR = "scripts/paper_report.py"
@@ -401,6 +402,49 @@ class DatabaseSettings(BaseModel):
     expired_decision_retention_s: float = Field(default=24 * 60 * 60, ge=0.0)
 
 
+class ApiTokenSettings(BaseModel):
+    """A bearer token whose secret is resolved from an environment variable."""
+
+    token_id: str = Field(min_length=1, max_length=128)
+    secret: str = Field(min_length=1, max_length=256)
+    scopes: list[ApiScope] = Field(min_length=1)
+
+    @field_validator("token_id", "secret")
+    @classmethod
+    def _reject_whitespace(cls, value: str) -> str:
+        if value.strip() != value or not value:
+            raise ValueError("API token identifiers and secret environment names must be non-blank")
+        return value
+
+    @field_validator("secret")
+    @classmethod
+    def _require_environment_name(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", value):
+            raise ValueError("api_tokens.secret must be an uppercase environment variable name")
+        return value
+
+    @field_validator("scopes")
+    @classmethod
+    def _unique_scopes(cls, value: list[ApiScope]) -> list[ApiScope]:
+        if len(set(value)) != len(value):
+            raise ValueError("API token scopes must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def _require_secret_environment(self) -> Self:
+        if not os.environ.get(self.secret):
+            raise ValueError(
+                f"API token secret environment variable is missing: {self.secret}"
+            )
+        return self
+
+    def resolved_secret(self) -> str:
+        secret = os.environ.get(self.secret)
+        if not secret:
+            raise ValueError(f"API token secret environment variable is missing: {self.secret}")
+        return secret
+
+
 class PMSSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="PMS_",
@@ -423,9 +467,11 @@ class PMSSettings(BaseSettings):
     resolution_poll_interval_s: float = Field(default=300.0, gt=0.0)
     api_host: str = "127.0.0.1"
     api_token: str | None = None
+    api_tokens: list[ApiTokenSettings] = Field(default_factory=list)
     live_account_reconciliation_required: bool = True
     live_emergency_audit_path: str = ".data/live-emergency-audit.jsonl"
     live_first_order_audit_path: str = ".data/first-order-audit.jsonl"
+    live_request_audit_fallback_path: str | None = None
     live_paper_soak_report_path: str | None = None
     live_operator_rehearsal_report_path: str | None = None
     live_execution_model_path: str | None = None
@@ -452,6 +498,13 @@ class PMSSettings(BaseSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     dashboard: DashboardSettings = Field(default_factory=DashboardSettings)
     strategies: StrategyRuntimeSettings = Field(default_factory=StrategyRuntimeSettings)
+
+    @model_validator(mode="after")
+    def _validate_api_tokens(self) -> Self:
+        token_ids = [item.token_id for item in self.api_tokens]
+        if len(set(token_ids)) != len(token_ids):
+            raise ValueError("API token IDs must be unique")
+        return self
 
     @classmethod
     def load(
@@ -699,6 +752,8 @@ def _require_live_api_control_plane_auth(settings: PMSSettings) -> None:
         raise LiveTradingDisabledError(msg)
 
     if api_token is not None and api_token.strip() != "":
+        return
+    if any("live_admin" in token.scopes for token in settings.api_tokens):
         return
     msg = (
         "LIVE mode requires PMS_API_TOKEN before real-money startup, including "
@@ -1237,9 +1292,21 @@ def _require_distinct_live_audit_paths(settings: PMSSettings) -> None:
     if _path_looks_like_placeholder(settings.live_emergency_audit_path):
         msg = "LIVE emergency audit path contains placeholder"
         raise LiveTradingDisabledError(msg)
+    fallback_raw = settings.live_request_audit_fallback_path
+    if fallback_raw is not None and fallback_raw.strip() == "":
+        msg = "LIVE request-audit fallback path missing: live_request_audit_fallback_path"
+        raise LiveTradingDisabledError(msg)
+    if fallback_raw is not None and _path_looks_like_placeholder(fallback_raw):
+        msg = "LIVE request-audit fallback path contains placeholder"
+        raise LiveTradingDisabledError(msg)
 
     emergency_path = Path(settings.live_emergency_audit_path).expanduser()
     approval_audit_path = Path(first_order_path).expanduser()
+    fallback_path = (
+        Path(fallback_raw).expanduser()
+        if fallback_raw is not None
+        else emergency_path.with_name("api-request-audit-fallback.jsonl")
+    )
     _require_live_path_outside_working_tree(
         approval_audit_path,
         label="LIVE first-order audit path",
@@ -1247,6 +1314,10 @@ def _require_distinct_live_audit_paths(settings: PMSSettings) -> None:
     _require_live_path_outside_working_tree(
         emergency_path,
         label="LIVE emergency audit path",
+    )
+    _require_live_path_outside_working_tree(
+        fallback_path,
+        label="LIVE request-audit fallback path",
     )
     _require_live_path_parent_owner_writable(
         approval_audit_path,
@@ -1256,9 +1327,17 @@ def _require_distinct_live_audit_paths(settings: PMSSettings) -> None:
         emergency_path,
         label="LIVE emergency audit parent directory",
     )
+    _require_live_path_parent_owner_writable(
+        fallback_path,
+        label="LIVE request-audit fallback parent directory",
+    )
     _require_live_artifact_regular_file_or_absent(
         emergency_path,
         label="LIVE emergency audit path",
+    )
+    _require_live_artifact_regular_file_or_absent(
+        fallback_path,
+        label="LIVE request-audit fallback path",
     )
     _require_live_artifact_regular_file_or_absent(
         approval_audit_path,

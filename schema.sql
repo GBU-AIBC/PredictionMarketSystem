@@ -693,6 +693,19 @@ CREATE TABLE IF NOT EXISTS runtime_heartbeats (
 CREATE INDEX IF NOT EXISTS idx_runtime_heartbeats_run_observed
     ON runtime_heartbeats (run_id, observed_at);
 
+CREATE TABLE IF NOT EXISTS "api_request_audit" (
+    audit_id BIGSERIAL PRIMARY KEY,
+    token_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    outcome INTEGER NOT NULL CHECK (outcome BETWEEN 100 AND 599),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_request_audit_created_at
+    ON api_request_audit (created_at DESC);
+
 -- default strategy seed (Invariant 3 NULLABLE→seed pattern).
 -- load-bearing legacy bootstrap row: changing `default-v1` requires a coordinated
 -- migration of every existing inner-ring product row tagged by the pre-S5 runtime.

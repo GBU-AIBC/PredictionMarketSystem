@@ -1882,6 +1882,81 @@ class Runner:
                                 )
                             ),
                         )
+                        risk_manager = getattr(self.actuator_executor, "risk", None)
+                        risk_preview = None
+                        halt_preview = None
+                        if risk_manager is not None:
+                            # Trace a copy so persistence never changes the
+                            # live breaker or portfolio while recording the
+                            # decision's historical risk outcome.
+                            trace_risk = deepcopy(risk_manager)
+                            trace_portfolio = deepcopy(self.portfolio)
+                            check_auto_halt = getattr(trace_risk, "check_auto_halt", None)
+                            if callable(check_auto_halt):
+                                halt_preview = check_auto_halt(
+                                    trace_portfolio,
+                                    decision=deepcopy(decision),
+                                )
+                            risk_check = getattr(trace_risk, "check", None)
+                            if callable(risk_check) and not (
+                                halt_preview is not None and halt_preview.halted
+                            ):
+                                risk_preview = risk_check(
+                                    deepcopy(decision),
+                                    trace_portfolio,
+                                )
+                        if halt_preview is not None and halt_preview.halted:
+                            risk_reason = halt_preview.reason
+                        elif risk_preview is None:
+                            risk_reason = "unavailable"
+                        else:
+                            risk_reason = risk_preview.reason
+                        risk_approved = (
+                            False
+                            if halt_preview is not None and halt_preview.halted
+                            else None
+                            if risk_preview is None
+                            else risk_preview.approved
+                        )
+                        decision_evidence["decision_trace"] = {
+                            "strategy_id": decision.strategy_id,
+                            "strategy_version_id": decision.strategy_version_id,
+                            "forecasts": {
+                                "results": [
+                                    {
+                                        "model_id": decision.model_id,
+                                        "prob_estimate": decision.prob_estimate,
+                                        "expected_edge": decision.expected_edge,
+                                    }
+                                ],
+                                "model_id": decision.model_id,
+                                "prob_estimate": decision.prob_estimate,
+                                "expected_edge": decision.expected_edge,
+                            },
+                            "gates": {
+                                "status": "passed",
+                                "pre_actuator": "passed",
+                                "strict_factor_gates": self.config.controller.strict_factor_gates,
+                                "factor_snapshot_hash": factor_snapshot_hash,
+                            },
+                            "sizing": {
+                                "notional_usdc": decision.notional_usdc,
+                                "limit_price": decision.limit_price,
+                                "max_slippage_bps": decision.max_slippage_bps,
+                            },
+                            "risk": {
+                                "approved": risk_approved,
+                                "reason": risk_reason,
+                                "halted": bool(
+                                    halt_preview is not None and halt_preview.halted
+                                ),
+                                "halt_reason": (
+                                    None
+                                    if halt_preview is None or not halt_preview.halted
+                                    else halt_preview.reason
+                                ),
+                            },
+                        }
                         await self.decision_store.insert(
                             decision,
                             factor_snapshot_hash=factor_snapshot_hash,
@@ -2930,13 +3005,21 @@ class Runner:
             return
         self._persisted_halt_triggered_at = state.triggered_at
 
-    async def clear_live_halt(self, *, cleared_by: str) -> HaltState | None:
+    async def clear_live_halt(
+        self,
+        *,
+        cleared_by: str,
+        token_id: str | None = None,
+    ) -> HaltState | None:
         if self.config.mode != RunMode.LIVE:
             raise RuntimeError("halt clear is only available in LIVE mode")
         audit_writer = LiveEmergencyAuditWriter(
             Path(self.config.live_emergency_audit_path)
         )
-        await audit_writer.append_halt_clear(cleared_by=cleared_by)
+        await audit_writer.append_halt_clear(
+            cleared_by=cleared_by,
+            token_id=token_id,
+        )
         self.actuator_executor.risk.clear_halt(preserve_open_orders=True)
         self.portfolio = replace(self.portfolio, max_drawdown_pct=None)
         self._risk_peak_equity = _portfolio_equity(self.portfolio)

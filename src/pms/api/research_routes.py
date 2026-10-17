@@ -19,6 +19,7 @@ from pms.research.policies import (
 )
 from pms.research.spec_codec import deserialize_backtest_spec, deserialize_execution_config
 from pms.research.sweep import ParameterSweep, QueuedSweepRun
+from pms.core.validation import validate_finite
 
 
 _ORPHANED_FAILURE_REASON = "orphaned (worker process gone)"
@@ -343,7 +344,7 @@ def _float_field(
     if not isinstance(raw_value, (int, float)) or isinstance(raw_value, bool):
         msg = f"{key} must be numeric"
         raise TypeError(msg)
-    return float(raw_value)
+    return validate_finite(raw_value, field_name=key)
 
 
 def _load_yaml_payload(sweep_yaml: str) -> dict[str, object]:

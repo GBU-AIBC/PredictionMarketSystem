@@ -59,6 +59,30 @@ FIXTURE_PATH = Path("tests/fixtures/polymarket_7day_synthetic.jsonl")
 AUTH_HEADERS = {"Authorization": "Bearer live-api-token"}
 
 
+class _AuditConnection:
+    async def execute(self, *_args: object) -> None:
+        return
+
+
+class _AuditAcquire:
+    async def __aenter__(self) -> _AuditConnection:
+        return _AuditConnection()
+
+    async def __aexit__(self, *_args: object) -> None:
+        return
+
+
+class _AvailableAuditPool:
+    def acquire(self) -> _AuditAcquire:
+        return _AuditAcquire()
+
+    async def fetch(self, *_args: object) -> list[object]:
+        return []
+
+    async def fetchval(self, *_args: object) -> int:
+        return 1
+
+
 class ReportingFillStoreDouble:
     async def read_trades(
         self,
@@ -915,12 +939,14 @@ async def test_status_marks_market_data_stale_when_no_signal_arrives_after_start
 @pytest.mark.asyncio
 async def test_api_feedback_resolve_and_config_errors() -> None:
     runner = _runner_with_state()
+    runner.config.api_token = "live-api-token"
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
     app = create_app(runner)
     transport = httpx.ASGITransport(app=app)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        resolved = await client.post("/feedback/fb-pending/resolve")
-        missing = await client.post("/feedback/not-found/resolve")
+        resolved = await client.post("/feedback/fb-pending/resolve", headers=AUTH_HEADERS)
+        missing = await client.post("/feedback/not-found/resolve", headers=AUTH_HEADERS)
         blocked_live = await client.post(
             "/config",
             json={"mode": "live"},
@@ -940,6 +966,8 @@ async def test_api_feedback_resolve_and_config_errors() -> None:
 async def test_api_config_rejects_live_mode_when_credentials_are_missing() -> None:
     runner = _runner_with_state()
     runner.config.live_trading_enabled = True
+    runner.config.api_token = "live-api-token"
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
     app = create_app(runner)
     transport = httpx.ASGITransport(app=app)
 
@@ -961,6 +989,7 @@ async def test_api_config_validates_candidate_live_mode_readiness() -> None:
         eval_store=cast(EvalStore, InMemoryEvalStore()),
         feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
     )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
     app = create_app(runner, auto_start=False)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
 
@@ -984,6 +1013,7 @@ async def test_api_config_rejects_live_mode_without_credentialed_preflight_artif
         eval_store=cast(EvalStore, InMemoryEvalStore()),
         feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
     )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
     app = create_app(runner, auto_start=False)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
 
@@ -1033,6 +1063,7 @@ async def test_api_config_redacts_live_transition_refusal_detail(
         eval_store=cast(EvalStore, InMemoryEvalStore()),
         feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
     )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
 
     def _refuse_live_transition(settings: PMSSettings) -> None:
         assert settings.mode == RunMode.LIVE
@@ -1081,6 +1112,7 @@ async def test_api_config_rejects_live_mode_switch_while_runner_is_active() -> N
 
     task = asyncio.create_task(_pending())
     runner.sensor_stream._tasks = (task,)  # noqa: SLF001
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
     app = create_app(runner, auto_start=False)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
 
@@ -1106,6 +1138,48 @@ async def test_api_config_rejects_live_mode_switch_while_runner_is_active() -> N
 
 
 @pytest.mark.asyncio
+async def test_live_config_validation_runs_after_available_audit_sink() -> None:
+    runner = Runner(
+        config=_live_transition_settings(include_operator_readiness=False),
+        eval_store=cast(EvalStore, InMemoryEvalStore()),
+        feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
+    )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
+    app = create_app(runner, auto_start=False)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        response = await client.post("/config", json={"mode": "live"}, headers=AUTH_HEADERS)
+    assert response.status_code == 400
+    assert "operator readiness" in response.json()["detail"]
+    assert runner.config.mode == RunMode.PAPER
+
+
+@pytest.mark.asyncio
+async def test_live_start_validation_runs_after_available_audit_sink() -> None:
+    runner = Runner(
+        config=PMSSettings(
+            mode=RunMode.LIVE,
+            live_trading_enabled=True,
+            api_token="live-api-token",
+            auto_migrate_default_v2=False,
+        ),
+        eval_store=cast(EvalStore, InMemoryEvalStore()),
+        feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
+    )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
+    app = create_app(runner, auto_start=False)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        response = await client.post("/run/start", headers=AUTH_HEADERS)
+    assert response.status_code == 400
+    assert response.json()["detail"].startswith("Missing Polymarket credential fields:")
+
+
+@pytest.mark.asyncio
 async def test_api_run_start_rejects_live_mode_when_credentials_are_missing() -> None:
     runner = Runner(
         config=PMSSettings(
@@ -1117,6 +1191,7 @@ async def test_api_run_start_rejects_live_mode_when_credentials_are_missing() ->
         eval_store=cast(EvalStore, InMemoryEvalStore()),
         feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
     )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
     app = create_app(runner, auto_start=False)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
 
@@ -1144,6 +1219,7 @@ async def test_api_run_start_redacts_live_runtime_startup_refusal(
         eval_store=cast(EvalStore, InMemoryEvalStore()),
         feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
     )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
 
     async def _failing_start() -> None:
         raise exception_type(
@@ -1184,6 +1260,7 @@ async def test_api_run_start_redacts_polymarket_credentials_from_live_startup_er
         config=PMSSettings(
             mode=RunMode.LIVE,
             live_trading_enabled=True,
+            api_token="live-api-token",
             auto_migrate_default_v2=False,
             polymarket=PolymarketSettings(
                 private_key=credential_values[0],
@@ -1197,6 +1274,7 @@ async def test_api_run_start_redacts_polymarket_credentials_from_live_startup_er
         eval_store=cast(EvalStore, InMemoryEvalStore()),
         feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
     )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
 
     async def _failing_start() -> None:
         raise ConnectionError(
@@ -1242,6 +1320,7 @@ async def test_api_run_start_redacts_live_trading_disabled_error_detail(
         config=PMSSettings(
             mode=RunMode.LIVE,
             live_trading_enabled=True,
+            api_token="live-api-token",
             auto_migrate_default_v2=False,
             polymarket=PolymarketSettings(
                 private_key=credential_values[0],
@@ -1255,6 +1334,7 @@ async def test_api_run_start_redacts_live_trading_disabled_error_detail(
         eval_store=cast(EvalStore, InMemoryEvalStore()),
         feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
     )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
 
     async def _failing_start() -> None:
         raise LiveTradingDisabledError(

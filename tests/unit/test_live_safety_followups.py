@@ -1706,6 +1706,7 @@ async def test_api_reconciles_submission_unknown_incident(
     connection = _Connection()
     connection.fetchrow_result = {"decision_id": "d-unknown"}
     runner = Runner(config=PMSSettings(auto_migrate_default_v2=False))
+    runner.config.api_token = "live-api-token"
     runner._pg_pool = cast(asyncpg.Pool, _Pool(connection))  # noqa: SLF001
 
     async def fake_schema_check(pool: object) -> None:
@@ -1743,6 +1744,7 @@ async def test_api_reconcile_submission_unknown_checks_schema_before_mutation(
     connection = _Connection()
     connection.fetchrow_result = {"decision_id": "d-unknown"}
     runner = Runner(config=PMSSettings(auto_migrate_default_v2=False))
+    runner.config.api_token = "live-api-token"
     runner._pg_pool = cast(asyncpg.Pool, _Pool(connection))  # noqa: SLF001
     secret_dsn = "postgresql://admin:supersecret@db.internal.example.com:5432/pms_live"
 
@@ -1860,6 +1862,7 @@ async def test_api_rejects_open_submission_unknown_without_venue_order_id() -> N
     connection = _Connection()
     connection.fetchrow_result = {"decision_id": "d-unknown"}
     runner = Runner(config=PMSSettings(auto_migrate_default_v2=False))
+    runner.config.api_token = "live-api-token"
     runner._pg_pool = cast(asyncpg.Pool, _Pool(connection))  # noqa: SLF001
     app = create_app(runner, auto_start=False)
     transport = httpx.ASGITransport(app=app)
@@ -1887,6 +1890,7 @@ async def test_api_rejects_submission_unknown_blank_reconciled_by() -> None:
     connection = _Connection()
     connection.fetchrow_result = {"decision_id": "d-unknown"}
     runner = Runner(config=PMSSettings(auto_migrate_default_v2=False))
+    runner.config.api_token = "live-api-token"
     runner._pg_pool = cast(asyncpg.Pool, _Pool(connection))  # noqa: SLF001
     app = create_app(runner, auto_start=False)
     transport = httpx.ASGITransport(app=app)

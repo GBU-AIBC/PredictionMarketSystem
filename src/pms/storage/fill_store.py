@@ -698,11 +698,17 @@ class FillStore:
         limit: int,
         offset: int = 0,
         until: datetime | None = None,
+        run_mode: str | None = None,
     ) -> list["StoredTradeRow"]:
         async with self._pool().acquire() as connection:
             await _ensure_fill_payloads_table(connection)
             rows = await self._fetch_trade_rows(
-                connection, limit=limit, offset=offset, until=until, ascending=False
+                connection,
+                limit=limit,
+                offset=offset,
+                until=until,
+                ascending=False,
+                run_mode=run_mode,
             )
         return _trade_rows_for_api(rows)
 
@@ -765,6 +771,7 @@ class FillStore:
         offset: int,
         until: datetime | None,
         ascending: bool,
+        run_mode: str | None = None,
     ) -> list[asyncpg.Record]:
         order = (
             "fills.ts ASC, fill_payloads.payload->>'executed_at' ASC NULLS LAST, "
@@ -772,6 +779,32 @@ class FillStore:
             if ascending
             else "fills.ts DESC, fills.fill_id DESC"
         )
+        run_mode_clause = ""
+        query_args: tuple[object, ...] = (until, limit, offset)
+        if run_mode is not None:
+            run_mode_clause = """
+              AND (
+                  $4::text IS NULL
+                  OR EXISTS (
+                      SELECT 1
+                      FROM jsonb_array_elements_text(
+                          COALESCE(fill_payloads.payload->'anomaly_flags', '[]'::jsonb)
+                      ) AS flags(flag)
+                      WHERE flags.flag = 'run_mode=' || $4
+                  )
+                  OR (
+                      $4 IN ('paper', 'backtest')
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements_text(
+                              COALESCE(fill_payloads.payload->'anomaly_flags', '[]'::jsonb)
+                          ) AS flags(flag)
+                          WHERE flags.flag LIKE 'run_mode=%'
+                      )
+                  )
+              )
+            """
+            query_args = (until, limit, offset, run_mode)
         return cast(
             list[asyncpg.Record],
             await connection.fetch(
@@ -793,13 +826,12 @@ class FillStore:
             LEFT JOIN markets
                 ON markets.condition_id = fills.market_id
             WHERE ($1::timestamptz IS NULL OR fills.ts < $1)
+            {run_mode_clause}
             ORDER BY {order}
             LIMIT $2
             OFFSET $3
             """,
-            until,
-            limit,
-            offset,
+            *query_args,
             ),
         )
 
