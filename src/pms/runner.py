@@ -437,6 +437,7 @@ class Runner:
     )
     _reselection_task: asyncio.Task[None] | None = field(init=False, default=None)
     _reselection_lock: asyncio.Lock = field(init=False)
+    _market_selection_lock: asyncio.Lock = field(init=False)
     _reselection_requested: asyncio.Event = field(init=False)
     _strategy_change_callbacks_registered: bool = field(init=False, default=False)
     _active_sensors: tuple[ISensor, ...] = field(init=False, default=())
@@ -496,6 +497,7 @@ class Runner:
         self._stop_event = asyncio.Event()
         self._controller_lifecycle_lock = asyncio.Lock()
         self._reselection_lock = asyncio.Lock()
+        self._market_selection_lock = asyncio.Lock()
         self._reselection_requested = asyncio.Event()
         self._position_exit_monitor = PositionExitMonitor(self.config.position_exit)
         self._category_prior_estimator = _category_prior_estimator_from_settings(
@@ -703,19 +705,10 @@ class Runner:
             self._active_sensors = self._build_sensors()
             self._wire_active_perception(self._active_sensors)
             await self._configure_controllers()
-            # Keep lightweight test doubles and older embeddings that expose
-            # the original one-argument `start` seam compatible while the
-            # concrete stream receives supervised task creation.
-            if (
-                "task_factory"
-                in inspect.signature(self.sensor_stream.start).parameters
-            ):
-                await self.sensor_stream.start(
-                    self._active_sensors,
-                    task_factory=self._supervised_sensor_task,
-                )
-            else:
-                await self.sensor_stream.start(self._active_sensors)
+            await self.sensor_stream.start(
+                self._active_sensors,
+                task_factory=self._supervised_sensor_task,
+            )
             await self._evaluator_spool.start()
             self._controller_task = self._supervisor.spawn(
                 self._worker_spec(
@@ -1184,7 +1177,10 @@ class Runner:
         self._market_selector = MarketSelector(
             PostgresMarketDataStore(
                 self._pg_pool,
-                market_freshness_s=3.0 * self.config.sensor.poll_interval_s,
+                market_freshness_s=max(
+                    3.0 * self.config.sensor.poll_interval_s,
+                    300.0,
+                ),
             ),
             self._strategy_registry,
             UnionMergePolicy(),
@@ -3060,16 +3056,16 @@ class Runner:
         subscription_controller = self._subscription_controller
         if selector is None or subscription_controller is None:
             return
-        async with self._reselection_lock:
+        # Serialize selector reads without holding the subscription lock; the
+        # DB pool may wait here, while the bounded websocket update below does
+        # not hold a pool-backed lock.
+        async with self._market_selection_lock:
             result = await selector.select()
-            user_asset_ids = cast(
-                frozenset[str],
-                getattr(selector, "last_user_subscription_asset_ids", frozenset()),
-            )
-            protected_asset_ids = [
-                *_open_position_token_ids(self.portfolio),
-                *sorted(user_asset_ids),
-            ]
+        protected_asset_ids = [
+            *_open_position_token_ids(self.portfolio),
+            *sorted(_selector_user_subscription_asset_ids(selector)),
+        ]
+        async with self._reselection_lock:
             await subscription_controller.update(
                 _cap_subscription_asset_ids(
                     list(result.asset_ids),
@@ -3347,14 +3343,7 @@ class Runner:
                 for asset_id in asset_ids
             }
         )
-        user_asset_ids = cast(
-            frozenset[str],
-            getattr(
-                self._market_selector,
-                "last_user_subscription_asset_ids",
-                frozenset(),
-            ),
-        )
+        selector = self._market_selector
         async with self._reselection_lock:
             await subscription_controller.update(
                 _cap_subscription_asset_ids(
@@ -3362,7 +3351,11 @@ class Runner:
                     self.config,
                     protected_asset_ids=[
                         *_open_position_token_ids(self.portfolio),
-                        *sorted(user_asset_ids),
+                        *(
+                            sorted(_selector_user_subscription_asset_ids(selector))
+                            if selector is not None
+                            else []
+                        ),
                     ],
                 )
             )
@@ -3766,6 +3759,19 @@ def _find_subscription_sink(
         if callable(update_subscription):
             return cast(SubscriptionManagedSensor, sensor)
     return None
+
+
+def _selector_user_subscription_asset_ids(
+    selector: MarketSelectorLike,
+) -> frozenset[str]:
+    value: object = getattr(
+        selector,
+        "last_user_subscription_asset_ids",
+        frozenset(),
+    )
+    if isinstance(value, frozenset):
+        return cast(frozenset[str], value)
+    return frozenset(cast(Sequence[str], value))
 
 
 def _matches_strategy_scope(

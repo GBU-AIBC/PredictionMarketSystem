@@ -480,7 +480,7 @@ class PostgresMarketDataStore:
           AND COALESCE(markets.closed, false) = false
           AND COALESCE(markets.active, true) = true
           AND markets.last_seen_at >= (
-                $2 - ($5::double precision * INTERVAL '1 second')
+                $2::timestamptz - ($5::double precision * INTERVAL '1 second')
           )
           AND (
                 (

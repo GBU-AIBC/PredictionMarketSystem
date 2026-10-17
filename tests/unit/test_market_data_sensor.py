@@ -811,6 +811,43 @@ async def test_market_data_sensor_survives_persistence_type_errors(
 
 
 @pytest.mark.asyncio
+async def test_market_data_sensor_fails_after_repeated_persistence_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store_mock()
+    store_mock = cast(StoreMock, store)
+    store_mock.write_book_snapshot_mock.side_effect = TypeError("poison frame")
+    payload = json.dumps(
+        {
+            "event_type": "book",
+            "market": "m-poison",
+            "asset_id": "asset-poison",
+            "timestamp": "1757908892351",
+            "hash": "book-poison",
+            "bids": [{"price": "0.48", "size": "30"}],
+            "asks": [{"price": "0.52", "size": "25"}],
+        }
+    )
+    monkeypatch.setattr(
+        "pms.sensor.adapters.market_data.connect",
+        ConnectSequence([FakeWebSocket([payload]) for _ in range(5)]),
+    )
+    sensor = MarketDataSensor(
+        store=store,
+        ws_url="ws://market-data.example.test",
+        asset_ids=["asset-poison"],
+    )
+    sensor._INITIAL_BACKOFF_S = 0.0
+    iterator = cast(Any, sensor.__aiter__())
+
+    with pytest.raises(SensorDataQualityError, match="consecutive"):
+        await asyncio.wait_for(anext(iterator), timeout=0.5)
+
+    assert sensor.consecutive_data_error_reconnects == 5
+    await sensor.aclose()
+
+
+@pytest.mark.asyncio
 async def test_market_data_sensor_skips_malformed_json_and_continues_loop(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

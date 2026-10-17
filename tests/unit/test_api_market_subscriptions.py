@@ -19,6 +19,7 @@ from pms.storage.market_subscription_store import MarketSubscriptionRow
 class _SubscriptionStoreDouble:
     upsert_results: list[MarketSubscriptionRow | None] = field(default_factory=list)
     delete_results: list[bool] = field(default_factory=list)
+    user_subscription_results: list[set[str]] = field(default_factory=list)
     upsert_calls: list[str] = field(default_factory=list)
     delete_calls: list[str] = field(default_factory=list)
 
@@ -34,6 +35,8 @@ class _SubscriptionStoreDouble:
         return self.delete_results.pop(0)
 
     async def read_user_subscriptions(self) -> set[str]:
+        if self.user_subscription_results:
+            return self.user_subscription_results.pop(0)
         return set()
 
 
@@ -74,6 +77,13 @@ async def test_subscribe_endpoint_upserts_user_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _SubscriptionStoreDouble(upsert_results=[_row()])
+    reselection_calls: list[str] = []
+
+    async def request_reselection(self: Runner) -> None:
+        del self
+        reselection_calls.append("subscribe")
+
+    monkeypatch.setattr(Runner, "_request_reselection", request_reselection)
     app = _app(monkeypatch, store)
 
     async with httpx.AsyncClient(
@@ -87,8 +97,10 @@ async def test_subscribe_endpoint_upserts_user_row(
         "token_id": "token-yes",
         "source": "user",
         "created_at": "2026-04-24T09:00:00+00:00",
+        "effective": True,
     }
     assert store.upsert_calls == ["token-yes"]
+    assert reselection_calls == ["subscribe"]
 
 
 @pytest.mark.asyncio
@@ -112,6 +124,7 @@ async def test_subscribe_endpoint_idempotent_returns_200(
         "token_id": "token-yes",
         "source": "user",
         "created_at": "2026-04-24T09:00:00+00:00",
+        "effective": True,
     }
     assert store.upsert_calls == ["token-yes", "token-yes"]
 
@@ -139,6 +152,13 @@ async def test_unsubscribe_endpoint_deletes_row_returns_true(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _SubscriptionStoreDouble(delete_results=[True])
+    reselection_calls: list[str] = []
+
+    async def request_reselection(self: Runner) -> None:
+        del self
+        reselection_calls.append("unsubscribe")
+
+    monkeypatch.setattr(Runner, "_request_reselection", request_reselection)
     app = _app(monkeypatch, store)
 
     async with httpx.AsyncClient(
@@ -150,6 +170,7 @@ async def test_unsubscribe_endpoint_deletes_row_returns_true(
     assert response.status_code == 200
     assert response.json() == {"token_id": "token-yes", "deleted": True}
     assert store.delete_calls == ["token-yes"]
+    assert reselection_calls == ["unsubscribe"]
 
 
 @pytest.mark.asyncio
@@ -197,3 +218,25 @@ async def test_subscribe_endpoint_emits_structured_log(
     assert getattr(records[0], "condition_id") == "market-1"
     assert getattr(records[0], "request_method") == "POST"
     assert getattr(records[0], "request_path") == "/markets/token-yes/subscribe"
+
+
+@pytest.mark.asyncio
+async def test_subscribe_endpoint_surfaces_pin_dropped_by_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = {f"token-{index}" for index in range(3)}
+    store = _SubscriptionStoreDouble(
+        upsert_results=[_row(token_id="token-yes")],
+        user_subscription_results=[rows],
+    )
+    app = _app(monkeypatch, store)
+    app.state.runner.config.sensor.max_subscription_asset_ids = 2
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post("/markets/token-yes/subscribe")
+
+    assert response.status_code == 200
+    assert response.json()["effective"] is False

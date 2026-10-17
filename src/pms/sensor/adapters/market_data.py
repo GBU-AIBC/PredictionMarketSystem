@@ -56,13 +56,12 @@ class MarketDataSensor:
     # silently drops the subscription.
     _INITIAL_BACKOFF_S = 1.0
     _DEFAULT_MAX_RECONNECT_INTERVAL_S = 60.0
-    _POOL_SATURATION_S = 0.1
-    _POOL_RETRY_BACKOFF_S = 0.05
     _HEARTBEAT_INTERVAL_S = 10.0
     _PONG_TIMEOUT_S = 15.0
     _WATCHDOG_TIMEOUT_S = 120.0
     _CLOSE_TIMEOUT_S = 1.0
     _DEFAULT_MAX_MESSAGE_SIZE_BYTES = 8 * 1024 * 1024
+    _MAX_CONSECUTIVE_DATA_ERROR_RECONNECTS = 5
 
     def __init__(
         self,
@@ -93,6 +92,7 @@ class MarketDataSensor:
             maxlen=_MALFORMED_RATE_WINDOW_SIZE
         )
         self._malformed_rate_threshold = _MALFORMED_RATE_THRESHOLD_DEFAULT
+        self._consecutive_data_error_reconnects = 0
         self._last_malformed_warning_at_s = -_MALFORMED_WARNING_RATE_LIMIT_S
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._watchdog = SensorWatchdog(
@@ -135,6 +135,10 @@ class MarketDataSensor:
     def malformed_rate_threshold(self, value: float) -> None:
         self._malformed_rate_threshold = value
 
+    @property
+    def consecutive_data_error_reconnects(self) -> int:
+        return self._consecutive_data_error_reconnects
+
     def __aiter__(self) -> AsyncIterator[MarketSignal]:
         return self._iterate()
 
@@ -170,8 +174,10 @@ class MarketDataSensor:
                                 )
                             self._connected_once = True
                             async for raw_message in websocket:
+                                signals = await self._handle_raw_message(raw_message)
                                 connection_had_data = True
-                                for signal in await self._handle_raw_message(raw_message):
+                                self._consecutive_data_error_reconnects = 0
+                                for signal in signals:
                                     yield signal
                         finally:
                             heartbeat_task.cancel()
@@ -198,6 +204,20 @@ class MarketDataSensor:
                     ValueError,
                     TypeError,
                 ) as error:
+                    is_data_error = isinstance(
+                        error,
+                        (SensorDataQualityError, ValueError, TypeError),
+                    )
+                    if is_data_error:
+                        self._consecutive_data_error_reconnects += 1
+                        if (
+                            self._consecutive_data_error_reconnects
+                            >= self._MAX_CONSECUTIVE_DATA_ERROR_RECONNECTS
+                        ):
+                            raise SensorDataQualityError(
+                                "market data sensor exceeded consecutive "
+                                "data-error reconnect limit"
+                            ) from error
                     if isinstance(error, SensorDataQualityError):
                         self._malformed_message_window.clear()
                         logger.warning(
@@ -500,13 +520,6 @@ class MarketDataSensor:
             self._market_signal_metadata[market_id] = normalized
         return normalized
 
-    async def _send_subscription(self) -> None:
-        async with self._send_lock:
-            websocket = self._websocket
-            if websocket is None:
-                return
-            await self._send_subscription_locked(websocket)
-
     async def _send_subscription_locked(self, websocket: Any) -> None:
         await websocket.send(json.dumps(_subscription_payload(self._asset_ids)))
 
@@ -530,22 +543,6 @@ class MarketDataSensor:
                 if not _is_unsupported_connect_kwarg_error(exc):
                     raise
         return connect(self.ws_url)
-
-    async def _send_subscription_update(
-        self,
-        *,
-        previous_asset_ids: frozenset[str],
-        next_asset_ids: list[str],
-    ) -> None:
-        async with self._send_lock:
-            websocket = self._websocket
-            if websocket is None:
-                return
-            await self._send_subscription_update_locked(
-                websocket=websocket,
-                previous_asset_ids=previous_asset_ids,
-                next_asset_ids=next_asset_ids,
-            )
 
     async def _send_subscription_update_locked(
         self,

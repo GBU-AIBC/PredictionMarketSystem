@@ -136,6 +136,16 @@ async def test_read_eligible_markets_filters_by_venue_and_horizon_and_keeps_null
         volume_24h=2_000.0,
         closed=True,
     )
+    stale_open = _market(
+        condition_id="market-stale-open",
+        venue="polymarket",
+        resolves_at=now + timedelta(days=3),
+        created_at=now,
+        last_seen_at=now - timedelta(hours=1),
+        volume_24h=2_000.0,
+        active=True,
+        closed=False,
+    )
 
     for market in (
         future_in_horizon,
@@ -145,6 +155,7 @@ async def test_read_eligible_markets_filters_by_venue_and_horizon_and_keeps_null
         other_venue,
         low_volume,
         stale_closed,
+        stale_open,
     ):
         await store.write_market(market)
 

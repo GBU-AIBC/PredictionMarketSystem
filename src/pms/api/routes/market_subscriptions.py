@@ -33,6 +33,7 @@ class SubscribeMarketResponse(BaseModel):
     token_id: str
     source: str
     created_at: str
+    effective: bool
 
 
 class UnsubscribeMarketResponse(BaseModel):
@@ -45,6 +46,7 @@ async def subscribe_market(
     *,
     token_id: str,
     request_metadata: Mapping[str, object],
+    max_subscription_asset_ids: int | None = None,
 ) -> SubscribeMarketResponse:
     row = await store.upsert_user_subscription(token_id)
     if row is None:
@@ -56,10 +58,18 @@ async def subscribe_market(
         condition_id=row.condition_id,
         request_metadata=request_metadata,
     )
+    effective = True
+    if max_subscription_asset_ids is not None:
+        active_ids = sorted(await store.read_user_subscriptions())
+        effective = (
+            not active_ids
+            or token_id in active_ids[:max_subscription_asset_ids]
+        )
     return SubscribeMarketResponse(
         token_id=row.token_id,
         source=row.source,
         created_at=row.created_at.isoformat(),
+        effective=effective,
     )
 
 
