@@ -917,7 +917,9 @@ class Runner:
                 PostgresMarketDataStore(self._pg_pool)
             )
         h1_strategy = (
-            build_h1_flb_strategy()
+            build_h1_flb_strategy(
+                time_in_force=self.config.controller.time_in_force,
+            )
             if strategy_id == H1_FLB_STRATEGY_ID
             else None
         )
@@ -1046,7 +1048,10 @@ class Runner:
         else:
             resolved_market_reader = market_reader
 
-        ripple_strategy = build_ripple_strategy(strategy_id)
+        ripple_strategy = build_ripple_strategy(
+            strategy_id,
+            time_in_force=self.config.controller.time_in_force,
+        )
         _verify_runtime_strategy_version(
             ripple_strategy,
             strategy_version_id,
@@ -1126,7 +1131,10 @@ class Runner:
             )
             raise RuntimeError(msg)
 
-        anchoring_strategy = build_anchoring_strategy(strategy_id)
+        anchoring_strategy = build_anchoring_strategy(
+            strategy_id,
+            time_in_force=self.config.controller.time_in_force,
+        )
         _verify_runtime_strategy_version(
             anchoring_strategy,
             strategy_version_id,

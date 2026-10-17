@@ -24,6 +24,7 @@ def build_h1_flb_strategy(
     *,
     calibration_csv_sha256: str | None = None,
     calibration_source_label: str | None = None,
+    time_in_force: str = "GTC",
 ) -> Strategy:
     metadata: tuple[tuple[str, str], ...] = (
         ("owner", "system"),
@@ -43,7 +44,7 @@ def build_h1_flb_strategy(
         ("entry_execution_cost_bps", str(H1_FLB_ENTRY_EXECUTION_COST_BPS)),
         ("fee_rate", str(H1_FLB_FEE_RATE)),
         ("max_slippage_bps", str(H1_FLB_MAX_SLIPPAGE_BPS)),
-        ("time_in_force", "GTC"),
+        ("time_in_force", time_in_force.upper()),
         ("min_expected_edge", str(H1_FLB_MIN_EXPECTED_EDGE)),
         ("longshot_yes_threshold", str(H1_FLB_LONGSHOT_THRESHOLD)),
         ("favorite_yes_threshold", str(H1_FLB_FAVORITE_THRESHOLD)),

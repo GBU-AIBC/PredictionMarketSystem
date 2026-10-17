@@ -37,7 +37,11 @@ ANCHORING_DEFAULT_MAX_SLIPPAGE_BPS = 50
 ANCHORING_DEFAULT_TIME_IN_FORCE = TimeInForce.GTC
 
 
-def build_anchoring_strategy(strategy_id: str) -> Strategy:
+def build_anchoring_strategy(
+    strategy_id: str,
+    *,
+    time_in_force: str = "GTC",
+) -> Strategy:
     """Build the immutable projection that owns H2 runtime economics."""
     return Strategy(
         config=StrategyConfig(
@@ -50,7 +54,7 @@ def build_anchoring_strategy(strategy_id: str) -> Strategy:
                 ("min_expected_edge", str(ANCHORING_DEFAULT_MIN_EXPECTED_EDGE)),
                 ("decay_window_hours", str(DEFAULT_DECAY_WINDOW_HOURS)),
                 ("max_slippage_bps", str(ANCHORING_DEFAULT_MAX_SLIPPAGE_BPS)),
-                ("time_in_force", ANCHORING_DEFAULT_TIME_IN_FORCE.value),
+                ("time_in_force", time_in_force.upper()),
             ),
         ),
         risk=RiskParams(

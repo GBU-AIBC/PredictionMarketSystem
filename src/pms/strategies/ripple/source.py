@@ -86,7 +86,7 @@ RIPPLE_FACTOR_REQUIREMENTS: tuple[FactorCompositionStep, ...] = (
 )
 
 
-def build_ripple_strategy(strategy_id: str) -> Strategy:
+def build_ripple_strategy(strategy_id: str, *, time_in_force: str = "GTC") -> Strategy:
     """Build the immutable projection that owns Ripple's runtime economics."""
     return Strategy(
         config=StrategyConfig(
@@ -97,7 +97,7 @@ def build_ripple_strategy(strategy_id: str) -> Strategy:
                 ("prior_strength", str(RIPPLE_DEFAULT_PRIOR_STRENGTH)),
                 ("min_expected_edge", str(RIPPLE_DEFAULT_MIN_EXPECTED_EDGE)),
                 ("max_slippage_bps", str(RIPPLE_DEFAULT_MAX_SLIPPAGE_BPS)),
-                ("time_in_force", RIPPLE_DEFAULT_TIME_IN_FORCE.value),
+                ("time_in_force", time_in_force.upper()),
             ),
         ),
         risk=RiskParams(
