@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 import os
 import uuid
 from typing import Any, cast
@@ -17,10 +18,18 @@ from pms.research.specs import (
 )
 from pms.research.execution import BacktestExecutionSimulator
 from pms.research.runner import (
-    _StrategyAccumulator,
-    _fill_from_order,
-    _signal_with_replay_resolution,
+    BacktestRunner,
 )
+from pms.strategies.projections import (
+    ActiveStrategy,
+    EvalSpec,
+    ForecasterSpec,
+    MarketSelectionSpec,
+    RiskParams,
+    StrategyConfig,
+)
+from pms.core.enums import TimeInForce
+from pms.core.models import Opportunity, Portfolio, TradeDecision
 from pms.storage.market_resolution_store import MarketResolutionStore
 from pms.storage.market_data_store import PostgresMarketDataStore
 from tests.integration.test_market_data_store import (
@@ -133,6 +142,138 @@ async def _collect_signals(
     return signals
 
 
+class _ReplayPipeline:
+    def __init__(self, strategy_id: str, strategy_version_id: str) -> None:
+        self.strategy_id = strategy_id
+        self.strategy_version_id = strategy_version_id
+        self._emitted = False
+
+    async def on_signal(
+        self,
+        signal: Any,
+        portfolio: Portfolio | None = None,
+    ) -> tuple[Opportunity, TradeDecision] | None:
+        del portfolio
+        if self._emitted:
+            return None
+        self._emitted = True
+        opportunity = Opportunity(
+            opportunity_id="opp-replay-resolution-c1",
+            market_id=signal.market_id,
+            token_id=signal.token_id,
+            side="yes",
+            selected_factor_values={},
+            expected_edge=0.2,
+            rationale="real replay acceptance",
+            target_size_usdc=10.0,
+            expiry=signal.resolves_at,
+            staleness_policy="research",
+            strategy_id=self.strategy_id,
+            strategy_version_id=self.strategy_version_id,
+            created_at=signal.fetched_at,
+        )
+        return opportunity, TradeDecision(
+            decision_id="decision-replay-resolution-c1",
+            market_id=signal.market_id,
+            token_id=signal.token_id,
+            venue=signal.venue,
+            side="BUY",
+            notional_usdc=10.0,
+            order_type="limit",
+            max_slippage_bps=50,
+            stop_conditions=[],
+            prob_estimate=0.7,
+            expected_edge=0.2,
+            time_in_force=TimeInForce.IOC,
+            opportunity_id=opportunity.opportunity_id,
+            strategy_id=self.strategy_id,
+            strategy_version_id=self.strategy_version_id,
+            limit_price=0.6,
+        )
+
+
+class _ReplayPipelineFactory:
+    def __init__(self) -> None:
+        self.pipeline = _ReplayPipeline("alpha", "v1")
+
+    def build(self, strategy: ActiveStrategy) -> _ReplayPipeline:
+        assert strategy.strategy_id == "alpha"
+        return self.pipeline
+
+
+def _active_strategy() -> ActiveStrategy:
+    return ActiveStrategy(
+        strategy_id="alpha",
+        strategy_version_id="v1",
+        config=StrategyConfig(
+            strategy_id="alpha",
+            factor_composition=(),
+            metadata=(("owner", "integration"),),
+        ),
+        risk=RiskParams(
+            max_position_notional_usdc=100.0,
+            max_daily_drawdown_pct=2.5,
+            min_order_size_usdc=1.0,
+        ),
+        eval_spec=EvalSpec(metrics=("brier", "pnl")),
+        forecaster=ForecasterSpec(forecasters=(("rules", ()),)),
+        market_selection=MarketSelectionSpec(
+            venue="polymarket",
+            resolution_time_max_horizon_days=7,
+            volume_min_usdc=100.0,
+        ),
+    )
+
+
+async def _insert_runner_row(
+    pool: asyncpg.Pool,
+    *,
+    run_id: str,
+    market_id: str,
+) -> None:
+    payload = {
+        "strategy_versions": [["alpha", "v1"]],
+        "dataset": {
+            "source": "postgresql",
+            "version": "outer-ring-v1",
+            "coverage_start": "2026-03-01T00:00:00+00:00",
+            "coverage_end": "2026-03-31T23:59:00+00:00",
+            "market_universe_filter": {"venue": "polymarket", "market_ids": [market_id]},
+            "data_quality_gaps": [],
+        },
+        "execution_model": {
+            "fee_rate": 0.0,
+            "slippage_bps": 5.0,
+            "latency_ms": 0.0,
+            "staleness_ms": 60000.0,
+            "fill_policy": "immediate_or_cancel",
+        },
+        "risk_policy": {
+            "max_position_notional_usdc": 100.0,
+            "max_daily_drawdown_pct": 2.5,
+            "min_order_size_usdc": 1.0,
+        },
+        "date_range_start": "2026-03-01T00:00:00+00:00",
+        "date_range_end": "2026-03-31T23:59:00+00:00",
+    }
+    async with pool.acquire() as connection:
+        await connection.execute(
+            """
+            INSERT INTO backtest_runs (
+                run_id, spec_hash, status, strategy_ids,
+                date_range_start, date_range_end, exec_config_json, spec_json
+            ) VALUES ($1::uuid, $2, 'queued', $3::text[], $4, $5, $6::jsonb, $7::jsonb)
+            """,
+            run_id,
+            f"spec-{run_id}",
+            ["alpha"],
+            datetime(2026, 3, 1, tzinfo=UTC),
+            datetime(2026, 3, 31, 23, 59, tzinfo=UTC),
+            '{"chunk_days": 7, "time_budget": 1800}',
+            json.dumps(payload),
+        )
+
+
 @pytest.mark.asyncio(loop_scope="session")
 async def test_market_universe_replay_engine_streams_ordered_market_signals(
     pg_pool: asyncpg.Pool,
@@ -171,12 +312,7 @@ async def test_market_universe_replay_engine_streams_ordered_market_signals(
 async def test_real_replay_ioc_fill_scores_brier_and_pnl_from_market_resolution(
     pg_pool: asyncpg.Pool,
 ) -> None:
-    """Replay labels join only for scoring, including immediate IOC fills."""
-    from types import SimpleNamespace
-    from pms.core.enums import TimeInForce
-    from pms.core.models import TradeDecision
-    from pms.research.replay import MarketUniverseReplayEngine
-
+    """BacktestRunner + real replay engine persist point-in-time labels."""
     market_id = "market-replay-resolution-c1"
     token_id = "token-replay-resolution-c1"
     store = PostgresMarketDataStore(pg_pool)
@@ -186,60 +322,71 @@ async def test_real_replay_ioc_fill_scores_brier_and_pnl_from_market_resolution(
         resolved_outcome=1.0,
         source="test",
     )
-    spec = _spec(market_id=market_id)
+    run_id = str(uuid.uuid4())
+    await _insert_runner_row(pg_pool, run_id=run_id, market_id=market_id)
+    from pms.research.replay import MarketUniverseReplayEngine
+
     engine = MarketUniverseReplayEngine(pool=pg_pool)
-    signal = (await _collect_signals(
-        engine,
-        spec,
-        BacktestExecutionConfig(chunk_days=7),
-    ))[0]
-    scoring_signal = _signal_with_replay_resolution(signal, engine)
-    decision = TradeDecision(
-        decision_id="decision-replay-resolution-c1",
+    runner = BacktestRunner(
+        writable_pool=pg_pool,
+        readonly_pool=pg_pool,
+        replay_engine=engine,
+        execution_simulator=BacktestExecutionSimulator(replay_engine=engine),
+        strategy_loader=lambda _keys: _load_one_strategy(),
+        controller_factory=_ReplayPipelineFactory(),
+    )
+    assert await runner.execute(run_id) is True
+    async with pg_pool.acquire() as connection:
+        row = await connection.fetchrow(
+            """
+            SELECT brier, pnl_cum
+            FROM strategy_runs
+            WHERE run_id = $1::uuid AND strategy_id = 'alpha'
+            """,
+            run_id,
+        )
+    assert row is not None
+    assert row["brier"] is not None
+    assert row["pnl_cum"] is not None
+
+
+async def _load_one_strategy() -> list[ActiveStrategy]:
+    return [_active_strategy()]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_real_replay_backtest_fails_when_resolution_label_is_removed(
+    pg_pool: asyncpg.Pool,
+) -> None:
+    """The acceptance path must fail closed when the resolution join is absent."""
+    market_id = "market-replay-resolution-c1-mutant"
+    await _seed_replay_rows(
+        PostgresMarketDataStore(pg_pool),
         market_id=market_id,
-        token_id=token_id,
-        venue="polymarket",
-        side="BUY",
-        notional_usdc=10.0,
-        order_type="limit",
-        max_slippage_bps=50,
-        stop_conditions=[],
-        prob_estimate=0.7,
-        expected_edge=0.2,
-        time_in_force=TimeInForce.IOC,
-        opportunity_id="opportunity-replay-resolution-c1",
-        strategy_id="alpha",
-        strategy_version_id="v1",
-        limit_price=0.6,
+        token_id="token-replay-resolution-c1-mutant",
     )
-    order_state = await BacktestExecutionSimulator(replay_engine=engine).execute(
-        signal=signal,
-        decision=decision,
-        execution_model=spec.execution_model,
+    run_id = str(uuid.uuid4())
+    await _insert_runner_row(pg_pool, run_id=run_id, market_id=market_id)
+    from pms.research.replay import MarketUniverseReplayEngine
+
+    engine = MarketUniverseReplayEngine(pool=pg_pool)
+    runner = BacktestRunner(
+        writable_pool=pg_pool,
+        readonly_pool=pg_pool,
+        replay_engine=engine,
+        execution_simulator=BacktestExecutionSimulator(replay_engine=engine),
+        strategy_loader=lambda _keys: _load_one_strategy(),
+        controller_factory=_ReplayPipelineFactory(),
     )
-    fill = _fill_from_order(
-        order_state,
-        decision=decision,
-        signal=scoring_signal,
-        prior_filled_notional_usdc=0.0,
-        prior_filled_quantity=0.0,
-        execution_model=spec.execution_model,
-    )
-    assert fill is not None
-    accumulator = _StrategyAccumulator(
-        strategy_id="alpha",
-        strategy_version_id="v1",
-        execution_model=spec.execution_model,
-    )
-    accumulator.record_decision(
-        signal=scoring_signal,
-        opportunity=SimpleNamespace(side="yes"),
-        decision=decision,
-    )
-    accumulator.record_fill(signal=scoring_signal, decision=decision, fill=fill)
-    args = accumulator.as_insert_args(run_id="run-replay-resolution-c1")
-    assert args[8] is not None
-    assert args[9] is not None
+    assert await runner.execute(run_id) is False
+    async with pg_pool.acquire() as connection:
+        row = await connection.fetchrow(
+            "SELECT status, failure_reason FROM backtest_runs WHERE run_id = $1::uuid",
+            run_id,
+        )
+    assert row is not None
+    assert row["status"] == "failed"
+    assert "required resolution labels" in row["failure_reason"]
 
 
 @pytest.mark.asyncio(loop_scope="session")
