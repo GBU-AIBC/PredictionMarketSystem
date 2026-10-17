@@ -10,7 +10,12 @@ from typing import Any, cast
 
 import asyncpg
 
-from pms.core.validation import validate_finite, validate_positive, validate_price
+from pms.core.validation import (
+    notional_matches_quantity_price,
+    validate_finite,
+    validate_positive,
+    validate_price,
+)
 
 
 _CREATE_FILL_PAYLOADS_TABLE = """
@@ -147,6 +152,14 @@ class SubmissionUnknownReconciliationStore:
                 fee_bps = int(validate_finite(fee_bps, field_name="fee_bps"))
                 if fee_bps < 0:
                     raise ValueError("fee_bps must be >= 0")
+            if not notional_matches_quantity_price(
+                quantity=fill_quantity,
+                notional=fill_notional_usdc,
+                price=fill_price,
+            ):
+                raise ValueError(
+                    "fill_notional_usdc does not match fill_quantity * fill_price"
+                )
             filled_at = filled_at or datetime.now(tz=UTC)
         async with self.pool.acquire() as connection:
             async with connection.transaction():

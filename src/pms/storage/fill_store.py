@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 import json
 import logging
 import math
@@ -13,6 +13,7 @@ import asyncpg
 
 from pms.core.enums import Side
 from pms.core.validation import (
+    notional_matches_quantity_price,
     validate_notional,
     validate_positive,
     validate_price,
@@ -28,10 +29,6 @@ CREATE TABLE IF NOT EXISTS fill_payloads (
 """
 
 logger = logging.getLogger(__name__)
-
-_NOTIONAL_TOLERANCE_USDC = Decimal("0.01")
-_NOTIONAL_TOLERANCE_RATIO = Decimal("0.005")
-
 
 @dataclass
 class FillStore:
@@ -1232,28 +1229,11 @@ def _notional_matches_price(
     keeps tolerance proportional for larger fills. Decimal arithmetic avoids
     binary float drift at this trust boundary.
     """
-    try:
-        quantity_dec = Decimal(
-            str(validate_positive(quantity, field_name="fill_quantity"))
-        )
-        notional_dec = Decimal(
-            str(validate_notional(notional, field_name="fill_notional_usdc"))
-        )
-        price_dec = Decimal(str(validate_price(price, field_name="fill_price")))
-    except (
-        InvalidOperation,
-        RuntimeError,
-        TypeError,
-        ValueError,
-        json.JSONDecodeError,
-    ):
-        return False
-    expected = quantity_dec * price_dec
-    tolerance = max(
-        _NOTIONAL_TOLERANCE_USDC,
-        abs(expected) * _NOTIONAL_TOLERANCE_RATIO,
+    return notional_matches_quantity_price(
+        quantity=quantity,
+        notional=notional,
+        price=price,
     )
-    return abs(notional_dec - expected) <= tolerance
 
 
 def _trade_from_row(row: asyncpg.Record) -> StoredTradeRow:
