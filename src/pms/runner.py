@@ -3263,6 +3263,24 @@ class Runner:
                         len(legacy_fill_ids),
                         ", ".join(legacy_fill_ids),
                     )
+                incomplete_fill_ids = await self.fill_store.incomplete_fill_ids(
+                    run_mode=self.config.mode.value
+                )
+                if incomplete_fill_ids and self.config.mode == RunMode.LIVE:
+                    raise RuntimeError(
+                        "LIVE portfolio reconciliation found economically incomplete "
+                        "fills: "
+                        + ", ".join(incomplete_fill_ids)
+                        + "; run pms-live reconcile-fill-economics --fill-id <fill-id> "
+                        "with verified ledger fields"
+                    )
+                if incomplete_fill_ids:
+                    logger.warning(
+                        "excluding %d economically incomplete fills from %s portfolio: %s",
+                        len(incomplete_fill_ids),
+                        self.config.mode.value,
+                        ", ".join(incomplete_fill_ids),
+                    )
             if callable(mode_reader) and isinstance(
                 getattr(self.fill_store, "pool", None), asyncpg.Pool
             ):
@@ -3419,8 +3437,6 @@ class Runner:
         if self.config.mode == RunMode.LIVE:
             unresolved_telemetry: list[str] = []
             for trade in trades:
-                if trade.provenance_only:
-                    continue
                 missing: list[str] = []
                 if trade.fees is None:
                     missing.append("fee")
@@ -3486,7 +3502,7 @@ class Runner:
                     * Decimal(str(closing))
                     - Decimal(str(trade.fees or 0.0))
                 )
-                if include_risk_telemetry and not trade.provenance_only:
+                if include_risk_telemetry:
                     risk_manager.record_trade_result(
                         RiskTradeResult(
                             pnl=float(pnl),

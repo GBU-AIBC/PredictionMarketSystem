@@ -346,6 +346,10 @@ async def test_tag_fill_provenance_cli_is_idempotent_and_audited(
         def __init__(self, pool: object) -> None:
             calls["pool"] = pool
 
+        async def untagged_fill_ids(self, *, limit: int) -> list[str]:
+            del limit
+            return ["fill-a", "fill-b"]
+
         async def tag_fill_provenance(
             self,
             *,
@@ -357,7 +361,8 @@ async def test_tag_fill_provenance_cli_is_idempotent_and_audited(
             calls["tag"] = (mode, operator, evidence, fill_ids)
             return 2 if calls.get("tag_count", 0) == 0 else 0
 
-        async def mark_provenance_tag_audited(self) -> int:
+        async def mark_provenance_tag_audited(self, fill_ids: tuple[str, ...]) -> int:
+            calls["marked"] = fill_ids
             return 2 if calls.get("tag_count", 0) == 0 else 0
 
     class Audit:
@@ -399,14 +404,19 @@ async def test_tag_fill_provenance_cli_is_idempotent_and_audited(
     )
 
     assert await live_cli._main_async(args) == 0
-    assert calls["tag"] == ("paper", "operator", "legacy-ledger-review", None)
+    assert calls["tag"] == (
+        "paper",
+        "operator",
+        "legacy-ledger-review",
+        ("fill-a", "fill-b"),
+    )
     assert calls["audit"] == {
         "mode": "paper",
         "tagged_count": 2,
         "operator": "operator",
         "evidence": "legacy-ledger-review",
         "attestation": "all",
-        "fill_ids": (),
+        "fill_ids": ("fill-a", "fill-b"),
     }
     assert json.loads(capsys.readouterr().out)["tagged_count"] == 2
     calls["tag_count"] = 1

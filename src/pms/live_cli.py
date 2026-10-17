@@ -131,6 +131,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicitly replace existing fee telemetry and audit the override.",
     )
     fee_reconcile.add_argument("--database-url")
+    economics = subparsers.add_parser(
+        "reconcile-fill-economics",
+        help="Record audited side/venue/token/price fields for an incomplete fill.",
+    )
+    economics.add_argument("--config")
+    economics.add_argument("--fill-id", required=True)
+    economics.add_argument("--side", required=True, choices=("BUY", "SELL"))
+    economics.add_argument("--venue", required=True)
+    economics.add_argument("--token-id", required=True)
+    economics.add_argument("--fill-price", required=True, type=float)
+    economics.add_argument("--executed-at", required=True)
+    economics.add_argument("--operator", required=True)
+    economics.add_argument("--evidence", required=True)
+    economics.add_argument("--database-url")
     provenance = subparsers.add_parser(
         "tag-fill-provenance",
         help="Audit and tag legacy fills with PAPER or LIVE provenance.",
@@ -355,6 +369,94 @@ async def _main_async(args: argparse.Namespace) -> int:
             )
         )
         return 0 if updated else 1
+    if args.command == "reconcile-fill-economics":
+        try:
+            operator = _require_operator_id(cast(str, args.operator), "operator")
+            evidence = _require_operator_text(cast(str, args.evidence), "evidence")
+            executed_at = datetime.fromisoformat(
+                cast(str, args.executed_at).replace("Z", "+00:00")
+            )
+            if executed_at.tzinfo is None:
+                raise ValueError("executed_at must include a timezone")
+            fill_price = float(args.fill_price)
+            if not math.isfinite(fill_price) or fill_price <= 0:
+                raise ValueError("fill_price must be finite and positive")
+        except (TypeError, ValueError) as exc:
+            print(json.dumps({"updated": False, "error": str(exc)}, sort_keys=True))
+            return 1
+        try:
+            settings = _load_cli_settings(cast(str | None, args.config))
+            pool = await asyncpg.create_pool(
+                dsn=args.database_url or settings.database.dsn,
+                min_size=1,
+                max_size=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"updated": False, "error": str(exc)}, sort_keys=True))
+            return 1
+        updated = False
+        try:
+            await ensure_schema_current(pool)
+            store = FillStore(pool)
+            updated = await store.reconcile_fill_economics(
+                cast(str, args.fill_id),
+                side=cast(str, args.side),
+                venue=cast(str, args.venue),
+                token_id=cast(str, args.token_id),
+                fill_price=fill_price,
+                executed_at=executed_at,
+                operator=operator,
+                evidence=evidence,
+            )
+            if updated:
+                try:
+                    await LiveEmergencyAuditWriter(
+                        Path(settings.live_emergency_audit_path)
+                    ).append_fill_economics_reconcile(
+                        fill_id=cast(str, args.fill_id),
+                        side=cast(str, args.side),
+                        venue=cast(str, args.venue),
+                        token_id=cast(str, args.token_id),
+                        fill_price=fill_price,
+                        executed_at=executed_at,
+                        operator=operator,
+                        evidence=evidence,
+                    )
+                    if not await store.mark_fill_economics_audited(
+                        cast(str, args.fill_id)
+                    ):
+                        raise RuntimeError(
+                            "fill economics audit marker was not persisted"
+                        )
+                except Exception as economics_audit_error:  # noqa: BLE001
+                    print(
+                        json.dumps(
+                            {
+                                "updated": True,
+                                "audit_persisted": False,
+                                "fill_id": args.fill_id,
+                                "error": str(economics_audit_error),
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                    return 1
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"updated": False, "error": str(exc)}, sort_keys=True))
+            return 1
+        finally:
+            await pool.close()
+        print(
+            json.dumps(
+                {
+                    "updated": updated,
+                    "audit_persisted": updated,
+                    "fill_id": args.fill_id,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0 if updated else 1
     if args.command == "tag-fill-provenance":
         try:
             operator = _require_operator_id(cast(str, args.operator), "operator")
@@ -385,11 +487,17 @@ async def _main_async(args: argparse.Namespace) -> int:
             return 1
         try:
             await ensure_schema_current(pool)
-            tagged_count = await FillStore(pool).tag_fill_provenance(
+            fill_store = FillStore(pool)
+            target_fill_ids = (
+                explicit_fill_ids
+                if explicit_fill_ids
+                else tuple(await fill_store.untagged_fill_ids(limit=100_000))
+            )
+            tagged_count = await fill_store.tag_fill_provenance(
                 mode=cast(str, args.mode),
                 operator=operator,
                 evidence=evidence,
-                fill_ids=explicit_fill_ids or None,
+                fill_ids=target_fill_ids,
             )
             try:
                 await LiveEmergencyAuditWriter(
@@ -400,9 +508,9 @@ async def _main_async(args: argparse.Namespace) -> int:
                     operator=operator,
                     evidence=evidence,
                     attestation="all" if args.all else "explicit",
-                    fill_ids=explicit_fill_ids,
+                    fill_ids=target_fill_ids,
                 )
-                marked = await FillStore(pool).mark_provenance_tag_audited()
+                marked = await fill_store.mark_provenance_tag_audited(target_fill_ids)
                 if marked != tagged_count:
                     raise RuntimeError(
                         "provenance audit marker count did not match tagged fills"

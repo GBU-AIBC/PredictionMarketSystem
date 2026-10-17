@@ -105,6 +105,33 @@ class LiveEmergencyAuditWriter:
         }
         await asyncio.to_thread(_append_jsonl, self.path, record)
 
+    async def append_fill_economics_reconcile(
+        self,
+        *,
+        fill_id: str,
+        side: str,
+        venue: str,
+        token_id: str,
+        fill_price: float,
+        executed_at: datetime,
+        operator: str,
+        evidence: str,
+    ) -> None:
+        record = {
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+            "phase": "live_fill_economics_reconcile",
+            "event": "fill_economics_reconciled",
+            "fill_id": fill_id,
+            "side": side,
+            "venue": venue,
+            "token_id": token_id,
+            "fill_price": fill_price,
+            "executed_at": executed_at.isoformat(),
+            "operator": _require_operator_id(operator, "operator"),
+            "evidence": _require_operator_text(evidence, "evidence"),
+        }
+        await asyncio.to_thread(_append_jsonl, self.path, record)
+
     async def append_manual_stop(
         self,
         *,

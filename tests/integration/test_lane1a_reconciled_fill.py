@@ -523,8 +523,9 @@ async def test_legacy_fill_provenance_backfill_restores_restarts(
             mode="live",
             operator="r6-operator",
             evidence="legacy-ledger-review-r6",
+            fill_ids=(fill_id,),
         ) >= 1
-        assert await store.mark_provenance_tag_audited() >= 1
+        assert await store.mark_provenance_tag_audited((fill_id,)) >= 1
         assert await store.tag_fill_provenance(
             mode="live",
             operator="r6-operator",
@@ -553,7 +554,7 @@ async def test_legacy_fill_provenance_backfill_restores_restarts(
     reason="set PMS_RUN_INTEGRATION=1 to run integration tests",
 )
 @pytest.mark.asyncio
-async def test_missing_sidecar_provenance_tag_unblocks_live_restart(
+async def test_missing_sidecar_provenance_tag_requires_economics_reconcile(
     tmp_path: Path,
 ) -> None:
     dsn = os.environ.get("PMS_TEST_DATABASE_URL")
@@ -589,7 +590,7 @@ async def test_missing_sidecar_provenance_tag_unblocks_live_restart(
             evidence="legacy-sidecar-review",
             fill_ids=(fill_id,),
         ) == 1
-        assert await store.mark_provenance_tag_audited() == 1
+        assert await store.mark_provenance_tag_audited((fill_id,)) == 1
         assert fill_id not in await store.untagged_fill_ids(limit=100)
         async with pool.acquire() as connection:
             payload = await connection.fetchval(
@@ -604,12 +605,8 @@ async def test_missing_sidecar_provenance_tag_unblocks_live_restart(
             )
         )
         live.bind_pg_pool(pool)
-        await live._reconcile_portfolio_from_db()  # noqa: SLF001
-        assert any(
-            position.market_id == "legacy-provenance-r7-market"
-            for position in live.portfolio.open_positions
-        )
-        await live._reconcile_risk_from_db()  # noqa: SLF001
+        with pytest.raises(RuntimeError, match="reconcile-fill-economics"):
+            await live._reconcile_portfolio_from_db()  # noqa: SLF001
     finally:
         async with pool.acquire() as connection:
             await connection.execute(
