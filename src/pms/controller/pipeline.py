@@ -36,7 +36,7 @@ from pms.controller.outcome_tokens import (
 from pms.controller.router import Router
 from pms.controller.sizers.kelly import KellySizer
 from pms.core.enums import RunMode, TimeInForce
-from pms.core.interfaces import ICalibrator, IForecaster, IPreCalibrator, ISizer
+from pms.core.interfaces import ICalibrator, IForecaster, ISizer
 from pms.core.models import (
     BookLevel,
     BookSnapshot,
@@ -1296,10 +1296,6 @@ def _size_with_costs(
     return size_fn(**kwargs)
 
 
-def _pre_calibrators(spec: CalibrationSpec) -> tuple[IPreCalibrator, ...]:
-    return (LogitShrinkageCalibrator(spec), ExtremeProbClamp(spec))
-
-
 def _resolved_sample_count(calibrator: ICalibrator, model_ids: Sequence[str]) -> int:
     sample_count = getattr(calibrator, "sample_count", None)
     if not callable(sample_count) or not model_ids:
@@ -1685,6 +1681,11 @@ def _effective_min_order_usdc(
 def _model_id(result: ForecastResult, forecaster: IForecaster) -> str:
     raw_model_id = getattr(result, "model_id", None)
     if isinstance(raw_model_id, str) and raw_model_id:
+        prompt_hash = getattr(result, "prompt_hash", None)
+        provider = getattr(result, "provider", None)
+        if isinstance(prompt_hash, str) and prompt_hash:
+            prefix = f"{provider}:" if isinstance(provider, str) else ""
+            return f"{prefix}{raw_model_id}:prompt-{prompt_hash[:12]}"
         return raw_model_id
     return forecaster.__class__.__name__
 

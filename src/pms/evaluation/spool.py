@@ -59,6 +59,7 @@ class EvalSpool:
     )
     _task: asyncio.Task[None] | None = None
     _seen_fill_keys: set[str] = field(default_factory=set)
+    _scored_decisions: set[str] = field(default_factory=set)
     _scored_record_count: int = 0
     _last_feedback_record_count: int = 0
 
@@ -114,6 +115,8 @@ class EvalSpool:
         fill_key = fill.fill_id or fill.trade_id
         if fill_key in self._seen_fill_keys:
             return False
+        if fill.decision_id in self._scored_decisions:
+            return False
         scored_record = self.scorer.score(
             fill,
             decision,
@@ -130,6 +133,7 @@ class EvalSpool:
         # dedups per (model_id, decision_id).
         inserted = await self.store.append(scored_record)
         self._seen_fill_keys.add(fill_key)
+        self._scored_decisions.add(fill.decision_id)
         if inserted:
             self._scored_record_count += 1
         if self.calibration_sink is not None:

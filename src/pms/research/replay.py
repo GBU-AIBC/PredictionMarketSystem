@@ -716,9 +716,6 @@ def _market_signal(
     external_signal = {"raw_event_type": event_type}
     if extra is not None:
         external_signal.update(extra)
-    # Resolution labels are joined from the market metadata at replay load
-    # time. They are only evidence for post-run scoring; controller prompt
-    # construction strips this key and never uses it for forecasting.
     return MarketSignal(
         market_id=state.market_id,
         token_id=state.token_id,

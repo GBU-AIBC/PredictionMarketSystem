@@ -251,4 +251,5 @@ async def test_terminal_partial_fill_is_evaluated_once() -> None:
     spool = EvalSpool(store=cast(EvalStore, store), scorer=Scorer())
     assert await spool.process(fill("fill-partial"), decision)
     assert not await spool.process(fill("fill-partial"), decision)
+    assert not await spool.process(fill("fill-terminal"), decision)
     assert len(await store.all()) == 1
