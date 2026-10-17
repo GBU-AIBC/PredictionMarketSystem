@@ -186,6 +186,8 @@ def _build_forecaster(
             config=llm_config,
             record_replay_mode=replay_mode,
             evidence_reader=evidence_reader,
+            strategy_id=strategy_id,
+            strategy_version_id=strategy_version_id,
         )
     if name == "flb":
         if raw_params:

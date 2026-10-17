@@ -14,7 +14,11 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
 from pms.api.routes.agent_evidence import router as evidence_router
-from pms.api.routes.agent_factors import router as factor_router
+from pms.api.routes.agent_factors import (
+    AgentFactorObservationRequest,
+    router as factor_router,
+    submit_agent_factor_observation,
+)
 from pms.config import DatabaseSettings, LLMSettings, PMSSettings
 from pms.controller.factor_snapshot import PostgresFactorSnapshotReader
 from pms.controller.factory import ControllerPipelineFactory
@@ -209,6 +213,29 @@ async def test_agent_evidence_and_factor_routes_round_trip_with_pit_and_provenan
         assert (await client.post("/evidence", json=missing_evidence)).status_code == 422
 
     store = AgentEvidenceStore(pg_pool)
+    retry_ts = now - timedelta(seconds=1)
+    retry_request = AgentFactorObservationRequest(
+        market_id=market_id,
+        value=0.7,
+        ts=retry_ts,
+        model="retry-model",
+        prompt_hash="f" * 64,
+    )
+    await submit_agent_factor_observation(
+        pg_pool,
+        factor_id="agent_probability",
+        request=retry_request,
+        submitted_by_token_id="integration-token",
+        now=now,
+    )
+    retry = await submit_agent_factor_observation(
+        pg_pool,
+        factor_id="agent_probability",
+        request=retry_request,
+        submitted_by_token_id="integration-token",
+        now=now + timedelta(seconds=121),
+    )
+    assert retry.provenance_written is False
     assert await store.list_for_market(market_id, as_of=expires_at) == []
     assert len(await store.list_for_market(market_id, as_of=datetime.now(tz=UTC))) == 1
     runner = Runner(

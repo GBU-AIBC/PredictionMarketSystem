@@ -631,6 +631,11 @@ forecasters wired in `src/pms/controller/factory.py:98-135`:
 Multiple forecasters can run side-by-side; the `blend_weighted` role
 in `factor_composition` controls the weighted blend.
 
+PAPER LLM records use a shared append-only replay log; BACKTEST builds an
+in-memory point-in-time index once per process. The log rotates by size and
+compaction retains the latest record for every replay key, so research replay
+does not depend on log length.
+
 ### 5.4 `MarketSelectionSpec`
 
 | Field | Required | Notes |

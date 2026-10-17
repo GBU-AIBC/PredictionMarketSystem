@@ -1,21 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from dataclasses import replace
 import json
+import time
 from pathlib import Path
 from typing import Any, cast
 from types import SimpleNamespace
 
 import pytest
+import pms.controller.forecasters.llm as llm_module
 import asyncpg
 from fastapi import HTTPException
 
 from pms.api.routes.agent_factors import _agent_catalog_entry, _validate_value
 from pms.controller.forecasters.llm import (
     LLMForecaster,
+    LLMForecastResult,
     LLMReplayCacheCorruptError,
     LLMReplayCacheMissError,
+    LLMReplayEvidenceError,
     durable_record_replay_path,
     _prompt,
     _replay_key,
@@ -401,6 +406,112 @@ def test_replay_rejects_a_worktree_cache_path() -> None:
         LLMForecaster(config=config, record_replay_mode="replay").predict(_signal())
 
 
+def test_replay_index_lookup_stays_fast_for_a_large_log(tmp_path: Path) -> None:
+    cache_path = tmp_path / "large.jsonl"
+    config = LLMSettings(
+        enabled=True,
+        provider="openai",
+        api_key="test",
+        model="openai-test",
+        record_replay_path=str(cache_path),
+    )
+    signal = _signal()
+    target = _replay_key(config, signal, _prompt(signal))
+    target_key = "|".join(target)
+    response = {"response": '{"prob_estimate":0.8,"confidence":0.5,"rationale":"ok"}'}
+    with cache_path.open("w", encoding="utf-8") as file:
+        for index in range(200_000):
+            key = target_key if index == 199_999 else f"openai-test|{index:064x}|{index:064x}"
+            file.write(json.dumps({"key": key, "row": response}, separators=(",", ":")))
+            file.write("\n")
+    replay = LLMForecaster(config=config, record_replay_mode="replay")
+    assert replay.predict(signal) is not None
+    started = time.monotonic()
+    assert replay.predict(signal) is not None
+    assert time.monotonic() - started < 0.05
+
+
+def test_replay_compaction_keeps_last_record_per_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llm_module, "_REPLAY_COMPACT_BYTES", 1)
+    cache_path = tmp_path / "compact.jsonl"
+    forecaster = LLMForecaster(
+        config=LLMSettings(
+            enabled=True,
+            provider="openai",
+            api_key="test",
+            model="openai-test",
+            record_replay_path=str(cache_path),
+        ),
+        record_replay_mode="record",
+    )
+    key = ("openai-test", "p" * 64, "i" * 64)
+    forecaster._replay_write(key, {"response": "first"})
+    forecaster._replay_write(key, {"response": "last"})
+    assert llm_module._read_replay_entries(cache_path)["|".join(key)]["response"] == "last"
+
+
+def test_replay_key_separates_strategy_no_forecast_rows(tmp_path: Path) -> None:
+    cache_path = tmp_path / "strategies.jsonl"
+    config = LLMSettings(
+        enabled=True,
+        provider="openai",
+        api_key="test",
+        model="openai-test",
+        record_replay_path=str(cache_path),
+    )
+    signal = _signal()
+    prompt = _prompt(signal)
+    first = _replay_key(config, signal, prompt, strategy_id="a", strategy_version_id="1")
+    second = _replay_key(config, signal, prompt, strategy_id="b", strategy_version_id="1")
+    assert first != second
+    writer = LLMForecaster(config=config, record_replay_mode="record", strategy_id="a", strategy_version_id="1")
+    writer._replay_write(first, {"response": '{"prob_estimate":0.8,"confidence":0.5,"rationale":"ok"}'})
+    writer._replay_write(second, {"response": "", "no_forecast": True, "reason": "parse_failed"})
+    replay = LLMForecaster(config=config, record_replay_mode="replay", strategy_id="a", strategy_version_id="1")
+    assert replay.predict(signal) is not None
+
+
+def test_torn_replay_tail_is_discarded_before_next_append(tmp_path: Path) -> None:
+    cache_path = tmp_path / "torn.jsonl"
+    config = LLMSettings(
+        enabled=True,
+        provider="openai",
+        api_key="test",
+        model="openai-test",
+        record_replay_path=str(cache_path),
+    )
+    writer = LLMForecaster(config=config, record_replay_mode="record")
+    writer._replay_write(("openai-test", "a" * 64, "b" * 64), {"response": "ok"})
+    cache_path.write_text(cache_path.read_text(encoding="utf-8") + '{"key":"torn"', encoding="utf-8")
+    writer._replay_write(("openai-test", "c" * 64, "d" * 64), {"response": "next"})
+    assert "torn" not in cache_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_replay_evidence_read_failure_is_fatal() -> None:
+    class Reader:
+        async def read_evidence(
+            self,
+            market_id: str,
+            *,
+            as_of: datetime,
+            limit: int = 8,
+        ) -> list[AgentEvidence]:
+            del market_id, as_of, limit
+            raise RuntimeError("database unavailable")
+
+    forecaster = LLMForecaster(
+        config=LLMSettings(enabled=True, provider="openai", api_key="test", model="openai-test"),
+        record_replay_mode="replay",
+        evidence_reader=Reader(),
+    )
+    with pytest.raises(LLMReplayEvidenceError):
+        await forecaster.apredict(_signal())
+
+
 def test_default_record_replay_path_is_mode_independent_and_absolute(tmp_path: Path) -> None:
     data_path = str(tmp_path / "audit.jsonl")
     paper_path = durable_record_replay_path(
@@ -524,3 +635,24 @@ async def test_controller_research_replay_cache_miss_is_fatal(tmp_path: Path) ->
     )
     with pytest.raises(LLMReplayCacheMissError):
         await pipeline.on_signal(_signal())
+
+
+@pytest.mark.asyncio
+async def test_controller_research_replay_timeout_is_fatal() -> None:
+    class SlowReplayForecaster(LLMForecaster):
+        async def apredict(self, signal: MarketSignal) -> LLMForecastResult | None:
+            del signal
+            await asyncio.sleep(1.0)
+            return None
+
+    pipeline = ControllerPipeline(
+        settings=PMSSettings(llm=LLMSettings(timeout_s=0.001)),
+    )
+    with pytest.raises(LLMReplayCacheMissError):
+        await pipeline._predict_forecaster(
+            SlowReplayForecaster(
+                config=LLMSettings(enabled=True, provider="openai", api_key="test"),
+                record_replay_mode="replay",
+            ),
+            _signal(),
+        )

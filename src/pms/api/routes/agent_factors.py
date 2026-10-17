@@ -67,16 +67,54 @@ async def submit_agent_factor_observation(
     entry = _agent_catalog_entry(factor_id)
     reference_now = _aware(now or datetime.now(tz=UTC), "now")
     ts = _aware(request.ts, "ts")
-    if ts > reference_now:
-        raise HTTPException(status_code=422, detail="ts must not be in the future")
-    age = (reference_now - ts).total_seconds()
-    if age > MAX_FACTOR_AGE_S:
-        raise HTTPException(status_code=422, detail="ts is too old for a contribution")
     value = _validate_value(request.value, entry)
     if not request.model.strip() or not _HASH_RE.fullmatch(request.prompt_hash):
         raise HTTPException(status_code=422, detail="invalid provenance")
     if any(not evidence_id.strip() or len(evidence_id) > 256 for evidence_id in request.evidence_ids):
         raise HTTPException(status_code=422, detail="invalid evidence_ids")
+    if ts > reference_now:
+        raise HTTPException(status_code=422, detail="ts must not be in the future")
+    age = (reference_now - ts).total_seconds()
+    if age > MAX_FACTOR_AGE_S:
+        async with pool.acquire() as connection:
+            existing = await connection.fetchrow(
+                """
+                SELECT fv.value, p.model, p.prompt_hash, p.evidence_ids,
+                       p.submitted_by_token_id
+                FROM factor_values AS fv
+                JOIN agent_factor_provenance AS p
+                  ON p.factor_id = fv.factor_id AND p.param = fv.param
+                 AND p.market_id = fv.market_id AND p.ts = fv.ts
+                 AND p.definition_version = fv.definition_version
+                WHERE fv.factor_id = $1 AND fv.param = $2 AND fv.market_id = $3
+                  AND fv.ts = $4 AND fv.definition_version = '1'
+                """,
+                factor_id,
+                request.param,
+                request.market_id,
+                ts,
+            )
+        if existing is not None:
+            existing_evidence_ids = existing["evidence_ids"]
+            if isinstance(existing_evidence_ids, str):
+                existing_evidence_ids = json.loads(existing_evidence_ids)
+            if (
+                float(existing["value"]) == value
+                and str(existing["model"]) == request.model
+                and str(existing["prompt_hash"]) == request.prompt_hash
+                and [str(item) for item in existing_evidence_ids] == request.evidence_ids
+                and str(existing["submitted_by_token_id"]) == submitted_by_token_id
+            ):
+                return AgentFactorObservationResponse(
+                    factor_id=factor_id,
+                    param=request.param,
+                    market_id=request.market_id,
+                    ts=ts,
+                    value=value,
+                    definition_version="1",
+                    provenance_written=False,
+                )
+        raise HTTPException(status_code=422, detail="ts is too old for a contribution")
     provenance_written = False
     try:
         async with pool.acquire() as connection:

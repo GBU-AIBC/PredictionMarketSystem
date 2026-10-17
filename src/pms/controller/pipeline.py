@@ -1276,6 +1276,10 @@ class ControllerPipeline:
         forecaster: IForecaster,
         signal: MarketSignal,
     ) -> ForecastResult | None:
+        replay_mode = (
+            isinstance(forecaster, LLMForecaster)
+            and forecaster.record_replay_mode == "replay"
+        )
         async_predict = getattr(forecaster, "apredict", None)
         if callable(async_predict) and not _predict_method_overridden(forecaster):
             try:
@@ -1286,7 +1290,11 @@ class ControllerPipeline:
                     )(signal),
                     timeout=self.settings.llm.timeout_s,
                 )
-            except TimeoutError:
+            except TimeoutError as exc:
+                if replay_mode:
+                    raise LLMReplayCacheMissError(
+                        "LLM replay timed out while loading the replay index"
+                    ) from exc
                 return None
         timeout_s = self.settings.llm.timeout_s
         try:
@@ -1294,7 +1302,11 @@ class ControllerPipeline:
                 asyncio.to_thread(forecaster.predict, signal),
                 timeout=timeout_s,
             )
-        except TimeoutError:
+        except TimeoutError as exc:
+            if replay_mode:
+                raise LLMReplayCacheMissError(
+                    "LLM replay timed out while loading the replay index"
+                ) from exc
             logger.info(
                 "forecaster timed out; skipping late forecast",
                 extra={"forecaster": type(forecaster).__name__, "market_id": signal.market_id},
