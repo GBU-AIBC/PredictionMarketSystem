@@ -11,13 +11,17 @@ import asyncpg
 from pydantic import BaseModel, field_serializer
 
 from pms.core.models import EvalRecord
+from pms.config import PMSSettings
 from pms.evaluation.metrics import (
     MetricsCollector,
     StrategyMetricsSnapshot,
     StrategyVersionKey,
 )
 from pms.storage.eval_store import EvalStore
-from pms.storage.strategy_registry import PostgresStrategyRegistry
+from pms.storage.strategy_registry import (
+    PostgresStrategyRegistry,
+    llm_identity_for_settings,
+)
 from pms.strategies.projections import StrategyRow
 
 
@@ -82,8 +86,15 @@ class StrategyExecutionSnapshot:
         return self.fill_count / self.decision_count
 
 
-async def list_strategies(pg_pool: asyncpg.Pool) -> dict[str, Any]:
-    registry = PostgresStrategyRegistry(pg_pool)
+async def list_strategies(
+    pg_pool: asyncpg.Pool,
+    *,
+    settings: PMSSettings | None = None,
+) -> dict[str, Any]:
+    registry = PostgresStrategyRegistry(
+        pg_pool,
+        llm_identity=None if settings is None else llm_identity_for_settings(settings),
+    )
     payload = StrategiesResponse(
         strategies=[
             StrategyRowResponse(
@@ -102,10 +113,14 @@ async def list_strategy_metrics(
     *,
     since: datetime | None = None,
     until: datetime | None = None,
+    settings: PMSSettings | None = None,
 ) -> dict[str, Any]:
     since = None if since is None else _coerce_aware_datetime(since)
     until = None if until is None else _coerce_aware_datetime(until)
-    registry = PostgresStrategyRegistry(pg_pool)
+    registry = PostgresStrategyRegistry(
+        pg_pool,
+        llm_identity=None if settings is None else llm_identity_for_settings(settings),
+    )
     strategy_rows = await registry.list_active_strategy_rows()
     eval_store = EvalStore(pg_pool)
     records_by_strategy = _filter_records_by_window(

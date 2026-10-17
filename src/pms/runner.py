@@ -143,7 +143,10 @@ from pms.storage.opportunity_store import OpportunityStore
 from pms.storage.order_store import OrderStore
 from pms.storage.quote_eval_store import QuoteEvalStore
 from pms.storage.runtime_heartbeat_store import RuntimeHeartbeatStore
-from pms.storage.strategy_registry import PostgresStrategyRegistry
+from pms.storage.strategy_registry import (
+    PostgresStrategyRegistry,
+    llm_identity_for_settings,
+)
 from pms.strategies.aggregate import Strategy
 from pms.strategies.defaults import DEFAULT_STRATEGY_COMPOSITION
 from pms.strategies.anchoring import (
@@ -674,22 +677,24 @@ class Runner:
                 if self._pg_pool is None:
                     msg = "Runner PostgreSQL pool is not initialized"
                     raise RuntimeError(msg)
-                self._strategy_registry = PostgresStrategyRegistry(self._pg_pool)
-                # Test/runtime registry doubles retain their legacy constructor;
-                # the concrete registry exposes this optional versioning hook.
-                setattr(
-                    self._strategy_registry,
-                    "_llm_identity",
-                    (
-                        (
-                            self.config.llm.provider,
-                            self.config.llm.model,
-                            self.config.llm.prompt_version,
-                        )
-                        if self.config.llm.enabled
-                        else None
-                    ),
+                llm_identity = llm_identity_for_settings(self.config)
+                registry_parameters = inspect.signature(
+                    PostgresStrategyRegistry
+                ).parameters
+                accepts_identity = "llm_identity" in registry_parameters or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in registry_parameters.values()
                 )
+                if accepts_identity:
+                    self._strategy_registry = PostgresStrategyRegistry(
+                        self._pg_pool,
+                        llm_identity=llm_identity,
+                    )
+                else:
+                    # Test/runtime registry doubles may still expose the
+                    # historical pool-only constructor.
+                    self._strategy_registry = PostgresStrategyRegistry(self._pg_pool)
+                    setattr(self._strategy_registry, "_llm_identity", llm_identity)
                 if self.config.mode == RunMode.LIVE:
                     self._live_preflight_active_strategies_fingerprint = (
                         await require_live_preflight_active_strategies_artifact(

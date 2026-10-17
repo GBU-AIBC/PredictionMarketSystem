@@ -169,7 +169,7 @@ class MarketUniverseReplayEngine:
             return None
         if as_of is not None:
             known_at = metadata.resolved_at or metadata.observed_at
-            if known_at is not None and known_at > as_of:
+            if known_at is None or known_at > as_of:
                 return None
         return metadata.resolved_outcome
 
@@ -275,7 +275,8 @@ class MarketUniverseReplayEngine:
                            markets.yes_price, markets.no_price,
                            resolutions.resolved_outcome,
                            resolutions.resolved_at,
-                           resolutions.observed_at
+                           resolutions.observed_at,
+                           markets.last_seen_at
                     FROM markets
                     LEFT JOIN market_resolutions AS resolutions
                       ON resolutions.market_id = markets.condition_id
@@ -294,7 +295,8 @@ class MarketUniverseReplayEngine:
                            markets.yes_price, markets.no_price,
                            resolutions.resolved_outcome,
                            resolutions.resolved_at,
-                           resolutions.observed_at
+                           resolutions.observed_at,
+                           markets.last_seen_at
                     FROM markets
                     LEFT JOIN market_resolutions AS resolutions
                       ON resolutions.market_id = markets.condition_id
@@ -313,7 +315,10 @@ class MarketUniverseReplayEngine:
                 resolves_at=cast(datetime | None, row["resolves_at"]),
                 resolved_outcome=_market_resolution_label(row),
                 resolved_at=cast(datetime | None, row.get("resolved_at")),
-                observed_at=cast(datetime | None, row.get("observed_at")),
+                observed_at=cast(
+                    datetime | None,
+                    row.get("observed_at") or row.get("last_seen_at"),
+                ),
             )
             for row in rows
         }

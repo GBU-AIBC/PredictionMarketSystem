@@ -361,6 +361,7 @@ class ControllerPipeline:
             probabilities.append(float(result[0]))
             confidence_weight = max(0.0, min(1.0, float(result[1])))
             if isinstance(forecaster, LLMForecaster):
+                # Cap LLM influence at 25%; zero confidence means zero weight.
                 confidence_weight = min(confidence_weight, 0.25)
             confidence_weights.append(confidence_weight)
             if result[2]:
@@ -1285,7 +1286,7 @@ def _apply_pre_calibrators(
 def _weighted_probability(probabilities: Sequence[float], weights: Sequence[float]) -> float:
     if not probabilities:
         return 0.5
-    effective = [weight if weight > 0.0 else 0.1 for weight in weights]
+    effective = [max(0.0, weight) for weight in weights]
     total = sum(effective)
     if total <= 0.0:
         return sum(probabilities) / len(probabilities)

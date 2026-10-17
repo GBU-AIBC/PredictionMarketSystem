@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from importlib import import_module
 from pathlib import Path
 from typing import Mapping, Protocol, Self, cast
@@ -437,11 +437,6 @@ class LLMForecaster:
 
     def _estimated_call_cost_usdc(self) -> Decimal:
         assert self.config is not None
-        if (
-            self.config.input_price_usdc_per_million_tokens <= 0.0
-            and self.config.output_price_usdc_per_million_tokens <= 0.0
-        ):
-            return _ESTIMATED_CALL_COST_USDC
         input_price, output = _model_prices(self.config)
         return max(
             _ESTIMATED_CALL_COST_USDC,
@@ -678,7 +673,17 @@ def _point_in_time_external_signal(signal: Mapping[str, object]) -> dict[str, ob
 
 
 def _cache_key(signal: MarketSignal) -> str:
-    return f"{signal.market_id}:{round(signal.yes_price, 3):.3f}"
+    payload = {
+        "external_signal": _point_in_time_external_signal(signal.external_signal),
+        "market_id": signal.market_id,
+        "orderbook": signal.orderbook,
+        "title": signal.title,
+        "venue": signal.venue,
+        "yes_price": signal.yes_price,
+    }
+    return sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
 
 
 def _provider_response(text: str, response: object) -> _ProviderResponse:
@@ -795,15 +800,30 @@ def _today_utc() -> date:
 def _load_budget_ledger(tracker: _BudgetTracker, today: date) -> None:
     if tracker.ledger_loaded:
         return
-    tracker.ledger_loaded = True
     if tracker.ledger_path is None or not tracker.ledger_path.exists():
+        tracker.ledger_loaded = True
         return
     try:
         payload = json.loads(tracker.ledger_path.read_text(encoding="utf-8"))
-        if payload.get("date") == today.isoformat():
+        if not isinstance(payload, dict):
+            raise ValueError("ledger root must be an object")
+        raw_date = payload.get("date")
+        if not isinstance(raw_date, str):
+            raise ValueError("ledger date must be an ISO date string")
+        parsed_date = date.fromisoformat(raw_date)
+        if parsed_date.isoformat() != raw_date:
+            raise ValueError("ledger date must use YYYY-MM-DD shape")
+        raw_cost = payload.get("cost_usdc")
+        if isinstance(raw_cost, bool) or raw_cost is None:
+            raise ValueError("ledger cost_usdc must be a finite non-negative number")
+        cost = Decimal(str(raw_cost))
+        if not cost.is_finite() or cost < 0:
+            raise ValueError("ledger cost_usdc must be a finite non-negative number")
+        if parsed_date == today:
             tracker.cost_day = today
-            tracker.daily_cost_usdc = Decimal(str(payload.get("cost_usdc", "0")))
-    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            tracker.daily_cost_usdc = cost
+        tracker.ledger_loaded = True
+    except (OSError, ValueError, TypeError, InvalidOperation, json.JSONDecodeError) as exc:
         raise LLMProviderUnavailableError(
             "LLM spend ledger is unreadable; refusing provider calls"
         ) from exc

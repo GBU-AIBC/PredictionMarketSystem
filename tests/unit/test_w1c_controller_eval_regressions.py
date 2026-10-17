@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from dataclasses import replace
+import json
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -12,11 +14,12 @@ from pms.config import DatabaseSettings, LLMSettings, PMSSettings, RiskSettings
 from pms.actuator.risk import InsufficientLiquidityError
 from pms.controller.forecasters.llm import (
     LLMForecaster,
+    LLMProviderUnavailableError,
     _ProviderResponse,
     _prompt,
 )
 from pms.controller.calibrators.netcal import NetcalCalibrator
-from pms.controller.pipeline import ControllerPipeline
+from pms.controller.pipeline import ControllerPipeline, _weighted_probability
 from pms.controller.sizers.kelly import KellySizer
 from pms.core.enums import Side, TimeInForce
 from pms.core.models import EvalRecord, FillRecord, MarketSignal, Portfolio, TradeDecision
@@ -29,7 +32,11 @@ from pms.storage.strategy_registry import (
 )
 from tests.support.fake_stores import InMemoryEvalStore
 from pms.research.execution import _walk_book
-from pms.research.replay import _market_resolution_label
+from pms.research.replay import (
+    MarketUniverseReplayEngine,
+    _MarketMetadata,
+    _market_resolution_label,
+)
 from pms.strategies.projections import (
     EvalSpec,
     ForecasterSpec,
@@ -161,6 +168,66 @@ def test_llm_unknown_model_price_fails_closed_when_usage_is_reported() -> None:
     assert forecaster.predict(_signal({"category": "politics"})) is None
     assert forecaster.last_failure_reason == "budget_exhausted"
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("cost", "ledger_date"),
+    [
+        ("-1", "2026-10-18"),
+        ("NaN", "2026-10-18"),
+        ("Infinity", "2026-10-18"),
+        ("0", "2026-1-1"),
+    ],
+)
+def test_invalid_spend_ledger_fails_before_provider_call(
+    tmp_path: Path,
+    cost: str,
+    ledger_date: str,
+) -> None:
+    ledger = tmp_path / "spend.json"
+    ledger.write_text(
+        json.dumps({"date": ledger_date, "cost_usdc": cost}),
+        encoding="utf-8",
+    )
+    calls: list[object] = []
+
+    class Client:
+        class messages:
+            @staticmethod
+            def create(**kwargs: object) -> object:
+                calls.append(kwargs)
+                return object()
+
+    forecaster = LLMForecaster(
+        config=LLMSettings(
+            enabled=True,
+            provider="anthropic",
+            api_key="test",
+            model="claude-test",
+            spend_ledger_path=str(ledger),
+            max_daily_llm_cost_usdc=0.01,
+        ),
+        client=Client(),
+    )
+    with pytest.raises(LLMProviderUnavailableError):
+        forecaster.predict(_signal({"category": "politics"}))
+    assert calls == []
+
+
+def test_estimated_reservation_uses_model_price() -> None:
+    forecaster = LLMForecaster(
+        config=LLMSettings(
+            enabled=True,
+            provider="anthropic",
+            api_key="test",
+            model="claude-sonnet-4-6",
+        )
+    )
+    assert forecaster._estimated_call_cost_usdc() == Decimal("0.00984")
+
+
+def test_zero_confidence_has_zero_weight() -> None:
+    assert _weighted_probability([0.9, 0.1], [0.0, 1.0]) == pytest.approx(0.1)
 
 
 def test_default_controller_pipeline_derives_restart_safe_spend_ledger(
@@ -388,6 +455,28 @@ def test_replay_resolution_label_accepts_closed_settlement_prices() -> None:
     ) == 0.0
 
 
+def test_closed_fallback_without_known_at_is_excluded_by_cutoff() -> None:
+    engine = MarketUniverseReplayEngine()
+    engine._market_metadata_cache["closed"] = _MarketMetadata(
+        title="closed",
+        venue="polymarket",
+        resolves_at=None,
+        resolved_outcome=_market_resolution_label(
+            {"closed": True, "yes_price": 1.0, "no_price": 0.0}
+        ),
+    )
+    cutoff = datetime(2026, 1, 2, tzinfo=UTC)
+    assert engine.resolution_for("closed", as_of=cutoff) is None
+    engine._market_metadata_cache["closed"] = _MarketMetadata(
+        title="closed",
+        venue="polymarket",
+        resolves_at=None,
+        resolved_outcome=1.0,
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    assert engine.resolution_for("closed", as_of=cutoff) == 1.0
+
+
 def test_replay_walk_book_rejects_non_finite_notional() -> None:
     with pytest.raises(InsufficientLiquidityError):
         _walk_book(
@@ -405,7 +494,12 @@ async def test_terminal_partial_fill_is_evaluated_once() -> None:
     decision = _decision()
     now = datetime(2026, 1, 1, tzinfo=UTC)
 
-    def fill(fill_id: str, notional: float, quantity: float) -> FillRecord:
+    def fill(
+        fill_id: str,
+        notional: float,
+        quantity: float,
+        status: str = "partial",
+    ) -> FillRecord:
         return FillRecord(
             trade_id=fill_id,
             order_id="w1c-order",
@@ -419,7 +513,7 @@ async def test_terminal_partial_fill_is_evaluated_once() -> None:
             fill_quantity=quantity,
             executed_at=now,
             filled_at=now,
-            status="partial",
+            status=status,
             anomaly_flags=[],
             strategy_id=decision.strategy_id,
             strategy_version_id=decision.strategy_version_id,
@@ -432,5 +526,7 @@ async def test_terminal_partial_fill_is_evaluated_once() -> None:
     assert await spool.process(fill("fill-partial-1", 4.0, 10.0), decision)
     assert await spool.process(fill("fill-partial-2", 7.0, 17.5), decision)
     assert not await spool.process(fill("fill-partial-2", 7.0, 17.5), decision)
+    assert await spool.process(fill("fill-terminal", 8.0, 20.0, "matched"), decision)
+    assert not await spool.process(fill("fill-late-partial", 7.0, 17.5), decision)
     assert len(await store.all()) == 1
-    assert (await store.all())[0].pnl == pytest.approx(10.5)
+    assert (await store.all())[0].pnl == pytest.approx(12.0)

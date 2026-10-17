@@ -64,6 +64,9 @@ class EvalSpool:
     _latest_order_totals: dict[str, tuple[float, float, str]] = field(
         default_factory=dict
     )
+    _terminal_order_totals: dict[str, tuple[float, float, str]] = field(
+        default_factory=dict
+    )
     _scored_record_count: int = 0
     _last_feedback_record_count: int = 0
 
@@ -116,7 +119,17 @@ class EvalSpool:
                 decision_evidence,
             )
             return False
-        previous = self._latest_order_totals.get(fill.order_id)
+        terminal = self._terminal_order_totals.get(fill.order_id)
+        if terminal is not None and (
+            fill.fill_notional_usdc < terminal[0]
+            or fill.fill_quantity < terminal[1]
+            or (
+                fill.fill_notional_usdc == terminal[0]
+                and fill.fill_quantity == terminal[1]
+            )
+        ):
+            return False
+        previous = self._latest_order_totals.get(fill.order_id) or terminal
         if previous is not None:
             previous_notional, previous_quantity, previous_status = previous
             if (
@@ -167,6 +180,11 @@ class EvalSpool:
         )
         if fill.status in {"matched", "filled", "cancelled", "rejected"}:
             self._latest_order_totals.pop(fill.order_id, None)
+            self._terminal_order_totals[fill.order_id] = (
+                fill.fill_notional_usdc,
+                fill.fill_quantity,
+                fill.status,
+            )
         if previous is None and inserted:
             self._scored_record_count += 1
         if self.calibration_sink is not None:

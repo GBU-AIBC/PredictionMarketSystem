@@ -9,6 +9,7 @@ from typing import cast
 
 import asyncpg
 
+from pms.config import PMSSettings
 from pms.strategies.aggregate import Strategy
 from pms.strategies.projections import (
     ActiveStrategy,
@@ -36,6 +37,16 @@ logger = logging.getLogger(__name__)
 
 StrategyChangeCallback = Callable[[], Awaitable[None]]
 LLMIdentity = tuple[str | None, str, str]
+
+
+def llm_identity_for_settings(settings: PMSSettings) -> LLMIdentity | None:
+    if not settings.llm.enabled:
+        return None
+    return (
+        settings.llm.provider,
+        settings.llm.model,
+        settings.llm.prompt_version,
+    )
 
 # The load-bearing legacy bootstrap version id seeded by schema.sql
 # (`INSERT INTO strategy_versions ... 'default-v1'`). It predates
