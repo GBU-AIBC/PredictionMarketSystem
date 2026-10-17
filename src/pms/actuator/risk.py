@@ -6,7 +6,10 @@ from decimal import Decimal
 from typing import Literal
 
 from pms.config import RiskSettings
+from pms.core.enums import ReasonCode
+from pms.core.exceptions import DomainValidationError
 from pms.core.models import OrderState, Portfolio, Position, TradeDecision
+from pms.core.validation import validate_finite, validate_positive
 
 
 class InsufficientLiquidityError(RuntimeError):
@@ -118,7 +121,23 @@ class RiskManager:
         )
 
     def check(self, decision: TradeDecision, portfolio: Portfolio) -> RiskDecision:
-        notional = decision.notional_usdc
+        try:
+            notional = validate_finite(
+                decision.notional_usdc,
+                field_name="TradeDecision.notional_usdc",
+            )
+            validate_finite(portfolio.free_usdc, field_name="Portfolio.free_usdc")
+            validate_finite(
+                portfolio.locked_usdc,
+                field_name="Portfolio.locked_usdc",
+            )
+            if portfolio.max_drawdown_pct is not None:
+                validate_finite(
+                    portfolio.max_drawdown_pct,
+                    field_name="Portfolio.max_drawdown_pct",
+                )
+        except DomainValidationError:
+            return RiskDecision(False, ReasonCode.NON_FINITE.value)
         if notional <= 0.0:
             return RiskDecision(False, "non_positive_size")
 
@@ -196,10 +215,23 @@ class RiskManager:
         self,
         portfolio: Portfolio,
         *,
+        decision: TradeDecision | None = None,
         now: datetime | None = None,
         trace_id: str | None = None,
     ) -> HaltState:
         checked_at = _coerce_aware(now)
+        # A verified reduction is allowed to unwind risk even while an entry
+        # breaker is latched. A mixed order (close plus residual entry) still
+        # goes through the normal halt path and is therefore fail-closed.
+        if decision is not None:
+            reduction = _split_reduction_shares(portfolio, decision)
+            if reduction.reducing_shares > 0.0 and reduction.residual_shares <= 1e-9:
+                return HaltState(
+                    halted=False,
+                    reason="position_reduction_allowed",
+                    triggered_at=checked_at,
+                    trigger_kind="none",
+                )
         if self._halt_state is not None and self._halt_state.halted:
             return self._halt_state
 
@@ -285,8 +317,30 @@ class RiskManager:
             return self._halt_state
         return None
 
+    def restore_halt(self, state: HaltState) -> None:
+        """Restore a durable breaker during runner construction."""
+        if not state.halted:
+            return
+        event = HaltEvent(state=state)
+        self._halt_state = state
+        self._active_halt_event = event
+        self._halt_events.append(event)
+
     def record_trade_result(self, result: RiskTradeResult) -> None:
-        normalized = replace(result, filled_at=_coerce_aware(result.filled_at))
+        try:
+            pnl = validate_finite(result.pnl, field_name="RiskTradeResult.pnl")
+            slippage_bps = validate_finite(
+                result.slippage_bps,
+                field_name="RiskTradeResult.slippage_bps",
+            )
+        except DomainValidationError as exc:
+            raise ValueError("RiskTradeResult contains a non-finite value") from exc
+        normalized = replace(
+            result,
+            pnl=pnl,
+            slippage_bps=slippage_bps,
+            filled_at=_coerce_aware(result.filled_at),
+        )
         self._recent_trades.append(normalized)
         if len(self._recent_trades) > 100:
             del self._recent_trades[:-100]

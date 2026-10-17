@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable, Final, Literal, Protocol, cast
+from uuid import uuid4
 
 from pms.config import PMSSettings, validate_live_mode_ready
 from pms.core.enums import OrderStatus, RunMode
@@ -29,6 +30,7 @@ from pms.core.models import (
     VenueAccountSnapshot,
     VenueCredentials,
 )
+from pms.core.validation import validate_finite, validate_positive, validate_price
 from pms.live_preflight_artifact import (
     is_sha256_hexdigest as _is_sha256_hexdigest,
     latest_live_emergency_audit_timestamp,
@@ -135,6 +137,9 @@ class PolymarketOrderResult:
     remaining_notional_usdc: float
     fill_price: float | None
     filled_quantity: float
+    fees: float | None = None
+    fee_bps: int | None = None
+    transaction_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -873,11 +878,18 @@ class PolymarketActuator:
         # confirmed by the venue, subsequent submits do not serialize on
         # `_approval_lock`. In every-order mode this remains closed.
         if not self._operator_approval_required():
-            return await self._submit_with_quote_guard(
-                decision=decision,
-                request=request,
-                credentials=credentials,
-            )
+            try:
+                return await self._submit_with_quote_guard(
+                    decision=decision,
+                    request=request,
+                    credentials=credentials,
+                )
+            except asyncio.CancelledError as exc:
+                raise PolymarketSubmissionUnknownError(
+                    "Polymarket live submission was cancelled; order status is "
+                    "unknown — reconcile with venue before retrying",
+                    order_state=_submission_unknown_order_state(decision),
+                ) from exc
 
         # Slow path: hold `_approval_lock` across the *entire* approval +
         # submit + commit window. The previous implementation released
@@ -941,11 +953,51 @@ class PolymarketActuator:
             # `async with` releases the lock and `_approval_state.approved`
             # stays False — the next caller will see no commit and
             # re-prompt the gate (correct consume-on-success behavior).
-            order_state = await self._submit_with_quote_guard(
-                decision=decision,
-                request=request,
-                credentials=credentials,
-            )
+            try:
+                order_state = await self._submit_with_quote_guard(
+                    decision=decision,
+                    request=request,
+                    credentials=credentials,
+                )
+            except PolymarketSubmissionUnknownError as error:
+                self._approval_state.approved = True
+                if error.order_state is None:
+                    error.order_state = _submission_unknown_order_state(decision)
+                try:
+                    await asyncio.shield(self.operator_gate.consume(preview))
+                except Exception as consume_error:  # noqa: BLE001
+                    logger.error(
+                        "operator approval consume failed after unknown submit: %s",
+                        consume_error,
+                    )
+                await self._emit_audit(
+                    event="approval_consumed",
+                    preview=preview,
+                    approver_id=approver_id,
+                )
+                raise
+            except asyncio.CancelledError as exc:
+                # Cancellation does not prove the worker thread stopped. The
+                # approval is consumed before surfacing an unknown incident so
+                # a restart cannot replay the same authorization blindly.
+                self._approval_state.approved = True
+                try:
+                    await asyncio.shield(self.operator_gate.consume(preview))
+                except Exception as consume_error:  # noqa: BLE001
+                    logger.error(
+                        "operator approval consume failed after cancelled submit: %s",
+                        consume_error,
+                    )
+                await self._emit_audit(
+                    event="approval_consumed",
+                    preview=preview,
+                    approver_id=approver_id,
+                )
+                raise PolymarketSubmissionUnknownError(
+                    "Polymarket live submission was cancelled; order status is "
+                    "unknown — reconcile with venue before retrying",
+                    order_state=_submission_unknown_order_state(decision),
+                ) from exc
 
             # First venue submission succeeded: lock in first-order
             # completion and consume the operator-side approval artefact
@@ -1573,18 +1625,37 @@ def _order_request(decision: TradeDecision) -> PolymarketOrderRequest:
     if decision.token_id is None:
         msg = "Polymarket live execution requires decision.token_id"
         raise LiveTradingDisabledError(msg)
-    estimated_quantity = _decision_quantity(decision)
+    try:
+        notional = validate_positive(
+            decision.notional_usdc,
+            field_name="PolymarketOrderRequest.notional_usdc",
+        )
+        price = validate_price(
+            decision.limit_price,
+            field_name="PolymarketOrderRequest.price",
+        )
+        max_slippage_bps = int(
+            validate_finite(
+                decision.max_slippage_bps,
+                field_name="PolymarketOrderRequest.max_slippage_bps",
+            )
+        )
+    except ValueError as exc:
+        raise LiveTradingDisabledError(
+            "Polymarket order request contains invalid or non-finite values"
+        ) from exc
+    estimated_quantity = _decision_quantity(decision, notional=notional, price=price)
     return PolymarketOrderRequest(
         market_id=decision.market_id,
         token_id=decision.token_id,
         side=decision.action if decision.action is not None else decision.side,
-        price=decision.limit_price,
+        price=price,
         size=_sdk_order_size(decision, estimated_quantity=estimated_quantity),
-        notional_usdc=decision.notional_usdc,
+        notional_usdc=notional,
         estimated_quantity=estimated_quantity,
         order_type=decision.order_type,
         time_in_force=decision.time_in_force.value,
-        max_slippage_bps=decision.max_slippage_bps,
+        max_slippage_bps=max_slippage_bps,
     )
 
 
@@ -1614,7 +1685,43 @@ def _order_state_from_result(
         strategy_id=decision.strategy_id,
         strategy_version_id=decision.strategy_version_id,
         filled_quantity=result.filled_quantity,
-        pre_submit_quote={} if quote is None else _quote_payload(quote),
+        pre_submit_quote={
+            **({} if quote is None else _quote_payload(quote)),
+            **({} if result.fees is None else {"fees": result.fees}),
+            **({} if result.fee_bps is None else {"fee_bps": result.fee_bps}),
+            **(
+                {}
+                if result.transaction_ref is None
+                else {"transaction_ref": result.transaction_ref}
+            ),
+        },
+        action=decision.action,
+        outcome=decision.outcome,
+        time_in_force=decision.time_in_force.value,
+        intent_key=decision.intent_key,
+        risk_group_id=decision.risk_group_id,
+    )
+
+
+def _submission_unknown_order_state(decision: TradeDecision) -> OrderState:
+    now = datetime.now(tz=UTC)
+    return OrderState(
+        order_id=f"submission-unknown-{uuid4().hex}",
+        decision_id=decision.decision_id,
+        status=OrderStatus.INVALID.value,
+        market_id=decision.market_id,
+        token_id=decision.token_id,
+        venue=decision.venue,
+        requested_notional_usdc=decision.notional_usdc,
+        filled_notional_usdc=0.0,
+        remaining_notional_usdc=decision.notional_usdc,
+        fill_price=None,
+        submitted_at=now,
+        last_updated_at=now,
+        raw_status="submission_unknown",
+        strategy_id=decision.strategy_id,
+        strategy_version_id=decision.strategy_version_id,
+        filled_quantity=0.0,
         action=decision.action,
         outcome=decision.outcome,
         time_in_force=decision.time_in_force.value,
@@ -1936,11 +2043,22 @@ def _spread_bps(*, best_bid: float | None, best_ask: float | None) -> float:
     return ((best_ask - best_bid) / midpoint) * 10_000.0
 
 
-def _decision_quantity(decision: TradeDecision) -> float:
-    if decision.limit_price <= 0.0:
-        msg = "Polymarket live execution requires a positive limit_price"
-        raise LiveTradingDisabledError(msg)
-    return decision.notional_usdc / decision.limit_price
+def _decision_quantity(
+    decision: TradeDecision,
+    *,
+    notional: float | None = None,
+    price: float | None = None,
+) -> float:
+    normalized_notional = validate_positive(
+        notional if notional is not None else decision.notional_usdc,
+        field_name="PolymarketOrderRequest.notional_usdc",
+    )
+    normalized_price = validate_price(
+        price if price is not None else decision.limit_price,
+        field_name="PolymarketOrderRequest.price",
+    )
+    quantity = normalized_notional / normalized_price
+    return validate_positive(quantity, field_name="PolymarketOrderRequest.size")
 
 
 def _sdk_order_size(
@@ -1986,7 +2104,12 @@ def _float_close(value: object, expected: float) -> bool:
     # tight) without introducing such drift.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
-    return math.isclose(float(value), expected, rel_tol=1e-9, abs_tol=1e-12)
+    # Approval is a bounded quote, not a promise that a moving mark will be
+    # byte-identical when the operator's file is consumed. Keep the bound
+    # deliberately tight (25 bps, with a half-tick floor) so stale or resized
+    # orders remain denied while ordinary rounding and one-tick movement pass.
+    tolerance = max(0.0005, abs(expected) * 0.0025)
+    return math.isclose(float(value), expected, rel_tol=0.0, abs_tol=tolerance)
 
 
 def _approval_payload_hash(payload: Mapping[str, object]) -> str:
@@ -2485,6 +2608,9 @@ def _order_result_from_sdk_response(
         remaining_notional_usdc=remaining_notional_usdc,
         fill_price=fill_price,
         filled_quantity=filled_quantity,
+        fees=_response_fee(response),
+        fee_bps=_response_fee_bps(response),
+        transaction_ref=_response_transaction_ref(response),
     )
 
 
@@ -2507,6 +2633,52 @@ def _sdk_response_order_id(response: object) -> str:
         "order status is unknown — reconcile with venue before retrying"
     )
     raise PolymarketSubmissionUnknownError(msg)
+
+
+def _response_fee(response: object) -> float | None:
+    raw = _response_value(response, "fees", "fee", "fee_usdc", "feeAmount")
+    if raw is None:
+        return None
+    try:
+        value = validate_finite(raw, field_name="venue fee")
+    except ValueError as exc:
+        raise PolymarketSubmissionUnknownError(
+            "Polymarket live order response has invalid fee; order status is "
+            "unknown — reconcile with venue before retrying"
+        ) from exc
+    if value < 0.0:
+        raise PolymarketSubmissionUnknownError(
+            "Polymarket live order response has negative fee; order status is "
+            "unknown — reconcile with venue before retrying"
+        )
+    return value
+
+
+def _response_fee_bps(response: object) -> int | None:
+    raw = _response_value(response, "fee_bps", "feeBps")
+    if raw is None:
+        return None
+    try:
+        value = validate_finite(raw, field_name="venue fee_bps")
+    except ValueError as exc:
+        raise PolymarketSubmissionUnknownError(
+            "Polymarket live order response has invalid fee_bps; order status is "
+            "unknown — reconcile with venue before retrying"
+        ) from exc
+    if value < 0.0:
+        raise PolymarketSubmissionUnknownError(
+            "Polymarket live order response has negative fee_bps; order status is "
+            "unknown — reconcile with venue before retrying"
+        )
+    return int(value)
+
+
+def _response_transaction_ref(response: object) -> str | None:
+    raw = _response_value(response, "transaction_ref", "transactionHash", "tx_hash")
+    if raw is None:
+        return None
+    normalized = str(raw).strip()
+    return normalized or None
 
 
 def _sdk_response_success_is_false(response: object) -> bool:
@@ -2834,8 +3006,8 @@ def _compare_positions(
     notional_tolerance: float,
 ) -> list[str]:
     mismatches: list[str] = []
-    db_by_key = {_position_key(position): position for position in db_positions}
-    venue_by_key = {_position_key(position): position for position in venue_positions}
+    db_by_key = _aggregate_positions_by_contract(db_positions)
+    venue_by_key = _aggregate_positions_by_contract(venue_positions)
     for key in sorted(set(db_by_key) | set(venue_by_key)):
         db_position = db_by_key.get(key)
         venue_position = venue_by_key.get(key)
@@ -2858,6 +3030,44 @@ def _compare_positions(
                 f"venue={venue_position.locked_usdc:.8f}"
             )
     return mismatches
+
+
+def _aggregate_positions_by_contract(
+    positions: Sequence[Position],
+) -> dict[tuple[str, str | None, str], Position]:
+    """Aggregate strategy-tagged rows before comparing venue contracts.
+
+    The venue account has no strategy dimension, while the inner-ring ledger
+    intentionally does. Summing by contract preserves every strategy's
+    exposure in the DB comparison instead of letting the last row overwrite
+    earlier versions.
+    """
+    grouped: dict[tuple[str, str | None, str], Position] = {}
+    for position in positions:
+        key = _position_key(position)
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = position
+            continue
+        shares = existing.shares_held + position.shares_held
+        locked = existing.locked_usdc + position.locked_usdc
+        avg_price = (
+            0.0
+            if shares <= 1e-12
+            else (
+                existing.avg_entry_price * existing.shares_held
+                + position.avg_entry_price * position.shares_held
+            )
+            / shares
+        )
+        grouped[key] = replace(
+            existing,
+            shares_held=shares,
+            locked_usdc=locked,
+            avg_entry_price=avg_price,
+            unrealized_pnl=existing.unrealized_pnl + position.unrealized_pnl,
+        )
+    return grouped
 
 
 def _venue_cash_balance(balances: Mapping[str, float]) -> float | None:

@@ -13,7 +13,7 @@ from pms.alerting.events import HaltEvent as AlertHaltEvent
 from pms.core.enums import OrderStatus, TimeInForce, Venue
 from pms.core.exceptions import KalshiStubError
 from pms.core.interfaces import DedupStore
-from pms.core.models import OrderState, Portfolio, TradeDecision
+from pms.core.models import LiveTradingDisabledError, OrderState, Portfolio, TradeDecision
 from pms.core.venue_support import kalshi_stub_error
 from pms.event_stream import RuntimeEventBus
 from pms.storage.dedup_store import InMemoryDedupStore
@@ -58,7 +58,7 @@ class ActuatorExecutor:
             return final_state
 
         try:
-            halt_state = self.risk.check_auto_halt(portfolio)
+            halt_state = self.risk.check_auto_halt(portfolio, decision=decision)
             if halt_state.halted:
                 await self._publish_halt_event(decision, halt_state)
                 final_state = _rejected_order_state(decision, halt_state.trigger_kind)
@@ -107,6 +107,16 @@ class ActuatorExecutor:
                     final_state,
                     reason="submission_unknown",
                 )
+                raise
+            except LiveTradingDisabledError as error:
+                # Gate failures are terminal decision outcomes, not venue
+                # failures. Preserve the exception for the runner's incident
+                # logging while returning a durable rejected state to callers
+                # that use the executor directly.
+                reason = _live_gate_reason(error)
+                final_state = _rejected_order_state(decision, reason)
+                release_outcome = "rejected"
+                await self.feedback.generate(final_state, reason=reason)
                 raise
             except Exception:
                 final_state = _rejected_order_state(decision, "venue_rejection")
@@ -195,6 +205,15 @@ def _rejected_order_state(decision: TradeDecision, reason: str) -> OrderState:
         filled_quantity=0.0,
         risk_group_id=decision.risk_group_id,
     )
+
+
+def _live_gate_reason(error: LiveTradingDisabledError) -> str:
+    if type(error).__name__ == "OperatorApprovalRequiredError":
+        return "operator_gate_denied"
+    message = str(error).lower()
+    if "disabled" in message or "mode=live" in message:
+        return "live_disabled"
+    return "live_disabled"
 
 
 def _dedup_release_outcome(order_state: OrderState) -> str | None:

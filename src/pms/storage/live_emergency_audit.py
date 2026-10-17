@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from pms.core.models import OrderState, TradeDecision
+from pms.actuator.risk import HaltState
 
 
 EmergencyRestartMode = Literal["paper", "backtest"]
@@ -62,6 +63,81 @@ class LiveEmergencyAuditWriter:
             restart_mode=restart_mode,
         )
         await asyncio.to_thread(_append_jsonl, self.path, record)
+
+    async def append_halt(self, state: HaltState) -> None:
+        """Persist the active breaker so a restart cannot silently resume."""
+        await asyncio.to_thread(
+            _append_jsonl,
+            self.path,
+            {
+                "timestamp": datetime.now(tz=UTC).isoformat(),
+                "phase": "risk_halt",
+                "event": "risk_halt",
+                "reason": state.reason,
+                "trigger_kind": state.trigger_kind,
+                "triggered_at": state.triggered_at.isoformat(),
+            },
+        )
+
+    async def append_halt_clear(self, *, cleared_by: str) -> None:
+        await asyncio.to_thread(
+            _append_jsonl,
+            self.path,
+            {
+                "timestamp": datetime.now(tz=UTC).isoformat(),
+                "phase": "risk_halt_clear",
+                "event": "risk_halt_clear",
+                "cleared_by": _require_operator_id(cleared_by, "cleared_by"),
+            },
+        )
+
+
+def read_active_halt(path: Path) -> HaltState | None:
+    """Read the last durable halt/clear pair without trusting malformed lines."""
+    try:
+        raw_lines = path.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, OSError):
+        return None
+    active: HaltState | None = None
+    for line in raw_lines:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        phase = payload.get("phase")
+        if phase == "risk_halt_clear":
+            active = None
+            continue
+        if phase != "risk_halt":
+            continue
+        try:
+            triggered_at = datetime.fromisoformat(
+                str(payload["triggered_at"]).replace("Z", "+00:00")
+            )
+            if triggered_at.tzinfo is None:
+                triggered_at = triggered_at.replace(tzinfo=UTC)
+            trigger_kind = payload["trigger_kind"]
+            if trigger_kind not in {
+                "consecutive_losses",
+                "slippage_spike",
+                "credential_failure",
+                "order_without_fill",
+                "rate_limit_exceeded",
+                "drawdown_circuit_breaker",
+                "daily_loss_limit",
+            }:
+                continue
+            active = HaltState(
+                halted=True,
+                reason=str(payload["reason"]),
+                triggered_at=triggered_at,
+                trigger_kind=trigger_kind,
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return active
 
 
 def _manual_stop_record(

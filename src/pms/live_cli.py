@@ -105,6 +105,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reconcile.add_argument("--reconciled-by", required=True)
     reconcile.add_argument("--note")
+    reconcile.add_argument("--fill-price", type=float)
+    reconcile.add_argument("--fill-notional-usdc", type=float)
+    reconcile.add_argument("--fill-quantity", type=float)
+    reconcile.add_argument("--filled-at")
+    reconcile.add_argument("--fees", type=float)
+    reconcile.add_argument("--fee-bps", type=int)
     reconcile.add_argument("--database-url")
     reconcile_live_order = subparsers.add_parser(
         "reconcile-live-order",
@@ -224,6 +230,13 @@ async def _main_async(args: argparse.Namespace) -> int:
             reconciled_by = normalize_submission_unknown_reconciled_by(
                 cast(str, args.reconciled_by)
             )
+            filled_at = (
+                datetime.fromisoformat(
+                    cast(str, args.filled_at).replace("Z", "+00:00")
+                )
+                if args.filled_at
+                else None
+            )
         except ValueError as exc:
             _print_reconcile_failure(args, exc)
             return 1
@@ -241,15 +254,40 @@ async def _main_async(args: argparse.Namespace) -> int:
         try:
             try:
                 await ensure_schema_current(pool)
+                reconcile_kwargs: dict[str, object] = {
+                    "decision_id": decision_id,
+                    "venue_order_id": venue_order_id,
+                    "status": status,
+                    "reconciled_by": reconciled_by,
+                    "note": cast(str | None, args.note),
+                }
+                if any(
+                    value is not None
+                    for value in (
+                        args.fill_price,
+                        args.fill_notional_usdc,
+                        args.fill_quantity,
+                        args.filled_at,
+                        args.fees,
+                        args.fee_bps,
+                    )
+                ):
+                    reconcile_kwargs.update(
+                        {
+                            "fill_price": cast(float | None, args.fill_price),
+                            "fill_notional_usdc": cast(
+                                float | None,
+                                args.fill_notional_usdc,
+                            ),
+                            "fill_quantity": cast(float | None, args.fill_quantity),
+                            "filled_at": filled_at,
+                            "fees": cast(float | None, args.fees),
+                            "fee_bps": cast(int | None, args.fee_bps),
+                        }
+                    )
                 updated = await SubmissionUnknownReconciliationStore(
                     pool
-                ).reconcile_submission_unknown(
-                    decision_id=decision_id,
-                    venue_order_id=venue_order_id,
-                    status=status,
-                    reconciled_by=reconciled_by,
-                    note=cast(str | None, args.note),
-                )
+                ).reconcile_submission_unknown(**reconcile_kwargs)  # type: ignore[arg-type]
             except Exception as exc:  # noqa: BLE001
                 _print_reconcile_failure(args, exc, settings=settings)
                 return 1
