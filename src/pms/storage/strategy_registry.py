@@ -532,7 +532,7 @@ def _strategy_from_config_json(raw_value: object) -> Strategy:
                 "eval_spec.min_slippage_samples",
             ),
             min_win_rate_samples=_json_int(
-                eval_spec_payload.get("min_win_rate_samples", 20),
+                eval_spec_payload.get("min_win_rate_samples", 1),
                 "eval_spec.min_win_rate_samples",
             ),
         ),
