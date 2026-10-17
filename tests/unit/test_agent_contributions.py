@@ -242,6 +242,28 @@ def test_live_factory_strips_agent_evidence_reader() -> None:
     assert forecaster.evidence_reader is None
 
 
+@pytest.mark.asyncio
+async def test_evidence_reader_rejects_out_of_scope_market() -> None:
+    class Store:
+        async def list_for_market(
+            self,
+            market_id: str,
+            *,
+            as_of: datetime,
+            limit: int = 8,
+        ) -> list[AgentEvidence]:
+            del market_id, as_of, limit
+            return []
+
+    source = AgentEvidenceObservationSource(
+        cast(Any, Store()),
+        market_ids=("allowed-market",),
+    )
+    assert await source.read_evidence(
+        "blocked-market", as_of=datetime.now(tz=UTC)
+    ) == ()
+
+
 def _signal() -> MarketSignal:
     return MarketSignal(
         market_id="m-replay",
