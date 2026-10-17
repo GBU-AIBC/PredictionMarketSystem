@@ -96,7 +96,7 @@ def read_active_halt(path: Path) -> HaltState | None:
     """Read the last durable halt/clear pair without trusting malformed lines."""
     try:
         raw_lines = path.read_text(encoding="utf-8").splitlines()
-    except (FileNotFoundError, OSError):
+    except FileNotFoundError:
         return None
     active: HaltState | None = None
     for line in raw_lines:

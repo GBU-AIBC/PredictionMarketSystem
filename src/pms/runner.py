@@ -2008,27 +2008,20 @@ class Runner:
                         )
                     logger.warning("order persistence failed: %s", error)
                 self._record_live_order_risk_reservation(order_state)
-                adapter = getattr(self.actuator_executor, "adapter", None)
-                adapter_client = getattr(adapter, "client", None)
-                true_live_submit = (
-                    self.config.mode == RunMode.LIVE
-                    and isinstance(self.actuator_executor, ActuatorExecutor)
-                    and adapter_client is not None
-                    and getattr(adapter_client, "requires_live_mode", True) is not False
-                )
-                # True LIVE fills must carry a venue fee; injected clients used
-                # by paper/integration tests may still use the conservative
-                # estimate so they do not masquerade as venue settlement.
+                live_fill = self.config.mode == RunMode.LIVE
+                # Every LIVE adapter path must carry venue fee evidence; fee
+                # estimation is reserved for PAPER/BACKTEST and cannot be
+                # selected by adapter duck typing.
                 fill_fee_rate = (
                     None
-                    if true_live_submit
+                    if live_fill
                     else self._paper_fill_fee_rate(decision)
                 )
                 fill = _fill_from_order(
                     order_state, decision, signal, fee_rate=fill_fee_rate
                 )
                 fee_unreconciled = bool(
-                    true_live_submit and fill is not None and fill.fees is None
+                    live_fill and fill is not None and fill.fees is None
                 )
                 if fill is not None:
                     realized_result = _risk_trade_result_from_fill(

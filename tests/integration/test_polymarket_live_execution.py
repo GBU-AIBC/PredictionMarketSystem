@@ -103,6 +103,8 @@ class MockPolymarketClient:
             remaining_notional_usdc=0.0,
             fill_price=0.48,
             filled_quantity=25.0,
+            fees=0.0,
+            fee_bps=0,
         )
 
 

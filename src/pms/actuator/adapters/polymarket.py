@@ -907,9 +907,14 @@ class PolymarketActuator:
         # raises, the lock releases without flipping the flag and the
         # next caller will re-prompt the gate.
         async with self._approval_lock:
+            # A prior task may have failed approval cleanup while this task
+            # waited for the lock. Re-check before either submit path so a
+            # stale approval artefact cannot authorize another order.
+            self._raise_if_operator_approval_blocked()
             # Double-check after acquiring — in first-order mode another
             # task may have just opened the fast path while we were waiting.
             if not self._operator_approval_required():
+                self._raise_if_operator_approval_blocked()
                 return await self._submit_with_quote_guard(
                     decision=decision,
                     request=request,
@@ -917,6 +922,7 @@ class PolymarketActuator:
                 )
 
             preview = await self._live_order_preview(decision)
+            self._raise_if_operator_approval_blocked()
             approved = await self.operator_gate.approve_first_order(preview)
             # Capture approver_id from the operator gate once, before
             # consume() can unlink any sidecar. Threading the same

@@ -3028,6 +3028,80 @@ async def test_polymarket_actuator_every_order_mode_blocks_after_consume_failure
 
 
 @pytest.mark.asyncio
+async def test_every_order_consume_failure_blocks_waiting_concurrent_submit() -> None:
+    @dataclass
+    class _RaceClient:
+        release_first: asyncio.Event = field(default_factory=asyncio.Event)
+        first_entered: asyncio.Event = field(default_factory=asyncio.Event)
+        submitted: list[PolymarketOrderRequest] = field(default_factory=list)
+        requires_live_mode: bool = False
+
+        async def submit_order(
+            self,
+            order: PolymarketOrderRequest,
+            credentials: object,
+        ) -> PolymarketOrderResult:
+            del credentials
+            self.submitted.append(order)
+            if len(self.submitted) == 1:
+                self.first_entered.set()
+                await self.release_first.wait()
+            return PolymarketOrderResult(
+                order_id=f"race-{len(self.submitted)}",
+                status=OrderStatus.MATCHED.value,
+                raw_status="matched",
+                filled_notional_usdc=order.notional_usdc,
+                remaining_notional_usdc=0.0,
+                fill_price=order.price,
+                filled_quantity=order.estimated_quantity,
+            )
+
+    @dataclass
+    class _ConsumeFailureGate:
+        consume_calls: int = 0
+
+        async def approve_first_order(self, preview: LiveOrderPreview) -> bool:
+            del preview
+            return True
+
+        async def consume(self, preview: LiveOrderPreview) -> None:
+            del preview
+            self.consume_calls += 1
+            if self.consume_calls == 1:
+                raise OSError("stale approval cleanup failed")
+
+    client = _RaceClient()
+    gate = _ConsumeFailureGate()
+    actuator = PolymarketActuator(
+        _live_settings(operator_approval_mode="every_order"),
+        client=client,
+        operator_gate=gate,
+        quote_provider=AllowQuoteProvider(),
+    )
+
+    first = asyncio.create_task(
+        actuator.execute(_decision(decision_id="race-first"), _portfolio())
+    )
+    await asyncio.wait_for(client.first_entered.wait(), timeout=1.0)
+    second = asyncio.create_task(
+        actuator.execute(_decision(decision_id="race-second"), _portfolio())
+    )
+    # Let the second task pass the pre-lock check and wait for the first task.
+    await asyncio.sleep(0)
+    client.release_first.set()
+    first_result, second_result = await asyncio.gather(
+        first,
+        second,
+        return_exceptions=True,
+    )
+
+    assert isinstance(first_result, OrderState)
+    assert isinstance(second_result, LiveTradingDisabledError)
+    assert len(client.submitted) == 1
+    assert gate.consume_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_polymarket_actuator_first_order_gate_is_serialized() -> None:
     # The lock around the gate must serialize gate calls — a second concurrent
     # task cannot observe an in-progress gate. After the live-hardening fix

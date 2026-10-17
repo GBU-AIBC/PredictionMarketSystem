@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
+
+import asyncpg
 from datetime import UTC, datetime
 from math import nan
 from pathlib import Path
@@ -42,6 +45,7 @@ from pms.runner import (
     Runner,
     ActuatorWorkItem,
 )
+from pms.storage.fill_store import StoredTradeRow
 from pms.storage.live_emergency_audit import LiveEmergencyAuditWriter, read_active_halt
 from pms.storage.feedback_store import FeedbackStore
 from tests.support.fake_stores import InMemoryFeedbackStore
@@ -192,6 +196,17 @@ async def test_halt_persistence_requires_explicit_clear(tmp_path: Path) -> None:
     assert restored.actuator_executor.risk.active_halt() == state
     await writer.append_halt_clear(cleared_by="operator")
     assert read_active_halt(path) is None
+
+
+def test_unreadable_halt_audit_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / "halt.jsonl"
+
+    def deny_read(*_: object, **__: object) -> str:
+        raise PermissionError("audit path unreadable")
+
+    monkeypatch.setattr(Path, "read_text", deny_read)
+    with pytest.raises(PermissionError, match="audit path unreadable"):
+        read_active_halt(path)
 
 
 def test_exit_approval_accepts_only_bounded_mark_drift() -> None:
@@ -622,6 +637,7 @@ async def test_live_runner_losing_sequence_trips_daily_loss_halt() -> None:
                 action=decision.action,
                 outcome=decision.outcome,
                 time_in_force=decision.time_in_force.value,
+                pre_submit_quote={"fees": 0.0, "fee_bps": 0},
             )
 
     class Store:
@@ -674,10 +690,106 @@ async def test_live_runner_losing_sequence_trips_daily_loss_halt() -> None:
 
 
 @pytest.mark.asyncio
-async def test_true_live_missing_fee_persists_fill_before_fail_closed() -> None:
+async def test_risk_replay_keeps_pre_clear_inventory_basis_for_post_clear_loss(
+    tmp_path: Path,
+) -> None:
+    opened_at = datetime(2026, 10, 18, 1, 0, tzinfo=UTC)
+    cleared_at = datetime(2026, 10, 18, 2, 0, tzinfo=UTC)
+    closed_at = datetime(2026, 10, 18, 3, 0, tzinfo=UTC)
+    trades = [
+        StoredTradeRow(
+            trade_id="trade-open",
+            fill_id="fill-open",
+            order_id="order-open",
+            decision_id="decision-open",
+            market_id="lane-1a-market",
+            question="lane-1a",
+            token_id="lane-1a-token",
+            venue="polymarket",
+            side="BUY",
+            fill_price=0.50,
+            fill_notional_usdc=50.0,
+            fill_quantity=100.0,
+            executed_at=opened_at,
+            filled_at=opened_at,
+            status="filled",
+            strategy_id="lane-1a-strategy",
+            strategy_version_id="lane-1a-v1",
+            fees=0.0,
+            slippage_bps=0.0,
+        ),
+        StoredTradeRow(
+            trade_id="trade-close",
+            fill_id="fill-close",
+            order_id="order-close",
+            decision_id="decision-close",
+            market_id="lane-1a-market",
+            question="lane-1a",
+            token_id="lane-1a-token",
+            venue="polymarket",
+            side="SELL",
+            fill_price=0.40,
+            fill_notional_usdc=40.0,
+            fill_quantity=100.0,
+            executed_at=closed_at,
+            filled_at=closed_at,
+            status="filled",
+            strategy_id="lane-1a-strategy",
+            strategy_version_id="lane-1a-v1",
+            fees=0.0,
+            slippage_bps=0.0,
+        ),
+    ]
+    audit_path = tmp_path / "live-emergency-audit.jsonl"
+    audit_path.write_text(
+        json.dumps(
+            {
+                "timestamp": cleared_at.isoformat(),
+                "phase": "risk_halt_clear",
+                "event": "risk_halt_clear",
+                "cleared_by": "operator",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    class Store:
+        pool = object.__new__(asyncpg.Pool)
+
+        async def read_trades(self, *, limit: int) -> list[StoredTradeRow]:
+            assert limit == 100_000
+            return trades
+
+    settings = PMSSettings(
+        mode=RunMode.LIVE,
+        live_emergency_audit_path=str(audit_path),
+        risk=RiskSettings(max_daily_loss_usdc=5.0),
+    )
+    runner = Runner(config=settings)
+    risk = RiskManager(settings.risk)
+    runner.actuator_executor = cast(Any, type("Executor", (), {"risk": risk})())
+    runner.fill_store = cast(Any, Store())
+    runner._pg_pool = cast(Any, object())  # noqa: SLF001
+
+    await runner._reconcile_risk_from_db()  # noqa: SLF001
+
+    assert len(risk._daily_trades) == 1  # noqa: SLF001
+    assert risk._daily_trades[0].pnl == pytest.approx(-10.0)  # noqa: SLF001
+    halt = risk.check_auto_halt(
+        Portfolio(100.0, 100.0, 0.0, []),
+        now=closed_at,
+    )
+    assert halt.halted is True
+    assert halt.trigger_kind == "daily_loss_limit"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_client", [True, False], ids=["client", "duck-typed"])
+async def test_live_missing_fee_persists_fill_before_fail_closed(with_client: bool) -> None:
     @dataclass
-    class TrueLiveAdapter:
-        client: object = object()
+    class LiveAdapter:
+        client: object | None = object()
 
         async def execute(
             self,
@@ -728,7 +840,7 @@ async def test_true_live_missing_fee_persists_fill_before_fail_closed() -> None:
     )
     runner = Runner(config=settings)
     runner.actuator_executor = ActuatorExecutor(
-        adapter=TrueLiveAdapter(),
+        adapter=LiveAdapter(client=object() if with_client else None),
         risk=RiskManager(settings.risk),
         feedback=ActuatorFeedback(cast(FeedbackStore, InMemoryFeedbackStore())),
     )
