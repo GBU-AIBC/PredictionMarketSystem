@@ -406,3 +406,122 @@ async def test_live_reconciliation_partitions_fill_provenance(
             )
             await connection.execute("DELETE FROM fills WHERE fill_id LIKE 'mode-partition-%'")
         await pool.close()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("PMS_RUN_INTEGRATION") != "1",
+    reason="set PMS_RUN_INTEGRATION=1 to run integration tests",
+)
+@pytest.mark.asyncio
+async def test_legacy_fill_provenance_backfill_restores_restarts(
+    tmp_path: Path,
+) -> None:
+    dsn = os.environ.get("PMS_TEST_DATABASE_URL")
+    if not dsn:
+        pytest.skip("PMS_TEST_DATABASE_URL is required")
+    pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=2)
+    fill_id = "legacy-provenance-r6-open"
+    filled_at = datetime(2026, 10, 18, 1, 0, tzinfo=UTC)
+    try:
+        async with pool.acquire() as connection:
+            await connection.execute(
+                "DELETE FROM fill_payloads WHERE fill_id = $1", fill_id
+            )
+            await connection.execute("DELETE FROM fills WHERE fill_id = $1", fill_id)
+            await connection.execute(
+                """
+                INSERT INTO fills (
+                    fill_id, order_id, market_id, ts, fill_notional_usdc,
+                    fill_quantity, strategy_id, strategy_version_id
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                fill_id,
+                "legacy-provenance-r6-order",
+                "legacy-provenance-r6-market",
+                filled_at,
+                10.0,
+                20.0,
+                "lane-1a-strategy",
+                "lane-1a-v1",
+            )
+            await connection.execute(
+                """
+                INSERT INTO fill_payloads (fill_id, payload)
+                VALUES ($1, $2::jsonb)
+                """,
+                fill_id,
+                json.dumps(
+                    {
+                        "trade_id": fill_id,
+                        "decision_id": "legacy-provenance-r6-decision",
+                        "token_id": "legacy-provenance-r6-token",
+                        "venue": "polymarket",
+                        "side": "BUY",
+                        "fill_price": 0.5,
+                        "executed_at": filled_at.isoformat(),
+                        "status": "filled",
+                        "anomaly_flags": ["execution_slippage_bps=0.000000000"],
+                        "fees": 0.0,
+                        "fee_bps": 0,
+                    }
+                ),
+            )
+
+        legacy_trades = await FillStore(pool).read_trades(limit=10)
+        assert any(trade.fill_id == fill_id for trade in legacy_trades)
+        replay_trades = await FillStore(pool).read_trades_for_replay(page_size=10)
+        assert any(
+            trade.fill_id == fill_id and trade.run_mode is None
+            for trade in replay_trades
+        )
+        paper = Runner(
+            config=PMSSettings(
+                mode=RunMode.PAPER,
+                live_emergency_audit_path=str(tmp_path / "paper-audit.jsonl"),
+            )
+        )
+        paper.bind_pg_pool(pool)
+        await paper._reconcile_portfolio_from_db()  # noqa: SLF001
+        assert any(
+            position.market_id == "legacy-provenance-r6-market"
+            and position.shares_held == pytest.approx(20.0)
+            for position in paper.portfolio.open_positions
+        )
+
+        live = Runner(
+            config=PMSSettings(
+                mode=RunMode.LIVE,
+                live_emergency_audit_path=str(tmp_path / "live-audit.jsonl"),
+            )
+        )
+        live.bind_pg_pool(pool)
+        with pytest.raises(RuntimeError, match=fill_id):
+            await live._reconcile_portfolio_from_db()  # noqa: SLF001
+
+        store = FillStore(pool)
+        assert await store.tag_fill_provenance(
+            mode="live",
+            operator="r6-operator",
+            evidence="legacy-ledger-review-r6",
+        ) >= 1
+        assert await store.tag_fill_provenance(
+            mode="live",
+            operator="r6-operator",
+            evidence="legacy-ledger-review-r6-repeat",
+        ) == 0
+        tagged = await store.get(fill_id)
+        assert tagged is not None
+        assert "run_mode=live" in tagged.anomaly_flags
+        await live._reconcile_portfolio_from_db()  # noqa: SLF001
+        assert any(
+            position.market_id == "legacy-provenance-r6-market"
+            for position in live.portfolio.open_positions
+        )
+    finally:
+        async with pool.acquire() as connection:
+            await connection.execute(
+                "DELETE FROM fill_payloads WHERE fill_id = $1", fill_id
+            )
+            await connection.execute("DELETE FROM fills WHERE fill_id = $1", fill_id)
+        await pool.close()

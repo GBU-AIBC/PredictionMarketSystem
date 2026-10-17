@@ -76,6 +76,29 @@ class LiveEmergencyAuditWriter:
         }
         await asyncio.to_thread(_append_jsonl, self.path, record)
 
+    async def append_provenance_tag(
+        self,
+        *,
+        mode: str,
+        tagged_count: int,
+        operator: str,
+        evidence: str,
+    ) -> None:
+        if mode not in {"paper", "live"}:
+            raise ValueError("mode must be paper or live")
+        if tagged_count < 0:
+            raise ValueError("tagged_count must be non-negative")
+        record = {
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+            "phase": "live_fill_provenance_tag",
+            "event": "fill_provenance_tagged",
+            "mode": mode,
+            "tagged_count": tagged_count,
+            "operator": _require_operator_id(operator, "operator"),
+            "evidence": _require_operator_text(evidence, "evidence"),
+        }
+        await asyncio.to_thread(_append_jsonl, self.path, record)
+
     async def append_manual_stop(
         self,
         *,

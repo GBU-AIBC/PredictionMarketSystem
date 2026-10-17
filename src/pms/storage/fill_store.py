@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 import json
 import logging
@@ -274,11 +274,101 @@ class FillStore:
             )
         return row is not None
 
+    async def untagged_fill_ids(self, *, limit: int = 20) -> list[str]:
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            rows = await connection.fetch(
+                """
+                SELECT fills.fill_id
+                FROM fills
+                LEFT JOIN fill_payloads ON fill_payloads.fill_id = fills.fill_id
+                WHERE fill_payloads.payload IS NULL
+                   OR NOT EXISTS (
+                       SELECT 1
+                       FROM jsonb_array_elements_text(
+                           COALESCE(fill_payloads.payload->'anomaly_flags', '[]'::jsonb)
+                       ) AS flag
+                       WHERE flag LIKE 'run_mode=%'
+                   )
+                ORDER BY fills.ts ASC, fills.fill_id ASC
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [str(row["fill_id"]) for row in rows]
+
+    async def tag_fill_provenance(
+        self,
+        *,
+        mode: str,
+        operator: str,
+        evidence: str,
+    ) -> int:
+        normalized_mode = mode.strip().lower()
+        if normalized_mode not in {"paper", "live"}:
+            raise ValueError("mode must be paper or live")
+        if not operator.strip() or not evidence.strip():
+            raise ValueError("operator and evidence are required")
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            async with connection.transaction():
+                rows = await connection.fetch(
+                    """
+                    SELECT fill_id, payload
+                    FROM fill_payloads
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements_text(
+                            COALESCE(payload->'anomaly_flags', '[]'::jsonb)
+                        ) AS flag
+                        WHERE flag LIKE 'run_mode=%'
+                    )
+                    FOR UPDATE
+                    """
+                )
+                for row in rows:
+                    payload = _json_object(row["payload"])
+                    flags = [
+                        flag
+                        for flag in _string_list(payload.get("anomaly_flags"))
+                        if not flag.startswith("run_mode=")
+                    ]
+                    flags.append(f"run_mode={normalized_mode}")
+                    payload["anomaly_flags"] = flags
+                    payload["provenance_tagged_by"] = operator.strip()
+                    payload["provenance_tag_evidence"] = evidence.strip()
+                    payload["provenance_tagged_at"] = datetime.now(tz=UTC).isoformat()
+                    await connection.execute(
+                        "UPDATE fill_payloads SET payload = $2::jsonb WHERE fill_id = $1",
+                        row["fill_id"],
+                        json.dumps(payload),
+                    )
+        return len(rows)
+
     async def read_positions(self) -> list[Position]:
         return await self._read_positions(run_mode=None)
 
     async def read_positions_for_mode(self, run_mode: str) -> list[Position]:
         return await self._read_positions(run_mode=run_mode)
+
+    async def read_fee_total_for_mode(self, run_mode: str) -> float:
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            rows = await connection.fetch(
+                "SELECT payload FROM fill_payloads"
+            )
+        total = Decimal("0")
+        for row in rows:
+            payload = _json_object(row["payload"])
+            mode = _run_mode_from_anomaly_flags(payload.get("anomaly_flags"))
+            if mode != run_mode and not (
+                mode is None and run_mode in {"paper", "backtest"}
+            ):
+                continue
+            fees = _decimal_or_none(payload.get("fees"))
+            if fees is not None and fees >= 0:
+                total += fees
+        return float(total)
 
     async def _read_positions(self, *, run_mode: str | None) -> list[Position]:
         async with self._pool().acquire() as connection:
@@ -374,10 +464,19 @@ class FillStore:
             rows = [
                 row
                 for row in rows
-                if _run_mode_from_anomaly_flags(
-                    _json_object(row["payload"]).get("anomaly_flags")
+                if (
+                    _run_mode_from_anomaly_flags(
+                        _json_object(row["payload"]).get("anomaly_flags")
+                    )
+                    == run_mode
+                    or (
+                        run_mode in {"paper", "backtest"}
+                        and _run_mode_from_anomaly_flags(
+                            _json_object(row["payload"]).get("anomaly_flags")
+                        )
+                        is None
+                    )
                 )
-                == run_mode
             ]
         return _positions_from_fill_rows(rows)
 

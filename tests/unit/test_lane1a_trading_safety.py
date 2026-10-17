@@ -331,6 +331,82 @@ async def test_live_fee_reconcile_cli_updates_store_and_audits(
 
 
 @pytest.mark.asyncio
+async def test_tag_fill_provenance_cli_is_idempotent_and_audited(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Pool:
+        async def close(self) -> None:
+            pass
+
+    calls: dict[str, object] = {}
+
+    class Store:
+        def __init__(self, pool: object) -> None:
+            calls["pool"] = pool
+
+        async def tag_fill_provenance(
+            self,
+            *,
+            mode: str,
+            operator: str,
+            evidence: str,
+        ) -> int:
+            calls["tag"] = (mode, operator, evidence)
+            return 2 if calls.get("tag_count", 0) == 0 else 0
+
+    class Audit:
+        def __init__(self, path: Path) -> None:
+            calls["audit_path"] = path
+
+        async def append_provenance_tag(self, **kwargs: object) -> None:
+            calls["audit"] = kwargs
+
+    settings = PMSSettings(
+        live_emergency_audit_path=str(tmp_path / "audit.jsonl"),
+    )
+
+    async def create_pool(**_: object) -> Pool:
+        return Pool()
+
+    async def ensure_schema(_: object) -> None:
+        calls["schema"] = True
+
+    monkeypatch.setattr(live_cli, "_load_cli_settings", lambda _: settings)
+    monkeypatch.setattr(asyncpg, "create_pool", create_pool)
+    monkeypatch.setattr(live_cli, "ensure_schema_current", ensure_schema)
+    monkeypatch.setattr(live_cli, "FillStore", Store)
+    monkeypatch.setattr(live_cli, "LiveEmergencyAuditWriter", Audit)
+    args = live_cli.build_parser().parse_args(
+        [
+            "tag-fill-provenance",
+            "--mode",
+            "paper",
+            "--operator",
+            "operator",
+            "--evidence",
+            "legacy-ledger-review",
+            "--database-url",
+            "postgres://test",
+        ]
+    )
+
+    assert await live_cli._main_async(args) == 0
+    assert calls["tag"] == ("paper", "operator", "legacy-ledger-review")
+    assert calls["audit"] == {
+        "mode": "paper",
+        "tagged_count": 2,
+        "operator": "operator",
+        "evidence": "legacy-ledger-review",
+    }
+    assert json.loads(capsys.readouterr().out)["tagged_count"] == 2
+    calls["tag_count"] = 1
+    assert await live_cli._main_async(args) == 0
+    assert json.loads(capsys.readouterr().out)["tagged_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_same_day_daily_loss_clear_rewrites_durable_halt(tmp_path: Path) -> None:
     path = tmp_path / "daily-halt.jsonl"
     settings = PMSSettings(

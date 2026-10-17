@@ -129,6 +129,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicitly replace existing fee telemetry and audit the override.",
     )
     fee_reconcile.add_argument("--database-url")
+    provenance = subparsers.add_parser(
+        "tag-fill-provenance",
+        help="Audit and tag legacy fills with PAPER or LIVE provenance.",
+    )
+    provenance.add_argument("--config")
+    provenance.add_argument("--mode", required=True, choices=("paper", "live"))
+    provenance.add_argument("--operator", required=True)
+    provenance.add_argument("--evidence", required=True)
+    provenance.add_argument("--database-url")
     reconcile_live_order = subparsers.add_parser(
         "reconcile-live-order",
         help=(
@@ -328,6 +337,57 @@ async def _main_async(args: argparse.Namespace) -> int:
             )
         )
         return 0 if updated else 1
+    if args.command == "tag-fill-provenance":
+        try:
+            operator = normalize_submission_unknown_reconciled_by(
+                cast(str, args.operator)
+            )
+            evidence = _normalize_fee_reconcile_evidence(cast(str, args.evidence))
+        except (TypeError, ValueError) as exc:
+            print(json.dumps({"updated": False, "error": str(exc)}, sort_keys=True))
+            return 1
+        try:
+            settings = _load_cli_settings(cast(str | None, args.config))
+            pool = await asyncpg.create_pool(
+                dsn=args.database_url or settings.database.dsn,
+                min_size=1,
+                max_size=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"updated": False, "error": str(exc)}, sort_keys=True))
+            return 1
+        try:
+            await ensure_schema_current(pool)
+            tagged_count = await FillStore(pool).tag_fill_provenance(
+                mode=cast(str, args.mode),
+                operator=operator,
+                evidence=evidence,
+            )
+            await LiveEmergencyAuditWriter(
+                Path(settings.live_emergency_audit_path)
+            ).append_provenance_tag(
+                mode=cast(str, args.mode),
+                tagged_count=tagged_count,
+                operator=operator,
+                evidence=evidence,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"updated": False, "error": str(exc)}, sort_keys=True))
+            return 1
+        finally:
+            await pool.close()
+        print(
+            json.dumps(
+                {
+                    "updated": True,
+                    "mode": args.mode,
+                    "tagged_count": tagged_count,
+                    "operator": operator,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
     if args.command == "reconcile-live-fee":
         try:
             fill_id = _normalize_fee_reconcile_fill_id(cast(str, args.fill_id))

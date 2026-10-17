@@ -3238,7 +3238,31 @@ class Runner:
         if pool is None:
             return
         try:
+            fee_reader = getattr(self.fill_store, "read_fee_total_for_mode", None)
+            if callable(fee_reader) and isinstance(
+                getattr(self.fill_store, "pool", None), asyncpg.Pool
+            ):
+                reconciled_fee_total = await fee_reader(self.config.mode.value)
+            else:
+                reconciled_fee_total = 0.0
             mode_reader = getattr(self.fill_store, "read_positions_for_mode", None)
+            if callable(mode_reader) and isinstance(
+                getattr(self.fill_store, "pool", None), asyncpg.Pool
+            ):
+                legacy_fill_ids = await self.fill_store.untagged_fill_ids()
+                if legacy_fill_ids and self.config.mode == RunMode.LIVE:
+                    raise RuntimeError(
+                        "LIVE portfolio reconciliation found untagged legacy fills: "
+                        + ", ".join(legacy_fill_ids)
+                        + "; run pms-live tag-fill-provenance --mode live "
+                        "--operator <operator> --evidence <evidence>"
+                    )
+                if legacy_fill_ids:
+                    logger.warning(
+                        "treating %d untagged legacy fills as PAPER provenance: %s",
+                        len(legacy_fill_ids),
+                        ", ".join(legacy_fill_ids),
+                    )
             if callable(mode_reader) and isinstance(
                 getattr(self.fill_store, "pool", None), asyncpg.Pool
             ):
@@ -3275,7 +3299,7 @@ class Runner:
             self.portfolio = replace(
                 self.portfolio,
                 locked_usdc=0.0,
-                free_usdc=total_budget,
+                free_usdc=max(0.0, total_budget - reconciled_fee_total),
                 open_positions=[],
             )
             self._risk_peak_equity = _portfolio_equity(self.portfolio)
@@ -3295,7 +3319,7 @@ class Runner:
             )
             free_usdc = 0.0
         else:
-            free_usdc = total_budget - total_locked
+            free_usdc = max(0.0, total_budget - total_locked - reconciled_fee_total)
         self.portfolio = replace(
             self.portfolio,
             locked_usdc=total_locked,
@@ -3377,8 +3401,20 @@ class Runner:
                     + "; backfill durable run_mode provenance before restarting"
                 )
         if isinstance(self.fill_store, FillStore):
+            legacy_count = sum(trade.run_mode is None for trade in trades)
+            if legacy_count and self.config.mode in {RunMode.PAPER, RunMode.BACKTEST}:
+                logger.warning(
+                    "treating %d untagged legacy fills as PAPER provenance during risk replay",
+                    legacy_count,
+                )
             trades = [
-                trade for trade in trades if trade.run_mode == self.config.mode.value
+                trade
+                for trade in trades
+                if trade.run_mode == self.config.mode.value
+                or (
+                    trade.run_mode is None
+                    and self.config.mode in {RunMode.PAPER, RunMode.BACKTEST}
+                )
             ]
         if self.config.mode == RunMode.LIVE:
             unresolved_telemetry: list[str] = []
@@ -3406,7 +3442,8 @@ class Runner:
                     "reconcile-live-fee --fill-id <fill-id> "
                     "[--fees <venue-fee>] "
                     "[--slippage-bps <execution-slippage-bps>] "
-                    "--reconciled-by <operator> --evidence <venue-evidence>"
+                    "--reconciled-by <operator> --evidence <venue-evidence> "
+                    "[--override]"
                 )
         clear_day_start = (
             clear_cutoff.astimezone(UTC).replace(
