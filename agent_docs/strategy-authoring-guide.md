@@ -142,8 +142,10 @@ that does not exist, see §8 before continuing.
 `src/pms/strategies/paper_multifactor.py` is the smallest installed example.
 It composes the required `agent_probability` rule delta (weight `1.0`,
 freshness SLA `300s`) with the optional `orderbook_imbalance` rule delta
-(weight `0.1`, the same SLA), and uses the `rules` forecaster. The catalog
-row is owned by `agent:llm`, so observations are accepted only through the
+(weight `0.1`, the same SLA), and uses both the `rules` and `llm` forecasters.
+The LLM forecaster receives bounded, point-in-time agent evidence in PAPER and
+BACKTEST; evidence is omitted from LIVE prompts. The catalog row is owned by
+`agent:llm`, so observations are accepted only through the
 agent factor route and are read at the signal's point in time. Its metadata
 sets `live_allowed=false`; the controller loader also rejects any
 agent-owned factor in LIVE mode, so this flag is enforced at startup.

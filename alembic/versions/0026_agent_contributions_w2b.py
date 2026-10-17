@@ -47,6 +47,22 @@ def upgrade() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_agent_factor_provenance_market_ts
             ON agent_factor_provenance (market_id, ts DESC);
+
+        INSERT INTO factors (
+            factor_id, name, description, input_schema_hash, output_type, direction, owner
+        ) VALUES (
+            'agent_probability',
+            'Agent Probability',
+            'Externally submitted point-in-time probability from an agent.',
+            '3e8b3b26e3d6a9f3f7db8eb5d651c7adf3a2d3cf9f6f21f4b5b11f4aa2a2c5ef',
+            'probability', 'neutral', 'agent:llm'
+        ) ON CONFLICT (factor_id) DO UPDATE SET
+            name = EXCLUDED.name,
+            description = EXCLUDED.description,
+            input_schema_hash = EXCLUDED.input_schema_hash,
+            output_type = EXCLUDED.output_type,
+            direction = EXCLUDED.direction,
+            owner = EXCLUDED.owner;
         """
     )
 

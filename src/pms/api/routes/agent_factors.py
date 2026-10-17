@@ -118,6 +118,7 @@ async def submit_agent_factor_observation(
                         WHERE evidence_id = ANY($1::text[])
                           AND market_id = $2
                           AND captured_at <= $3
+                          AND created_at <= $3
                           AND (expires_at IS NULL OR expires_at > $3)
                         """,
                         request.evidence_ids,
@@ -164,6 +165,21 @@ async def submit_agent_factor_observation(
                     )
                     if existing_provenance is None:
                         raise HTTPException(status_code=409, detail="factor provenance was not persisted")
+                    existing_evidence_ids = existing_provenance["evidence_ids"]
+                    if isinstance(existing_evidence_ids, str):
+                        existing_evidence_ids = json.loads(existing_evidence_ids)
+                    if (
+                        str(existing_provenance["model"]) != request.model
+                        or str(existing_provenance["prompt_hash"]) != request.prompt_hash
+                        or [str(value) for value in existing_evidence_ids]
+                        != request.evidence_ids
+                        or str(existing_provenance["submitted_by_token_id"])
+                        != submitted_by_token_id
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="factor provenance conflicts with existing row",
+                        )
     except asyncpg.ForeignKeyViolationError as exc:
         raise HTTPException(status_code=422, detail="factor catalog or market does not exist") from exc
     return AgentFactorObservationResponse(

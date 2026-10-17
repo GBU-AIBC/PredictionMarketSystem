@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import asyncpg
 from fastapi import FastAPI, Request
@@ -24,9 +27,11 @@ from pms.storage.agent_evidence_store import (
     canonical_content_hash,
 )
 from pms.runner import Runner
+from pms.research.runner import BacktestRunner
 from pms.strategies.intents import StrategyContext
 from pms.strategies.agent_evidence import AgentEvidenceObservationSource
 from pms.strategies.paper_multifactor import build_paper_agent_probability_strategy
+from pms.strategies.projections import ForecasterSpec
 
 
 pytestmark = [
@@ -114,12 +119,13 @@ async def test_agent_evidence_and_factor_routes_round_trip_with_pit_and_provenan
         assert listed.status_code == 200
         assert len(listed.json()["evidence"]) == 1
 
+        factor_ts = datetime.now(tz=UTC)
         factor_response = await client.post(
             "/factors/agent_probability/observations",
             json={
                 "market_id": market_id,
                 "value": 0.8,
-                "ts": now.isoformat(),
+                "ts": factor_ts.isoformat(),
                 "model": "model-v1",
                 "prompt_hash": "a" * 64,
                 "evidence_ids": [evidence_response.json()["evidence_id"]],
@@ -131,16 +137,27 @@ async def test_agent_evidence_and_factor_routes_round_trip_with_pit_and_provenan
             json={
                 "market_id": market_id,
                 "value": 0.8,
-                "ts": now.isoformat(),
+                "ts": factor_ts.isoformat(),
                 "model": "model-other",
                 "prompt_hash": "e" * 64,
             },
         )
-        assert conflicting_provenance.status_code == 201
-        assert conflicting_provenance.json()["provenance_written"] is False
+        assert conflicting_provenance.status_code == 409
+        knowledge_time_conflict = await client.post(
+            "/factors/agent_probability/observations",
+            json={
+                "market_id": market_id,
+                "value": 0.8,
+                "ts": (now - timedelta(seconds=1)).isoformat(),
+                "model": "model-v1",
+                "prompt_hash": "a" * 64,
+                "evidence_ids": [evidence_response.json()["evidence_id"]],
+            },
+        )
+        assert knowledge_time_conflict.status_code == 422
         provenance = await client.get(
             "/factors/agent_probability/observations/provenance",
-            params={"market_id": market_id, "ts": now.isoformat()},
+            params={"market_id": market_id, "ts": factor_ts.isoformat()},
         )
         assert provenance.status_code == 200
         assert provenance.json()["model"] == "model-v1"
@@ -398,3 +415,134 @@ async def test_posted_evidence_changes_paper_llm_prompt_but_not_before_as_of(
     first_prompt = str(messages.calls[0]["messages"])
     assert "known-before-as-of" in first_prompt
     assert "captured-after-as-of" not in first_prompt
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_paper_evidence_replays_through_backtest_factory_without_provider(
+    pg_pool: asyncpg.Pool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "pms.controller.factory.validate_llm_runtime_dependencies",
+        lambda config: None,
+    )
+    market_id = "w2b-replay-evidence-market"
+    await _seed_market(pg_pool, market_id)
+    now = datetime.now(tz=UTC).replace(microsecond=0)
+    captured_at = now - timedelta(seconds=2)
+    expires_at = now + timedelta(minutes=5)
+    payload = {"probability": 0.8}
+    summary = "evidence used for replay"
+    evidence = {
+        "market_id": market_id,
+        "source": "replay-agent",
+        "model": "replay-model",
+        "url": "https://example.test/replay",
+        "summary": summary,
+        "payload": payload,
+        "content_hash": canonical_content_hash(
+            market_id=market_id,
+            source="replay-agent",
+            model="replay-model",
+            url="https://example.test/replay",
+            summary=summary,
+            payload=payload,
+            captured_at=captured_at,
+            expires_at=expires_at,
+        ),
+        "captured_at": captured_at.isoformat(),
+        "expires_at": expires_at.isoformat(),
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_api(pg_pool)),
+        base_url="http://test",
+    ) as client:
+        response = await client.post("/evidence", json=evidence)
+        assert response.status_code == 201, response.text
+    async with pg_pool.acquire() as connection:
+        await connection.execute(
+            "UPDATE agent_evidence SET created_at = $1 WHERE market_id = $2",
+            now - timedelta(seconds=1),
+            market_id,
+        )
+    signal = MarketSignal(
+        market_id=market_id,
+        token_id="replay-token",
+        venue="polymarket",
+        title="Replay evidence?",
+        yes_price=0.5,
+        volume_24h=1_000.0,
+        resolves_at=None,
+        orderbook={},
+        external_signal={},
+        fetched_at=now,
+        market_status="open",
+    )
+    strategy = build_paper_agent_probability_strategy().to_active(
+        strategy_version_id="paper-agent-v1"
+    )
+    strategy = replace(strategy, forecaster=ForecasterSpec(forecasters=(("llm", ()),)))
+    replay_path = str(tmp_path / "paper-research.jsonl")
+    llm_settings = LLMSettings(
+        enabled=True,
+        provider="openai",
+        api_key="test",
+        model="openai-test",
+        record_replay_path=replay_path,
+        cache_ttl_s=0.0,
+    )
+    settings = PMSSettings(
+        mode=RunMode.PAPER,
+        database=DatabaseSettings(
+            dsn="postgres://postgres:postgres@127.0.0.1:55432/pms_w2b"
+        ),
+        llm=llm_settings,
+    )
+    paper_factory = ControllerPipelineFactory(
+        settings=settings,
+        evidence_reader=AgentEvidenceObservationSource(AgentEvidenceStore(pg_pool)),
+    )
+    paper_pipeline = paper_factory.build(strategy)
+    assert paper_pipeline.forecasters is not None
+    paper_forecaster = cast(LLMForecaster, paper_pipeline.forecasters[0])
+
+    def paper_create(**kwargs: object) -> object:
+        del kwargs
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"prob_estimate": 0.81, "confidence": 0.7, "rationale": "evidence"}'
+                    )
+                )
+            ]
+        )
+
+    paper_forecaster.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=paper_create))
+    )
+    recorded = await paper_forecaster.apredict(signal)
+    assert recorded is not None, paper_forecaster.last_failure_reason
+
+    research_factory = ControllerPipelineFactory(
+        settings=settings.model_copy(update={"mode": RunMode.BACKTEST})
+    )
+    BacktestRunner(
+        writable_pool=pg_pool,
+        readonly_pool=pg_pool,
+        controller_factory=research_factory,
+    )
+    replay_pipeline = research_factory.build(strategy)
+    assert replay_pipeline.forecasters is not None
+    replay_forecaster = cast(LLMForecaster, replay_pipeline.forecasters[0])
+
+    def fail_create(**kwargs: object) -> object:
+        del kwargs
+        raise AssertionError("provider called during research replay")
+
+    replay_forecaster.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=fail_create))
+    )
+    replayed = await replay_forecaster.apredict(signal)
+    assert replayed == recorded

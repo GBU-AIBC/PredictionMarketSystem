@@ -43,7 +43,9 @@ from pms.research.specs import (
     ExecutionModel,
 )
 from pms.storage.market_data_store import PostgresMarketDataStore
+from pms.storage.agent_evidence_store import AgentEvidenceStore
 from pms.storage.strategy_registry import _strategy_from_config_json
+from pms.strategies.agent_evidence import AgentEvidenceObservationSource
 from pms.strategies.projections import ActiveStrategy
 
 
@@ -540,6 +542,9 @@ class BacktestRunner:
             )
             self.controller_factory.outcome_token_resolver = (
                 MarketDataOutcomeTokenResolver(market_data_store)
+            )
+            self.controller_factory.evidence_reader = AgentEvidenceObservationSource(
+                AgentEvidenceStore(self.readonly_pool)
             )
 
     async def execute(self, run_id: str) -> bool:
