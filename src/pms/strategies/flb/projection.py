@@ -46,6 +46,8 @@ def build_h1_flb_strategy(
         ("fee_rate", str(H1_FLB_FEE_RATE)),
         ("max_slippage_bps", str(H1_FLB_MAX_SLIPPAGE_BPS)),
         ("time_in_force", time_in_force.upper()),
+        ("min_confidence", "0.60"),
+        ("source_confidence", "0.65"),
         ("min_expected_edge", str(H1_FLB_MIN_EXPECTED_EDGE)),
         ("longshot_yes_threshold", str(H1_FLB_LONGSHOT_THRESHOLD)),
         ("favorite_yes_threshold", str(H1_FLB_FAVORITE_THRESHOLD)),

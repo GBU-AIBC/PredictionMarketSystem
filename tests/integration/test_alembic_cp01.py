@@ -206,3 +206,72 @@ def test_factor_definition_version_migration_preserves_historical_rows() -> None
             "-c",
             f"DROP DATABASE IF EXISTS {temp_database} WITH (FORCE)",
         )
+
+
+def test_factor_definition_version_downgrade_rejects_duplicate_versions() -> None:
+    assert PMS_TEST_DATABASE_URL
+    admin_database_url = _replace_database(PMS_TEST_DATABASE_URL, "postgres")
+    temp_database = f"pms_alembic_factor_dupes_{uuid.uuid4().hex[:12]}"
+    temp_database_url = _replace_database(PMS_TEST_DATABASE_URL, temp_database)
+    seed_sql = """
+    INSERT INTO markets (
+        condition_id, slug, question, venue, created_at, last_seen_at
+    ) VALUES (
+        'factor-duplicate-market', 'factor-duplicate-market',
+        'Will duplicate definitions survive downgrade?', 'polymarket', now(), now()
+    );
+    INSERT INTO factors (
+        factor_id, name, description, input_schema_hash, default_params,
+        output_type, direction, owner
+    ) VALUES (
+        'orderbook_imbalance', 'Orderbook', 'factor', 'hash', '{}'::jsonb,
+        'scalar', 'neutral', 'system'
+        ) ON CONFLICT (factor_id) DO NOTHING;
+    """
+    try:
+        _run_psql(admin_database_url, "-c", f"CREATE DATABASE {temp_database}")
+        upgrade_0023 = _run_alembic(
+            temp_database_url,
+            "upgrade",
+            "0023_backtest_execution_rows",
+        )
+        assert upgrade_0023.returncode == 0, upgrade_0023.stderr
+        _run_psql(temp_database_url, "-c", seed_sql)
+        upgrade_head = _run_alembic(temp_database_url, "upgrade", "head")
+        assert upgrade_head.returncode == 0, upgrade_head.stderr
+        _run_psql(
+            temp_database_url,
+            "-c",
+            """
+            INSERT INTO factor_values (
+                factor_id, param, market_id, ts, value, definition_version
+            ) VALUES
+                ('orderbook_imbalance', '', 'factor-duplicate-market',
+                 '2026-01-01T00:00:00Z', 0.1, '1'),
+                ('orderbook_imbalance', '', 'factor-duplicate-market',
+                 '2026-01-01T00:00:00Z', 0.9, '2')
+            """,
+        )
+        downgrade = _run_alembic(
+            temp_database_url,
+            "downgrade",
+            "0023_backtest_execution_rows",
+        )
+        assert downgrade.returncode != 0
+        assert "coexisting definition versions" in downgrade.stderr
+        current = _run_alembic(temp_database_url, "current")
+        assert "0024_factor_def_version_w1b" in current.stdout
+        column = _run_psql(
+            temp_database_url,
+            "-At",
+            "-c",
+            "SELECT COUNT(*) FROM information_schema.columns "
+            "WHERE table_name = 'factor_values' AND column_name = 'definition_version'",
+        ).stdout.strip()
+        assert column == "1"
+    finally:
+        _run_psql(
+            admin_database_url,
+            "-c",
+            f"DROP DATABASE IF EXISTS {temp_database} WITH (FORCE)",
+        )

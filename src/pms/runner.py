@@ -202,6 +202,7 @@ from pms.strategies.ripple.source import (
     build_ripple_strategy,
 )
 from pms.strategies.runtime_bridge import StrategyRunResult
+from pms.strategies.economics import strategy_economic_float
 from pms.strategies.versioning import compute_strategy_version_id
 from pms.supervision import (
     ALIVE_WORKER_STATES,
@@ -414,6 +415,10 @@ class Runner:
     )
     _controller_factory: ControllerPipelineFactory = field(init=False)
     _controller_runtimes: dict[str, StrategyControllerRuntime] = field(
+        init=False,
+        default_factory=dict,
+    )
+    _active_strategies_by_version: dict[tuple[str, str], ActiveStrategy] = field(
         init=False,
         default_factory=dict,
     )
@@ -985,6 +990,11 @@ class Runner:
                     if h1_strategy is not None
                     else 0.02
                 ),
+                confidence=(
+                    float(h1_metadata["source_confidence"])
+                    if h1_strategy is not None
+                    else 0.65
+                ),
                 time_in_force=(
                     TimeInForce(h1_metadata["time_in_force"])
                     if h1_strategy is not None
@@ -993,7 +1003,18 @@ class Runner:
                 calibration_model=self._flb_calibration_model,
             ),
             controller=FlbController(),
-            agent=FlbAgent(),
+            agent=FlbAgent(
+                min_confidence=(
+                    float(h1_metadata["min_confidence"])
+                    if h1_strategy is not None
+                    else 0.6
+                ),
+                min_expected_edge=(
+                    float(h1_metadata["min_expected_edge"])
+                    if h1_strategy is not None
+                    else 0.02
+                ),
+            ),
             strategy_id=strategy_id,
             strategy_version_id=strategy_version_id,
         )
@@ -1096,7 +1117,7 @@ class Runner:
                 time_in_force=TimeInForce(ripple_metadata["time_in_force"]),
             ),
             controller=RippleController(),
-            agent=RippleAgent(),
+            agent=RippleAgent(min_confidence=float(ripple_metadata["min_confidence"])),
             strategy_id=strategy_id,
             strategy_version_id=strategy_version_id,
         )
@@ -1178,7 +1199,11 @@ class Runner:
                 time_in_force=TimeInForce(anchoring_metadata["time_in_force"]),
             ),
             controller=AnchoringController(),
-            agent=AnchoringAgent(),
+            agent=AnchoringAgent(
+                min_confidence=float(anchoring_metadata["min_confidence"]),
+                min_expected_edge=float(anchoring_metadata["min_expected_edge"]),
+                min_divergence=float(anchoring_metadata["min_divergence"]),
+            ),
             strategy_id=strategy_id,
             strategy_version_id=strategy_version_id,
         )
@@ -1960,7 +1985,7 @@ class Runner:
                 fill_fee_rate = (
                     None
                     if self.config.mode == RunMode.LIVE
-                    else self.config.strategies.flb_fee_rate
+                    else self._paper_fill_fee_rate(decision)
                 )
                 fill = _fill_from_order(
                     order_state, decision, signal, fee_rate=fill_fee_rate
@@ -2072,6 +2097,18 @@ class Runner:
                     self._release_position_exit_key(decision.decision_id)
                     self._release_position_capacity_reservation(decision.decision_id)
                 self._decision_queue.task_done()
+
+    def _paper_fill_fee_rate(self, decision: TradeDecision) -> float:
+        strategy = self._active_strategies_by_version.get(
+            (decision.strategy_id, decision.strategy_version_id)
+        )
+        if strategy is None:
+            return self.config.strategies.flb_fee_rate
+        return strategy_economic_float(
+            strategy,
+            "fee_rate",
+            self.config.strategies.flb_fee_rate,
+        )
 
     async def _decision_expiry_loop(self) -> None:
         while True:
@@ -3499,6 +3536,11 @@ class Runner:
 
     async def _build_controller_runtimes(self) -> list[StrategyControllerRuntime]:
         if self.controller is not None:
+            strategy = getattr(self.controller, "strategy", None)
+            if isinstance(strategy, ActiveStrategy):
+                self._active_strategies_by_version = {
+                    (strategy.strategy_id, strategy.strategy_version_id): strategy
+                }
             return [
                 StrategyControllerRuntime(
                     strategy_id="default",
@@ -3516,6 +3558,10 @@ class Runner:
             active_strategies = await registry.list_active_strategies()
             if not active_strategies:
                 return []
+            self._active_strategies_by_version = {
+                (strategy.strategy_id, strategy.strategy_version_id): strategy
+                for strategy in active_strategies
+            }
             self._require_live_active_strategies_match_preflight(active_strategies)
             scopes: dict[str, frozenset[str]] = {}
             if (
@@ -3539,6 +3585,11 @@ class Runner:
             ]
 
         default_strategy = _default_active_strategy(self.config)
+        self._active_strategies_by_version = {
+            (default_strategy.strategy_id, default_strategy.strategy_version_id): (
+                default_strategy
+            )
+        }
         pipeline = self._controller_factory.build(default_strategy)
         return [
             StrategyControllerRuntime(

@@ -14,17 +14,27 @@ class StrategyEconomicsError(ValueError):
 
 
 def validate_strategy_economics(metadata: tuple[tuple[str, str], ...]) -> None:
+    seen: set[str] = set()
+    for key, _ in metadata:
+        if key in seen:
+            raise StrategyEconomicsError(
+                f"duplicate strategy metadata key: {key!r}"
+            )
+        seen.add(key)
     values = dict(metadata)
+    if "economics_version" not in values:
+        return
     bounded_rates = {"fee_rate", "fee_rate_fallback"}
     non_negative = {
-        "max_slippage_bps",
         "entry_execution_cost_bps",
         "prior_strength",
         "decay_window_hours",
     }
+    non_negative_int = {"max_slippage_bps"}
     positive = {"min_expected_edge", "min_divergence"}
     probabilities = {
         "min_confidence",
+        "source_confidence",
         "longshot_yes_threshold",
         "favorite_yes_threshold",
     }
@@ -34,6 +44,9 @@ def validate_strategy_economics(metadata: tuple[tuple[str, str], ...]) -> None:
     for key in non_negative:
         if key in values:
             _require_float(values[key], key, minimum=0.0)
+    for key in non_negative_int:
+        if key in values:
+            _require_float(values[key], key, minimum=0.0, require_integer=True)
     for key in positive:
         if key in values:
             _require_float(values[key], key, minimum=0.0, strict_minimum=True)
@@ -57,6 +70,7 @@ def _require_float(
     minimum: float,
     maximum: float | None = None,
     strict_minimum: bool = False,
+    require_integer: bool = False,
 ) -> float:
     try:
         value = float(raw)
@@ -69,7 +83,11 @@ def _require_float(
             f"invalid strategy economic value {key!r}: {raw!r}"
         )
     minimum_failed = value <= minimum if strict_minimum else value < minimum
-    if minimum_failed or (maximum is not None and value > maximum):
+    if (
+        minimum_failed
+        or (maximum is not None and value > maximum)
+        or (require_integer and not value.is_integer())
+    ):
         raise StrategyEconomicsError(
             f"strategy economic value {key!r} is out of range: {value!r}"
         )

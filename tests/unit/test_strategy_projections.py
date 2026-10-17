@@ -357,6 +357,7 @@ def test_active_strategy_rejects_identity_mismatch() -> None:
         ("fee_rate", "nan"),
         ("max_slippage_bps", "-1"),
         ("max_slippage_bps", "nan"),
+        ("max_slippage_bps", "50.5"),
         ("entry_execution_cost_bps", "-1"),
         ("min_expected_edge", "0"),
         ("time_in_force", "BAD"),
@@ -383,3 +384,50 @@ def test_strategy_rejects_malformed_hashed_economics(key: str, value: str) -> No
             market_selection=strategy.market_selection,
             calibration=strategy.calibration,
         )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        (("fee_rate", "0.01"), ("fee_rate", "0.20")),
+        (("fee_rate", "0.20"), ("fee_rate", "0.01")),
+    ],
+)
+def test_strategy_rejects_duplicate_metadata_before_hashing(
+    metadata: tuple[tuple[str, str], ...],
+) -> None:
+    from pms.strategies.aggregate import Strategy
+    from pms.strategies.flb.projection import build_h1_flb_strategy
+
+    strategy = build_h1_flb_strategy()
+    malformed = replace(strategy.config, metadata=metadata)
+    with pytest.raises(ValueError, match="duplicate strategy metadata key"):
+        Strategy(
+            config=malformed,
+            risk=strategy.risk,
+            eval_spec=strategy.eval_spec,
+            forecaster=strategy.forecaster,
+            market_selection=strategy.market_selection,
+            calibration=strategy.calibration,
+        )
+
+
+def test_non_economics_metadata_schema_is_not_interpreted_as_economics() -> None:
+    from pms.strategies.aggregate import Strategy
+    from pms.strategies.flb.projection import build_h1_flb_strategy
+
+    strategy = build_h1_flb_strategy()
+    metadata = dict(strategy.config.metadata)
+    metadata.pop("economics_version")
+    metadata["min_confidence"] = "high"
+    generic_metadata = replace(strategy.config, metadata=tuple(metadata.items()))
+
+    loaded = Strategy(
+        config=generic_metadata,
+        risk=strategy.risk,
+        eval_spec=strategy.eval_spec,
+        forecaster=strategy.forecaster,
+        market_selection=strategy.market_selection,
+        calibration=strategy.calibration,
+    )
+    assert dict(loaded.config.metadata)["min_confidence"] == "high"

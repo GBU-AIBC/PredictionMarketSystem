@@ -461,6 +461,7 @@ def test_runner_builds_live_ripple_source_with_fractional_kelly_sizer() -> None:
     assert module.source.position_sizer.risk is not None
     assert module.source.position_sizer.risk.max_position_per_market == pytest.approx(1.0)
     assert module.source.position_sizer.fraction == Decimal("0.25")
+    assert getattr(module.agent, "min_confidence") == pytest.approx(0.60)
 
 
 def test_ripple_runtime_requires_hashed_economics_version() -> None:

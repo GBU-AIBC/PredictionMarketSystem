@@ -1,4 +1,9 @@
-"""Record the raw factor definition version beside each observation."""
+"""Record factor definition versions.
+
+Downgrade requires no coexisting definition versions at one legacy key because
+the pre-0024 four-column unique index cannot represent those rows losslessly.
+It fails before any DDL when that precondition is violated.
+"""
 
 from __future__ import annotations
 
@@ -31,6 +36,22 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     connection: Connection = op.get_bind()
+    has_duplicates = connection.exec_driver_sql(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM factor_values
+            GROUP BY factor_id, param, market_id, ts
+            HAVING COUNT(*) > 1
+        )
+        """
+    ).scalar()
+    if has_duplicates:
+        raise RuntimeError(
+            "Cannot downgrade 0024_factor_def_version_w1b: factor_values contains "
+            "coexisting definition versions at the same factor/param/market/timestamp; "
+            "resolve duplicates without deleting observations, then retry downgrade."
+        )
     connection.exec_driver_sql(
         "ALTER TABLE factor_values DROP COLUMN IF EXISTS definition_version"
     )

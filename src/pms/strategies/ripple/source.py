@@ -98,6 +98,7 @@ def build_ripple_strategy(strategy_id: str, *, time_in_force: str = "GTC") -> St
                 ("prior_strength", str(RIPPLE_DEFAULT_PRIOR_STRENGTH)),
                 ("min_expected_edge", str(RIPPLE_DEFAULT_MIN_EXPECTED_EDGE)),
                 ("max_slippage_bps", str(RIPPLE_DEFAULT_MAX_SLIPPAGE_BPS)),
+                ("min_confidence", "0.60"),
                 ("time_in_force", time_in_force.upper()),
             ),
         ),

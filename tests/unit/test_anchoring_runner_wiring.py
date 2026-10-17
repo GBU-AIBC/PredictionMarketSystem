@@ -81,6 +81,7 @@ def test_runner_builds_anchoring_strategy_module_with_live_components() -> None:
     assert isinstance(module.agent, AnchoringAgent)
     assert module.strategy_id == "h2_anchoring_lag"
     assert module.strategy_version_id == "h2-anchoring-lag-v1"
+    assert getattr(module.agent, "min_confidence") == pytest.approx(0.60)
 
 
 def test_anchoring_runtime_requires_hashed_economics_version() -> None:

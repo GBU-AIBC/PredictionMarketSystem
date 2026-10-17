@@ -13,7 +13,8 @@ from pms.config import (
     RiskSettings,
     StrategyRuntimeSettings,
 )
-from pms.core.enums import RunMode
+from pms.core.enums import RunMode, TimeInForce
+from pms.core.models import TradeDecision
 from pms.runner import Runner
 from pms.strategies.flb import FlbAgent, FlbController, FlbStrategyModule, LiveFlbSource
 from pms.strategies.flb.projection import build_h1_flb_strategy
@@ -225,6 +226,8 @@ def test_runner_builds_flb_strategy_module_with_live_components() -> None:
     assert isinstance(module.agent, FlbAgent)
     assert module.strategy_id == "h1_flb"
     assert module.strategy_version_id == "h1-flb-v1"
+    assert module.source.confidence == pytest.approx(0.65)
+    assert getattr(module.agent, "min_confidence") == pytest.approx(0.60)
     position_sizer_risk = getattr(module.source.position_sizer, "risk")
     assert position_sizer_risk is not None
     assert position_sizer_risk.max_position_per_market == pytest.approx(1.0)
@@ -259,6 +262,40 @@ def test_runner_flb_module_rejects_mismatched_strategy_version() -> None:
             market_ids=("market-flb-1",),
             market_reader=_StaticFlbMarketReader(_market()),
         )
+
+
+def test_paper_fill_fee_uses_versioned_strategy_fee() -> None:
+    strategy = build_h1_flb_strategy()
+    version_id = compute_strategy_version_id(*strategy.snapshot())
+    runner = Runner(
+        config=PMSSettings(
+            strategies=StrategyRuntimeSettings(flb_fee_rate=0.25),
+        )
+    )
+    runner._active_strategies_by_version[("h1_flb", version_id)] = strategy.to_active(
+        strategy_version_id=version_id
+    )
+    decision = TradeDecision(
+        decision_id="decision-fee",
+        market_id="market-fee",
+        token_id="token-fee",
+        venue="polymarket",
+        side="BUY",
+        limit_price=0.5,
+        notional_usdc=10.0,
+        order_type="limit",
+        max_slippage_bps=50,
+        stop_conditions=[],
+        prob_estimate=0.7,
+        expected_edge=0.2,
+        time_in_force=TimeInForce.GTC,
+        opportunity_id="opportunity-fee",
+        strategy_id="h1_flb",
+        strategy_version_id=version_id,
+        action="BUY",
+    )
+
+    assert runner._paper_fill_fee_rate(decision) == pytest.approx(0.07)
 
 
 def test_runner_rejects_configured_flb_calibration_without_provenance(
