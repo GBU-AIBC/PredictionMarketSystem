@@ -578,6 +578,14 @@ async def test_runner_market_selection_freshness_has_safety_floor(
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
+    runner.config.sensor.discovery_max_pages = 30
+    runner._wire_active_perception((Discovery(), Data()))  # noqa: SLF001
+    assert captured["store"]._market_freshness_s == pytest.approx(1500.0)  # noqa: SLF001
+    task = runner._reselection_task  # noqa: SLF001
+    if task is not None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
 
 def test_default_active_strategy_uses_operational_market_selection_horizon() -> None:
     strategy = _default_active_strategy(_settings(RunMode.PAPER))
@@ -690,7 +698,9 @@ async def test_runner_active_perception_reselection_is_serialized(
     await asyncio.wait_for(second, timeout=2.0)
 
     assert selector.calls == 2
-    assert subscription_controller.calls == 2
+    # The second selection supersedes the first before either publishes;
+    # generation fencing prevents a stale result from re-subscribing assets.
+    assert subscription_controller.calls == 1
 
     discovery.poll_released.set()
     await runner.stop()
@@ -946,6 +956,47 @@ async def test_reselect_does_not_hold_lock_during_selection_io() -> None:
     selector.release.set()
     await asyncio.wait_for(task, timeout=1.0)
     assert subscription_controller.updates == [["selected-token"]]
+
+
+@pytest.mark.asyncio
+async def test_reselect_discards_result_superseded_by_controller_refresh() -> None:
+    class Selector:
+        last_user_subscription_asset_ids: frozenset[str] = frozenset()
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def select(self) -> Any:
+            self.started.set()
+            await self.release.wait()
+            return SimpleNamespace(asset_ids=["stale-selection"])
+
+    @dataclass
+    class SubscriptionController:
+        updates: list[list[str]] = field(default_factory=list)
+
+        async def update(self, asset_ids: list[str]) -> bool:
+            self.updates.append(list(asset_ids))
+            return True
+
+    runner = _runner(RunMode.PAPER)
+    selector = Selector()
+    subscription_controller = SubscriptionController()
+    runner._market_selector = cast(Any, selector)  # noqa: SLF001
+    runner._subscription_controller = cast(Any, subscription_controller)  # noqa: SLF001
+    runner._controller_runtimes = {  # noqa: SLF001
+        "alpha": cast(Any, SimpleNamespace(asset_ids=frozenset({"fresh-refresh"})))
+    }
+
+    reselect_task = asyncio.create_task(runner._reselect())  # noqa: SLF001
+    await asyncio.wait_for(selector.started.wait(), timeout=1.0)
+    await runner._refresh_subscription_assets_locked()  # noqa: SLF001
+    assert subscription_controller.updates == [["fresh-refresh"]]
+
+    selector.release.set()
+    await asyncio.wait_for(reselect_task, timeout=1.0)
+    assert subscription_controller.updates == [["fresh-refresh"]]
 
 
 @pytest.mark.asyncio

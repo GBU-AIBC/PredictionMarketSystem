@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, cast
 
 from pydantic import BaseModel
@@ -47,6 +47,7 @@ async def subscribe_market(
     token_id: str,
     request_metadata: Mapping[str, object],
     max_subscription_asset_ids: int | None = None,
+    protected_asset_ids: Sequence[str] = (),
 ) -> SubscribeMarketResponse:
     row = await store.upsert_user_subscription(token_id)
     if row is None:
@@ -61,9 +62,10 @@ async def subscribe_market(
     effective = True
     if max_subscription_asset_ids is not None:
         active_ids = sorted(await store.read_user_subscriptions())
+        ordered_ids = list(dict.fromkeys([*protected_asset_ids, *active_ids]))
         effective = (
             not active_ids
-            or token_id in active_ids[:max_subscription_asset_ids]
+            or token_id in ordered_ids[:max_subscription_asset_ids]
         )
     return SubscribeMarketResponse(
         token_id=row.token_id,

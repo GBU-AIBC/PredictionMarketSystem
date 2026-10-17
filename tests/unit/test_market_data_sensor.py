@@ -848,6 +848,65 @@ async def test_market_data_sensor_fails_after_repeated_persistence_errors(
 
 
 @pytest.mark.asyncio
+async def test_market_data_sensor_poison_after_good_frame_keeps_backoff_and_escalates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store_mock()
+    store_mock = cast(StoreMock, store)
+    store_mock.write_book_snapshot_mock.side_effect = [
+        value
+        for _ in range(5)
+        for value in (1, TypeError("poison frame"))
+    ]
+
+    def _book_payload(hash_value: str) -> str:
+        return json.dumps(
+            {
+                "event_type": "book",
+                "market": "m-poison-after-good",
+                "asset_id": "asset-poison-after-good",
+                "timestamp": "1757908892351",
+                "hash": hash_value,
+                "bids": [{"price": "0.48", "size": "30"}],
+                "asks": [{"price": "0.52", "size": "25"}],
+            }
+        )
+
+    monkeypatch.setattr(
+        "pms.sensor.adapters.market_data.connect",
+        ConnectSequence(
+            [
+                FakeWebSocket([_book_payload(f"good-{index}"), _book_payload(f"poison-{index}")])
+                for index in range(5)
+            ]
+        ),
+    )
+    sensor = MarketDataSensor(
+        store=store,
+        ws_url="ws://market-data.example.test",
+        asset_ids=["asset-poison-after-good"],
+    )
+    sensor._INITIAL_BACKOFF_S = 0.01
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(sensor, "_sleep", fake_sleep)
+    iterator = cast(Any, sensor.__aiter__())
+
+    for _ in range(5):
+        await asyncio.wait_for(anext(iterator), timeout=0.5)
+    with pytest.raises(SensorDataQualityError, match="consecutive"):
+        await asyncio.wait_for(anext(iterator), timeout=0.5)
+
+    assert sleeps == [0.01, 0.02, 0.04, 0.08]
+    assert sensor.consecutive_data_error_reconnects == 5
+    await sensor.aclose()
+
+
+@pytest.mark.asyncio
 async def test_market_data_sensor_skips_malformed_json_and_continues_loop(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

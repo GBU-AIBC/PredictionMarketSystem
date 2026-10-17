@@ -394,6 +394,11 @@ def create_app(
                 max_subscription_asset_ids=(
                     active_runner.config.sensor.max_subscription_asset_ids
                 ),
+                protected_asset_ids=tuple(
+                    position.token_id
+                    for position in active_runner.portfolio.open_positions
+                    if position.token_id is not None
+                ),
             )
         except UnknownSubscriptionTokenError as exc:
             raise HTTPException(status_code=404, detail="Token not found") from exc

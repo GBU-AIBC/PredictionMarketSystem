@@ -438,6 +438,7 @@ class Runner:
     _reselection_task: asyncio.Task[None] | None = field(init=False, default=None)
     _reselection_lock: asyncio.Lock = field(init=False)
     _market_selection_lock: asyncio.Lock = field(init=False)
+    _reselection_generation: int = field(init=False, default=0)
     _reselection_requested: asyncio.Event = field(init=False)
     _strategy_change_callbacks_registered: bool = field(init=False, default=False)
     _active_sensors: tuple[ISensor, ...] = field(init=False, default=())
@@ -1157,6 +1158,7 @@ class Runner:
         self._subscription_controller = None
         self._reselection_task = None
         self._reselection_requested.clear()
+        self._reselection_generation = 0
         if self.config.mode == RunMode.BACKTEST:
             return
         if self._pg_pool is None:
@@ -1174,12 +1176,18 @@ class Runner:
         if self._strategy_registry is None:
             msg = "Runner strategy registry is not initialized"
             raise RuntimeError(msg)
+        discovery_cycle_budget_s = self.config.sensor.discovery_max_pages * (
+            self.config.sensor.discovery_http_timeout_s
+            + self.config.sensor.discovery_http_pool_timeout_s
+            + 30.0
+        )
         self._market_selector = MarketSelector(
             PostgresMarketDataStore(
                 self._pg_pool,
                 market_freshness_s=max(
                     3.0 * self.config.sensor.poll_interval_s,
                     300.0,
+                    discovery_cycle_budget_s,
                 ),
             ),
             self._strategy_registry,
@@ -3056,6 +3064,9 @@ class Runner:
         subscription_controller = self._subscription_controller
         if selector is None or subscription_controller is None:
             return
+        async with self._reselection_lock:
+            self._reselection_generation += 1
+            generation = self._reselection_generation
         # Serialize selector reads without holding the subscription lock; the
         # DB pool may wait here, while the bounded websocket update below does
         # not hold a pool-backed lock.
@@ -3066,6 +3077,8 @@ class Runner:
             *sorted(_selector_user_subscription_asset_ids(selector)),
         ]
         async with self._reselection_lock:
+            if generation != self._reselection_generation:
+                return
             await subscription_controller.update(
                 _cap_subscription_asset_ids(
                     list(result.asset_ids),
@@ -3345,6 +3358,7 @@ class Runner:
         )
         selector = self._market_selector
         async with self._reselection_lock:
+            self._reselection_generation += 1
             await subscription_controller.update(
                 _cap_subscription_asset_ids(
                     merged_asset_ids,

@@ -11,6 +11,7 @@ import pytest
 from pms.api.app import create_app
 from pms.config import PMSSettings
 from pms.core.enums import RunMode
+from pms.core.models import Portfolio, Position
 from pms.runner import Runner
 from pms.storage.market_subscription_store import MarketSubscriptionRow
 
@@ -237,6 +238,44 @@ async def test_subscribe_endpoint_surfaces_pin_dropped_by_cap(
         base_url="http://test",
     ) as client:
         response = await client.post("/markets/token-yes/subscribe")
+
+    assert response.status_code == 200
+    assert response.json()["effective"] is False
+
+
+@pytest.mark.asyncio
+async def test_subscribe_effective_accounts_for_open_position_cap_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _SubscriptionStoreDouble(
+        upsert_results=[_row(token_id="user-token")],
+        user_subscription_results=[{"user-token"}],
+    )
+    app = _app(monkeypatch, store)
+    app.state.runner.config.sensor.max_subscription_asset_ids = 1
+    app.state.runner.portfolio = Portfolio(
+        total_usdc=100.0,
+        free_usdc=90.0,
+        locked_usdc=10.0,
+        open_positions=[
+            Position(
+                market_id="held-market",
+                token_id="held-token",
+                venue="polymarket",
+                side="BUY",
+                shares_held=10.0,
+                avg_entry_price=1.0,
+                unrealized_pnl=0.0,
+                locked_usdc=10.0,
+            )
+        ],
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post("/markets/user-token/subscribe")
 
     assert response.status_code == 200
     assert response.json()["effective"] is False

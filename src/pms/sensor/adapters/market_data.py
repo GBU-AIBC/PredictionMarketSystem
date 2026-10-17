@@ -151,6 +151,7 @@ class MarketDataSensor:
                     "reconnect" if self._connected_once else "subscribe"
                 )
                 connection_had_data = False
+                connection_had_data_error = False
                 try:
                     async with self._connect() as websocket:
                         self._reset_book_state()
@@ -176,7 +177,6 @@ class MarketDataSensor:
                             async for raw_message in websocket:
                                 signals = await self._handle_raw_message(raw_message)
                                 connection_had_data = True
-                                self._consecutive_data_error_reconnects = 0
                                 for signal in signals:
                                     yield signal
                         finally:
@@ -206,8 +206,14 @@ class MarketDataSensor:
                 ) as error:
                     is_data_error = isinstance(
                         error,
-                        (SensorDataQualityError, ValueError, TypeError),
+                        (
+                            SensorDataQualityError,
+                            ValueError,
+                            TypeError,
+                            asyncpg.PostgresError,
+                        ),
                     )
+                    connection_had_data_error = is_data_error
                     if is_data_error:
                         self._consecutive_data_error_reconnects += 1
                         if (
@@ -231,10 +237,10 @@ class MarketDataSensor:
                         )
                     else:
                         _log_reconnectable_error(error)
-                    if connection_had_data:
+                    if connection_had_data and not connection_had_data_error:
                         backoff = self._INITIAL_BACKOFF_S
                     await self._sleep(backoff)
-                    if not connection_had_data:
+                    if not connection_had_data or connection_had_data_error:
                         backoff = min(backoff * 2.0, self._max_reconnect_interval_s)
                 else:
                     # A normal websocket iterator completion is a clean
@@ -243,6 +249,7 @@ class MarketDataSensor:
                     # a close before data keeps the current backoff.
                     if connection_had_data:
                         backoff = self._INITIAL_BACKOFF_S
+                        self._consecutive_data_error_reconnects = 0
                     await self._sleep(backoff)
                     if not connection_had_data:
                         backoff = min(backoff * 2.0, self._max_reconnect_interval_s)
