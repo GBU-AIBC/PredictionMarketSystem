@@ -67,6 +67,7 @@ class Scorer:
             filled=fill.status == OrderStatus.MATCHED.value,
             edge_at_decision=decision.expected_edge,
             spread_bps_at_decision=decision.spread_bps_at_decision,
+            calibration_prob_estimate=decision.calibration_prob_estimate,
         )
 
 

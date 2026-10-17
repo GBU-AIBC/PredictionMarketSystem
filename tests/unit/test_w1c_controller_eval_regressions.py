@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
-from pms.config import LLMSettings, RiskSettings
+from pms.config import DatabaseSettings, LLMSettings, PMSSettings, RiskSettings
 from pms.actuator.risk import InsufficientLiquidityError
 from pms.controller.forecasters.llm import (
     LLMForecaster,
@@ -15,6 +16,7 @@ from pms.controller.forecasters.llm import (
     _prompt,
 )
 from pms.controller.calibrators.netcal import NetcalCalibrator
+from pms.controller.pipeline import ControllerPipeline
 from pms.controller.sizers.kelly import KellySizer
 from pms.core.enums import Side, TimeInForce
 from pms.core.models import EvalRecord, FillRecord, MarketSignal, Portfolio, TradeDecision
@@ -24,7 +26,14 @@ from pms.storage.eval_store import EvalStore
 from tests.support.fake_stores import InMemoryEvalStore
 from pms.research.execution import _walk_book
 from pms.research.replay import _market_resolution_label
-from pms.strategies.projections import EvalSpec
+from pms.strategies.projections import (
+    EvalSpec,
+    ForecasterSpec,
+    MarketSelectionSpec,
+    RiskParams,
+    StrategyConfig,
+)
+from pms.strategies.versioning import compute_strategy_version_id
 
 
 def _signal(external_signal: dict[str, object]) -> MarketSignal:
@@ -149,6 +158,28 @@ def test_llm_unknown_model_price_fails_closed_when_usage_is_reported() -> None:
     assert calls == []
 
 
+def test_default_controller_pipeline_derives_restart_safe_spend_ledger(
+    tmp_path: Path,
+) -> None:
+    settings = PMSSettings(
+        llm=LLMSettings(
+            enabled=True,
+            provider="openai",
+            api_key="test",
+            model="openai-test",
+        ),
+        database=DatabaseSettings(dsn="postgresql://db-a/pms"),
+        live_emergency_audit_path=str(tmp_path / "audit" / "events.jsonl"),
+    )
+    pipeline = ControllerPipeline(settings=settings)
+    assert pipeline.forecasters is not None
+    llm = cast(LLMForecaster, pipeline.forecasters[2])
+    assert llm.config is not None
+    assert llm.config.spend_ledger_path is not None
+    assert str(tmp_path / "audit") in llm.config.spend_ledger_path
+    assert ".cache" not in llm.config.spend_ledger_path
+
+
 def test_kelly_sizes_on_cost_adjusted_entry_price() -> None:
     sizer = KellySizer(risk=RiskSettings(max_position_per_market=1_000.0))
     portfolio = Portfolio(1_000.0, 1_000.0, 0.0, [])
@@ -208,6 +239,63 @@ def test_eval_feedback_defaults_require_a_sample_window() -> None:
     defaults = EvalSpec(metrics=("slippage", "win_rate"))
     assert defaults.min_slippage_samples == 20
     assert defaults.min_win_rate_samples == 20
+
+
+def test_strategy_version_hash_includes_effective_llm_identity() -> None:
+    config = StrategyConfig(strategy_id="w1c", factor_composition=(), metadata=())
+    risk = RiskParams(
+        max_position_notional_usdc=100.0,
+        max_daily_drawdown_pct=2.5,
+        min_order_size_usdc=1.0,
+    )
+    eval_spec = EvalSpec(metrics=("brier",))
+    forecaster = ForecasterSpec(forecasters=(("llm", ()),))
+    market_selection = MarketSelectionSpec(
+            venue="polymarket",
+            resolution_time_max_horizon_days=7,
+            volume_min_usdc=1.0,
+    )
+    first = compute_strategy_version_id(
+        config,
+        risk,
+        eval_spec,
+        forecaster,
+        market_selection,
+        llm_identity=("anthropic", "claude-sonnet-4-6", "v1"),
+    )
+    second = compute_strategy_version_id(
+        config,
+        risk,
+        eval_spec,
+        forecaster,
+        market_selection,
+        llm_identity=("openai", "gpt-test", "v1"),
+    )
+    assert first != second
+
+
+def test_netcal_trains_on_persisted_pre_netcal_coordinate() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    records = [
+        EvalRecord(
+            market_id=f"m-{index}",
+            decision_id=f"d-{index}",
+            strategy_id="w1c",
+            strategy_version_id="v1",
+            prob_estimate=0.9,
+            calibration_prob_estimate=0.1,
+            resolved_outcome=0.0,
+            brier_score=0.81,
+            fill_status="matched",
+            recorded_at=now,
+            citations=[],
+            model_id="ensemble",
+        )
+        for index in range(100)
+    ]
+    calibrator = NetcalCalibrator()
+    calibrator.add_samples("ensemble", records)
+    assert calibrator.calibrate(0.1, model_id="ensemble") == pytest.approx(0.0)
 
 
 def test_replay_resolution_label_accepts_closed_settlement_prices() -> None:

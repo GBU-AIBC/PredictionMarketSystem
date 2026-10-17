@@ -147,6 +147,7 @@ class _ReplayPipeline:
         self.strategy_id = strategy_id
         self.strategy_version_id = strategy_version_id
         self._emitted = False
+        self.seen_resolution_label = False
 
     async def on_signal(
         self,
@@ -154,6 +155,7 @@ class _ReplayPipeline:
         portfolio: Portfolio | None = None,
     ) -> tuple[Opportunity, TradeDecision] | None:
         del portfolio
+        self.seen_resolution_label |= "resolved_outcome" in signal.external_signal
         if self._emitted:
             return None
         self._emitted = True
@@ -321,21 +323,24 @@ async def test_real_replay_ioc_fill_scores_brier_and_pnl_from_market_resolution(
         market_id,
         resolved_outcome=1.0,
         source="test",
+        resolved_at=datetime(2026, 3, 1, tzinfo=UTC),
     )
     run_id = str(uuid.uuid4())
     await _insert_runner_row(pg_pool, run_id=run_id, market_id=market_id)
     from pms.research.replay import MarketUniverseReplayEngine
 
     engine = MarketUniverseReplayEngine(pool=pg_pool)
+    factory = _ReplayPipelineFactory()
     runner = BacktestRunner(
         writable_pool=pg_pool,
         readonly_pool=pg_pool,
         replay_engine=engine,
         execution_simulator=BacktestExecutionSimulator(replay_engine=engine),
         strategy_loader=lambda _keys: _load_one_strategy(),
-        controller_factory=_ReplayPipelineFactory(),
+        controller_factory=factory,
     )
     assert await runner.execute(run_id) is True
+    assert factory.pipeline.seen_resolution_label is False
     async with pg_pool.acquire() as connection:
         row = await connection.fetchrow(
             """

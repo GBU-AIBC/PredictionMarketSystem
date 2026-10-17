@@ -47,6 +47,7 @@ class EvalStore:
                 record.strategy_version_id,
                 record.edge_at_decision,
                 record.spread_bps_at_decision,
+                record.calibration_prob_estimate,
             )
         return cast(str, result).rsplit(" ", maxsplit=1)[-1] == "1"
 
@@ -108,10 +109,11 @@ async def insert_eval_record_row(
             strategy_id,
             strategy_version_id,
             edge_at_decision,
-            spread_bps_at_decision
+            spread_bps_at_decision,
+            calibration_prob_estimate
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12::jsonb,
-            $13, $14, $15, $16, $17, $18, $19, $20, $21
+            $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
         )
         ON CONFLICT (decision_id) DO NOTHING
         """,
@@ -136,6 +138,7 @@ async def insert_eval_record_row(
         record.strategy_version_id,
         record.edge_at_decision,
         record.spread_bps_at_decision,
+        record.calibration_prob_estimate,
     )
     return cast(str, result).rsplit(" ", maxsplit=1)[-1] == "1"
 
@@ -161,7 +164,8 @@ SET market_id = $2,
     strategy_id = $18,
     strategy_version_id = $19,
     edge_at_decision = $20,
-    spread_bps_at_decision = $21
+    spread_bps_at_decision = $21,
+    calibration_prob_estimate = $22
 WHERE decision_id = $1
 """
 
@@ -188,7 +192,8 @@ SELECT
     slippage_bps,
     filled,
     edge_at_decision,
-    spread_bps_at_decision
+    spread_bps_at_decision,
+    calibration_prob_estimate
 FROM eval_records
 ORDER BY recorded_at ASC, decision_id ASC
 """
@@ -216,7 +221,8 @@ SELECT
     slippage_bps,
     filled,
     edge_at_decision,
-    spread_bps_at_decision
+    spread_bps_at_decision,
+    calibration_prob_estimate
 FROM eval_records
 WHERE strategy_id = $1 AND strategy_version_id = $2
 ORDER BY recorded_at ASC, decision_id ASC
@@ -270,6 +276,10 @@ def _eval_record_from_row(row: asyncpg.Record) -> EvalRecord:
         spread_bps_at_decision=cast(
             int | None,
             _row_value(row, "spread_bps_at_decision", None),
+        ),
+        calibration_prob_estimate=cast(
+            float | None,
+            _row_value(row, "calibration_prob_estimate", None),
         ),
     )
 

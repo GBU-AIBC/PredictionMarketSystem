@@ -21,6 +21,7 @@ from pms.strategies.projections import EvalSpec
 
 
 logger = logging.getLogger(__name__)
+_MAX_TRACKED_ORDER_SNAPSHOTS = 10_000
 
 StrategyMetricsProvider = Callable[
     [],
@@ -157,6 +158,10 @@ class EvalSpool:
             fill.fill_quantity,
             fill.status,
         )
+        if len(self._latest_order_totals) > _MAX_TRACKED_ORDER_SNAPSHOTS:
+            self._latest_order_totals.pop(next(iter(self._latest_order_totals)))
+        if fill.status in {"matched", "filled", "cancelled", "rejected"}:
+            self._latest_order_totals.pop(fill.order_id, None)
         if previous is None and inserted:
             self._scored_record_count += 1
         if self.calibration_sink is not None:

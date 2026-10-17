@@ -15,6 +15,9 @@ depends_on = None
 def upgrade() -> None:
     connection: Connection = op.get_bind()
     connection.exec_driver_sql(
+        "ALTER TABLE eval_records ADD COLUMN IF NOT EXISTS calibration_prob_estimate DOUBLE PRECISION"
+    )
+    connection.exec_driver_sql(
         """
         CREATE TABLE IF NOT EXISTS market_resolutions (
             market_id TEXT PRIMARY KEY REFERENCES markets(condition_id) ON DELETE CASCADE,

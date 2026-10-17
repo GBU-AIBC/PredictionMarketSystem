@@ -262,14 +262,14 @@ async def _run_resolution_backfill(args: _ResolutionBackfillArgs) -> int:
             timeout=timeout,
             trust_env=False,
         ) as client:
-            resolutions = await GammaResolutionSource(http_client=client).fetch_resolutions(
-                market_ids
-            )
+            source = GammaResolutionSource(http_client=client)
+            resolutions = await source.fetch_resolutions(market_ids)
         store = MarketResolutionStore(pool)
         for market_id, resolved_outcome in resolutions.items():
             await store.upsert(
                 market_id,
                 resolved_outcome=resolved_outcome,
+                resolved_at=source.resolved_at_by_market.get(market_id),
                 source="gamma",
             )
         _print_json(

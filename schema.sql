@@ -299,7 +299,8 @@ CREATE TABLE IF NOT EXISTS eval_records (
     strategy_id TEXT NOT NULL,
     strategy_version_id TEXT NOT NULL,
     edge_at_decision DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    spread_bps_at_decision INTEGER
+    spread_bps_at_decision INTEGER,
+    calibration_prob_estimate DOUBLE PRECISION
 );
 
 ALTER TABLE eval_records
@@ -308,7 +309,8 @@ ALTER TABLE eval_records
     ADD COLUMN IF NOT EXISTS baseline_prob_estimates JSONB NOT NULL DEFAULT '{}'::jsonb,
     ADD COLUMN IF NOT EXISTS baseline_brier_scores JSONB NOT NULL DEFAULT '{}'::jsonb,
     ADD COLUMN IF NOT EXISTS edge_at_decision DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    ADD COLUMN IF NOT EXISTS spread_bps_at_decision INTEGER;
+    ADD COLUMN IF NOT EXISTS spread_bps_at_decision INTEGER,
+    ADD COLUMN IF NOT EXISTS calibration_prob_estimate DOUBLE PRECISION;
 
 CREATE TABLE IF NOT EXISTS quote_eval_records (
     fill_id TEXT NOT NULL,

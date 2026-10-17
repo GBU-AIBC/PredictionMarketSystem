@@ -4000,6 +4000,11 @@ def _default_active_strategy(settings: PMSSettings) -> ActiveStrategy:
         eval_spec,
         forecaster,
         market_selection,
+        llm_identity=(
+            settings.llm.provider,
+            settings.llm.model,
+            settings.llm.prompt_version,
+        ),
     )
     return ActiveStrategy(
         strategy_id="default",

@@ -53,6 +53,7 @@ class _MarketMetadata:
     venue: Venue
     resolves_at: datetime | None
     resolved_outcome: float | None = None
+    resolved_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -156,9 +157,19 @@ class MarketUniverseReplayEngine:
             raise LookupError(msg)
         return _clone_signal(checkpoints[-1].signal)
 
-    def resolution_for(self, market_id: str) -> float | None:
+    def resolution_for(
+        self,
+        market_id: str,
+        *,
+        as_of: datetime | None = None,
+    ) -> float | None:
         metadata = self._market_metadata_cache.get(market_id)
-        return None if metadata is None else metadata.resolved_outcome
+        if metadata is None:
+            return None
+        if as_of is not None:
+            if metadata.resolved_at is None or metadata.resolved_at > as_of:
+                return None
+        return metadata.resolved_outcome
 
     async def _ensure_materialized(
         self,
@@ -260,7 +271,8 @@ class MarketUniverseReplayEngine:
                     SELECT markets.condition_id, markets.question, markets.venue,
                            markets.resolves_at, markets.closed,
                            markets.yes_price, markets.no_price,
-                           resolutions.resolved_outcome
+                           resolutions.resolved_outcome,
+                           resolutions.resolved_at
                     FROM markets
                     LEFT JOIN market_resolutions AS resolutions
                       ON resolutions.market_id = markets.condition_id
@@ -277,7 +289,8 @@ class MarketUniverseReplayEngine:
                     SELECT markets.condition_id, markets.question, markets.venue,
                            markets.resolves_at, markets.closed,
                            markets.yes_price, markets.no_price,
-                           resolutions.resolved_outcome
+                           resolutions.resolved_outcome,
+                           resolutions.resolved_at
                     FROM markets
                     LEFT JOIN market_resolutions AS resolutions
                       ON resolutions.market_id = markets.condition_id
@@ -295,6 +308,7 @@ class MarketUniverseReplayEngine:
                 venue=cast(Venue, row["venue"]),
                 resolves_at=cast(datetime | None, row["resolves_at"]),
                 resolved_outcome=_market_resolution_label(row),
+                resolved_at=cast(datetime | None, row.get("resolved_at")),
             )
             for row in rows
         }
@@ -713,7 +727,7 @@ def _market_signal(
     event_type: str,
     extra: dict[str, Any] | None = None,
 ) -> MarketSignal:
-    external_signal = {"raw_event_type": event_type}
+    external_signal: dict[str, Any] = {"raw_event_type": event_type}
     if extra is not None:
         external_signal.update(extra)
     return MarketSignal(

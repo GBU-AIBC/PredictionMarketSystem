@@ -1257,7 +1257,13 @@ def _signal_with_replay_resolution(
     resolver = getattr(replay_engine, "resolution_for", None)
     if not callable(resolver):
         return signal
-    resolved = normalize_resolved_outcome(resolver(signal.market_id))
+    try:
+        resolved_value = resolver(signal.market_id, as_of=signal.fetched_at)
+    except TypeError:
+        # Keep compatibility with test/research replay adapters that expose
+        # only the historical one-argument resolver contract.
+        resolved_value = resolver(signal.market_id)
+    resolved = normalize_resolved_outcome(resolved_value)
     if resolved is None:
         return signal
     return replace(

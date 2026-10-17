@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from hashlib import sha256
 from pathlib import Path
 from typing import cast
 from dataclasses import dataclass, field
@@ -18,6 +17,7 @@ from pms.controller.factor_snapshot import (
 )
 from pms.controller.forecasters.llm import (
     LLMForecaster,
+    durable_spend_ledger_path,
     validate_llm_runtime_dependencies,
 )
 from pms.controller.forecasters.flb import FlbForecaster
@@ -150,10 +150,9 @@ def _build_forecaster(
             # Keep the restart-safe ledger scoped to the configured database,
             # rather than placing a process/environment-shared file in HOME.
             # API keys are deliberately excluded from this identity.
-            database_digest = sha256(settings.database.dsn.encode()).hexdigest()[:24]
-            ledger_dir = Path(settings.live_emergency_audit_path).expanduser().parent
-            llm_payload["spend_ledger_path"] = str(
-                ledger_dir / f"llm-spend-{database_digest}.json"
+            llm_payload["spend_ledger_path"] = durable_spend_ledger_path(
+                database_dsn=settings.database.dsn,
+                data_path=settings.live_emergency_audit_path,
             )
         llm_config = LLMSettings.model_validate(llm_payload)
         validate_llm_runtime_dependencies(llm_config)

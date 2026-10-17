@@ -62,6 +62,12 @@ _BUDGET_TRACKERS: dict[str, tuple[ReferenceType[LLMSettings], _BudgetTracker]] =
 _BUDGET_TRACKERS_LOCK = threading.Lock()
 
 
+def durable_spend_ledger_path(*, database_dsn: str, data_path: str) -> str:
+    """Derive a restart-safe ledger path from the configured environment."""
+    database_digest = sha256(database_dsn.encode("utf-8")).hexdigest()[:24]
+    return str(Path(data_path).expanduser().parent / f"llm-spend-{database_digest}.json")
+
+
 class _LLMClient(Protocol):
     """Marker protocol; concrete SDK shapes are provider-specific."""
 

@@ -25,7 +25,7 @@ from pms.controller.factor_snapshot import (
     NullFactorSnapshotReader,
     required_factor_keys,
 )
-from pms.controller.forecasters.llm import LLMForecaster
+from pms.controller.forecasters.llm import LLMForecaster, durable_spend_ledger_path
 from pms.controller.forecasters.rules import RulesForecaster
 from pms.controller.forecasters.statistical import StatisticalForecaster
 from pms.controller.outcome_tokens import (
@@ -163,10 +163,20 @@ class ControllerPipeline:
             self.strategy_id = self.strategy.strategy_id
             self.strategy_version_id = self.strategy.strategy_version_id
         if self.forecasters is None:
+            llm_settings = self.settings.llm
+            if llm_settings.spend_ledger_path is None:
+                llm_settings = llm_settings.model_copy(
+                    update={
+                        "spend_ledger_path": durable_spend_ledger_path(
+                            database_dsn=self.settings.database.dsn,
+                            data_path=self.settings.live_emergency_audit_path,
+                        )
+                    }
+                )
             self.forecasters = (
                 RulesForecaster(),
                 StatisticalForecaster(),
-                LLMForecaster(config=self.settings.llm),
+                LLMForecaster(config=llm_settings),
             )
         if self.calibrator is None:
             self.calibrator = NetcalCalibrator()
@@ -510,6 +520,7 @@ class ControllerPipeline:
         else:
             factor_values = dict(signal_factor_values)
             factor_values.update(runtime_factor_values)
+        calibration_prob_estimate = prob_estimate
         calibrated_estimate = _apply_pre_calibrators(
             prob_estimate,
             model_ids=model_ids,
@@ -1077,6 +1088,7 @@ class ControllerPipeline:
             intent_key=intent_key,
             risk_group_id=_risk_group_id(signal),
             spread_bps_at_decision=decision_spread_bps,
+            calibration_prob_estimate=calibration_prob_estimate,
         )
 
     async def _refresh_signal_book_before_router_gate(
@@ -1241,12 +1253,15 @@ def _apply_pre_calibrators(
         resolved_sample_count=_resolved_sample_count(calibrator, model_ids),
         model_id=_decision_model_id(model_ids) or "unknown",
     )
-    # Calibration is keyed by the decision-level ensemble and receives the
-    # same shrunk coordinate that reaches TradeDecision/EvalRecord.
-    current = LogitShrinkageCalibrator(spec).calibrate(raw_prob, context=context)
+    # Netcal is trained from the raw decision coordinate persisted with each
+    # EvalRecord, so apply it to that same coordinate before presentation
+    # shrinkage and extreme clamping.
+    current: float | None = calibrator.calibrate(raw_prob, model_id=context.model_id)
     if current is None:
         return None
-    current = calibrator.calibrate(current, model_id=context.model_id)
+    current = LogitShrinkageCalibrator(spec).calibrate(current, context=context)
+    if current is None:
+        return None
     next_prob = ExtremeProbClamp(spec).calibrate(current, context=context)
     if next_prob is None:
         logger.info(

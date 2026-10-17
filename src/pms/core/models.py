@@ -95,6 +95,7 @@ class TradeDecision:
     intent_key: str | None = None
     risk_group_id: str | None = None
     spread_bps_at_decision: int | None = None
+    calibration_prob_estimate: float | None = None
 
     def __post_init__(self) -> None:
         if self.action is not None and self.side != self.action:
@@ -345,6 +346,7 @@ class EvalRecord:
     filled: bool = True
     edge_at_decision: float = 0.0
     spread_bps_at_decision: int | None = None
+    calibration_prob_estimate: float | None = None
 
     @property
     def brier_improvement(self) -> float | None:
