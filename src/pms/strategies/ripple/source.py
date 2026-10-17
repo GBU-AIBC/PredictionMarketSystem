@@ -12,7 +12,15 @@ from typing import runtime_checkable
 from pms.core.enums import TimeInForce
 from pms.core.models import BookSide, Outcome, Portfolio, Venue
 from pms.strategies.intents import StrategyContext, StrategyObservation
-from pms.strategies.projections import FactorCompositionStep
+from pms.strategies.aggregate import Strategy
+from pms.strategies.projections import (
+    EvalSpec,
+    FactorCompositionStep,
+    ForecasterSpec,
+    MarketSelectionSpec,
+    RiskParams,
+    StrategyConfig,
+)
 from pms.strategies.ripple.evaluator import (
     DEFAULT_MIN_EXPECTED_EDGE,
     DEFAULT_PRIOR_STRENGTH,
@@ -76,6 +84,35 @@ RIPPLE_FACTOR_REQUIREMENTS: tuple[FactorCompositionStep, ...] = (
         freshness_sla_s=3600.0,
     ),
 )
+
+
+def build_ripple_strategy(strategy_id: str) -> Strategy:
+    """Build the immutable projection that owns Ripple's runtime economics."""
+    return Strategy(
+        config=StrategyConfig(
+            strategy_id=strategy_id,
+            factor_composition=RIPPLE_FACTOR_REQUIREMENTS,
+            metadata=(
+                ("economics_version", RIPPLE_ECONOMICS_VERSION),
+                ("prior_strength", str(RIPPLE_DEFAULT_PRIOR_STRENGTH)),
+                ("min_expected_edge", str(RIPPLE_DEFAULT_MIN_EXPECTED_EDGE)),
+                ("max_slippage_bps", str(RIPPLE_DEFAULT_MAX_SLIPPAGE_BPS)),
+                ("time_in_force", RIPPLE_DEFAULT_TIME_IN_FORCE.value),
+            ),
+        ),
+        risk=RiskParams(
+            max_position_notional_usdc=RIPPLE_MAX_POSITION_NOTIONAL_USDC,
+            max_daily_drawdown_pct=20.0,
+            min_order_size_usdc=1.0,
+        ),
+        eval_spec=EvalSpec(metrics=("pnl", "fill_rate")),
+        forecaster=ForecasterSpec(forecasters=(("ripple", ()),)),
+        market_selection=MarketSelectionSpec(
+            venue="polymarket",
+            resolution_time_max_horizon_days=7,
+            volume_min_usdc=0.0,
+        ),
+    )
 
 
 FactorKey = tuple[str, str]

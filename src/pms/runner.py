@@ -152,13 +152,8 @@ from pms.strategies.anchoring import (
     LiveAnchoringSource,
 )
 from pms.strategies.anchoring.source import (
-    ANCHORING_DEFAULT_MAX_SLIPPAGE_BPS,
-    ANCHORING_DEFAULT_MIN_CONFIDENCE,
-    ANCHORING_DEFAULT_MIN_DIVERGENCE,
-    ANCHORING_DEFAULT_MIN_EXPECTED_EDGE,
-    ANCHORING_DEFAULT_TIME_IN_FORCE,
-    ANCHORING_MAX_POSITION_NOTIONAL_USDC,
     AnchoringMarketSnapshotReader,
+    build_anchoring_strategy,
 )
 from pms.strategies.flb import FlbAgent, FlbController, FlbStrategyModule
 from pms.strategies.flb.artifacts import (
@@ -173,12 +168,6 @@ from pms.strategies.flb.source import (
     load_flb_calibration_csv,
 )
 from pms.strategies.flb.projection import (
-    H1_FLB_ENTRY_EXECUTION_COST_BPS,
-    H1_FLB_FAVORITE_THRESHOLD,
-    H1_FLB_LONGSHOT_THRESHOLD,
-    H1_FLB_MAX_SLIPPAGE_BPS,
-    H1_FLB_MIN_EXPECTED_EDGE,
-    H1_FLB_FEE_RATE,
     H1_FLB_STRATEGY_ID,
     build_h1_flb_strategy,
 )
@@ -205,13 +194,9 @@ from pms.strategies.ripple import (
     RippleStrategyModule,
 )
 from pms.strategies.ripple.source import (
-    RIPPLE_DEFAULT_MIN_EXPECTED_EDGE,
-    RIPPLE_DEFAULT_PRIOR_STRENGTH,
-    RIPPLE_DEFAULT_MAX_SLIPPAGE_BPS,
-    RIPPLE_DEFAULT_TIME_IN_FORCE,
-    RIPPLE_MAX_POSITION_NOTIONAL_USDC,
     RippleFactorSnapshotReader,
     RippleMarketSnapshotReader,
+    build_ripple_strategy,
 )
 from pms.strategies.runtime_bridge import StrategyRunResult
 from pms.strategies.versioning import compute_strategy_version_id
@@ -931,52 +916,61 @@ class Runner:
             reader = _PostgresFlbMarketSnapshotReader(
                 PostgresMarketDataStore(self._pg_pool)
             )
+        h1_strategy = (
+            build_h1_flb_strategy()
+            if strategy_id == H1_FLB_STRATEGY_ID
+            else None
+        )
+        position_sizing_risk = self.config.risk
+        if h1_strategy is not None:
+            position_sizing_risk = self.config.risk.model_copy(
+                update={
+                    "max_position_per_market": (
+                        h1_strategy.risk.max_position_notional_usdc
+                    )
+                }
+            )
+        h1_metadata = dict(h1_strategy.config.metadata) if h1_strategy else {}
 
         return FlbStrategyModule(
             source=LiveFlbSource(
                 market_ids=tuple(market_ids),
                 market_reader=reader,
-                position_sizer=KellySizer(
-                    self.config.risk.model_copy(
-                        update={"max_position_per_market": 1.0}
-                    )
-                    if strategy_id == H1_FLB_STRATEGY_ID
-                    else self.config.risk
-                ),
+                position_sizer=KellySizer(risk=position_sizing_risk),
                 portfolio=self.portfolio,
                 max_slippage_bps=(
-                    H1_FLB_MAX_SLIPPAGE_BPS
-                    if strategy_id == H1_FLB_STRATEGY_ID
+                    int(h1_metadata["max_slippage_bps"])
+                    if h1_strategy is not None
                     else self.config.controller.max_slippage_bps
                 ),
                 entry_execution_cost_bps=(
-                    H1_FLB_ENTRY_EXECUTION_COST_BPS
-                    if strategy_id == H1_FLB_STRATEGY_ID
+                    float(h1_metadata["entry_execution_cost_bps"])
+                    if h1_strategy is not None
                     else self.config.strategies.flb_entry_execution_cost_bps
                 ),
                 fee_rate=(
-                    H1_FLB_FEE_RATE
-                    if strategy_id == H1_FLB_STRATEGY_ID
+                    float(h1_metadata["fee_rate"])
+                    if h1_strategy is not None
                     else self.config.strategies.flb_fee_rate
                 ),
                 longshot_yes_threshold=(
-                    H1_FLB_LONGSHOT_THRESHOLD
-                    if strategy_id == H1_FLB_STRATEGY_ID
+                    float(h1_metadata["longshot_yes_threshold"])
+                    if h1_strategy is not None
                     else 0.10
                 ),
                 favorite_yes_threshold=(
-                    H1_FLB_FAVORITE_THRESHOLD
-                    if strategy_id == H1_FLB_STRATEGY_ID
+                    float(h1_metadata["favorite_yes_threshold"])
+                    if h1_strategy is not None
                     else 0.90
                 ),
                 min_expected_edge=(
-                    H1_FLB_MIN_EXPECTED_EDGE
-                    if strategy_id == H1_FLB_STRATEGY_ID
+                    float(h1_metadata["min_expected_edge"])
+                    if h1_strategy is not None
                     else 0.02
                 ),
                 time_in_force=(
-                    TimeInForce.GTC
-                    if strategy_id == H1_FLB_STRATEGY_ID
+                    TimeInForce(h1_metadata["time_in_force"])
+                    if h1_strategy is not None
                     else TimeInForce(self.config.controller.time_in_force.upper())
                 ),
                 calibration_model=self._flb_calibration_model,
@@ -1052,6 +1046,14 @@ class Runner:
         else:
             resolved_market_reader = market_reader
 
+        ripple_strategy = build_ripple_strategy(strategy_id)
+        _verify_runtime_strategy_version(
+            ripple_strategy,
+            strategy_version_id,
+            legacy_ids={"ripple-v1"},
+        )
+        ripple_metadata = dict(ripple_strategy.config.metadata)
+
         return RippleStrategyModule(
             source=LiveRippleSource(
                 market_ids=tuple(market_ids),
@@ -1059,15 +1061,19 @@ class Runner:
                 market_reader=resolved_market_reader,
                 position_sizer=KellySizer(
                     risk=self.config.risk.model_copy(
-                        update={"max_position_per_market": RIPPLE_MAX_POSITION_NOTIONAL_USDC}
+                        update={
+                            "max_position_per_market": (
+                                ripple_strategy.risk.max_position_notional_usdc
+                            )
+                        }
                     ),
                     fraction=Decimal("0.25"),
                 ),
                 portfolio=self.portfolio,
-                prior_strength=RIPPLE_DEFAULT_PRIOR_STRENGTH,
-                min_expected_edge=RIPPLE_DEFAULT_MIN_EXPECTED_EDGE,
-                max_slippage_bps=RIPPLE_DEFAULT_MAX_SLIPPAGE_BPS,
-                time_in_force=RIPPLE_DEFAULT_TIME_IN_FORCE,
+                prior_strength=float(ripple_metadata["prior_strength"]),
+                min_expected_edge=float(ripple_metadata["min_expected_edge"]),
+                max_slippage_bps=int(ripple_metadata["max_slippage_bps"]),
+                time_in_force=TimeInForce(ripple_metadata["time_in_force"]),
             ),
             controller=RippleController(),
             agent=RippleAgent(),
@@ -1120,21 +1126,33 @@ class Runner:
             )
             raise RuntimeError(msg)
 
+        anchoring_strategy = build_anchoring_strategy(strategy_id)
+        _verify_runtime_strategy_version(
+            anchoring_strategy,
+            strategy_version_id,
+            legacy_ids={"h2-anchoring-lag-v1"},
+        )
+        anchoring_metadata = dict(anchoring_strategy.config.metadata)
+
         return AnchoringLagStrategyModule(
             source=LiveAnchoringSource(
                 market_ids=tuple(market_ids),
                 market_reader=market_reader,
                 position_sizer=KellySizer(
                     self.config.risk.model_copy(
-                        update={"max_position_per_market": ANCHORING_MAX_POSITION_NOTIONAL_USDC}
+                        update={
+                            "max_position_per_market": (
+                                anchoring_strategy.risk.max_position_notional_usdc
+                            )
+                        }
                     )
                 ),
                 portfolio=self.portfolio,
-                min_divergence=ANCHORING_DEFAULT_MIN_DIVERGENCE,
-                min_confidence=ANCHORING_DEFAULT_MIN_CONFIDENCE,
-                min_expected_edge=ANCHORING_DEFAULT_MIN_EXPECTED_EDGE,
-                max_slippage_bps=ANCHORING_DEFAULT_MAX_SLIPPAGE_BPS,
-                time_in_force=ANCHORING_DEFAULT_TIME_IN_FORCE,
+                min_divergence=float(anchoring_metadata["min_divergence"]),
+                min_confidence=float(anchoring_metadata["min_confidence"]),
+                min_expected_edge=float(anchoring_metadata["min_expected_edge"]),
+                max_slippage_bps=int(anchoring_metadata["max_slippage_bps"]),
+                time_in_force=TimeInForce(anchoring_metadata["time_in_force"]),
             ),
             controller=AnchoringController(),
             agent=AnchoringAgent(),
@@ -4793,6 +4811,33 @@ def _h1_flb_strategy_from_settings(
         calibration_csv_sha256=provenance.calibration_csv_sha256,
         calibration_source_label=provenance.calibration_source_label,
     )
+
+
+def _verify_runtime_strategy_version(
+    strategy: Strategy,
+    strategy_version_id: str,
+    *,
+    legacy_ids: set[str],
+) -> str:
+    expected_version_id = compute_strategy_version_id(*strategy.snapshot())
+    if strategy_version_id == expected_version_id:
+        return expected_version_id
+    if strategy_version_id in legacy_ids:
+        logger.warning(
+            "legacy runtime strategy version accepted with economics drift",
+            extra={
+                "event": "strategy_economics_version_drift",
+                "strategy_id": strategy.config.strategy_id,
+                "strategy_version_id": strategy_version_id,
+                "expected_version_id": expected_version_id,
+            },
+        )
+        return strategy_version_id
+    msg = (
+        "strategy_version_id does not match runtime strategy projection: "
+        f"row={strategy_version_id!r}, expected={expected_version_id!r}"
+    )
+    raise ValueError(msg)
 
 
 def _market_implied_baseline_prob_estimate(decision: TradeDecision) -> float:

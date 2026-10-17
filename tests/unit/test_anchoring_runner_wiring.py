@@ -6,15 +6,17 @@ import pytest
 
 from pms.config import PMSSettings, RiskSettings
 from pms.core.enums import RunMode
-from pms.runner import Runner
+from pms.runner import Runner, _verify_runtime_strategy_version
 from pms.strategies.anchoring import (
     AnchoringAgent,
     AnchoringController,
     AnchoringLagStrategyModule,
     AnchoringMarketSnapshot,
     LiveAnchoringSource,
+    build_anchoring_strategy,
 )
 from pms.strategies.intents import TradeIntent
+from pms.strategies.versioning import compute_strategy_version_id
 
 
 NOW = datetime(2026, 5, 4, 1, 0, tzinfo=UTC)
@@ -79,6 +81,17 @@ def test_runner_builds_anchoring_strategy_module_with_live_components() -> None:
     assert isinstance(module.agent, AnchoringAgent)
     assert module.strategy_id == "h2_anchoring_lag"
     assert module.strategy_version_id == "h2-anchoring-lag-v1"
+
+
+def test_anchoring_runtime_requires_hashed_economics_version() -> None:
+    strategy = build_anchoring_strategy("h2_anchoring_lag")
+    version_id = compute_strategy_version_id(*strategy.snapshot())
+    assert (
+        _verify_runtime_strategy_version(strategy, version_id, legacy_ids=set())
+        == version_id
+    )
+    with pytest.raises(ValueError, match="runtime strategy projection"):
+        _verify_runtime_strategy_version(strategy, "arbitrary", legacy_ids=set())
 
 
 @pytest.mark.asyncio

@@ -572,6 +572,15 @@ def _strategy_from_versioned_config_json(
             and compute_legacy_strategy_version_id(*strategy.snapshot())
             == strategy_version_id
         ):
+            logger.warning(
+                "legacy strategy version accepted with factor definition drift",
+                extra={
+                    "event": "factor_definition_version_drift",
+                    "strategy_id": strategy_id,
+                    "strategy_version_id": strategy_version_id,
+                    "expected_version_id": expected_version_id,
+                },
+            )
             return strategy
         msg = (
             "strategy_version_id does not match strategy config payload: "

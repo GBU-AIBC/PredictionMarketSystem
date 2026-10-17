@@ -257,6 +257,39 @@ async def test_factor_service_compute_once_continues_after_factor_error(
 
 
 @pytest.mark.asyncio
+async def test_factor_service_quarantines_deterministic_compute_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    original_compute = ExplodingFactor.compute
+
+    def counting_compute(
+        factor: ExplodingFactor,
+        signal: MarketSignal,
+        outer_ring: object,
+    ) -> FactorValueRow | None:
+        nonlocal calls
+        calls += 1
+        return original_compute(factor, signal, outer_ring)
+
+    monkeypatch.setattr(ExplodingFactor, "compute", counting_compute)
+    service = FactorService(
+        pool=cast(Any, object()),
+        store=cast(Any, FakeStore()),
+        cadence_s=0.1,
+        factors=(ExplodingFactor,),
+        signal_stream=SequenceSignalStream([]),
+    )
+    signal = _signal(market_id="quarantine-market")
+
+    await service.compute_once([signal])
+    await service.compute_once([signal])
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
 async def test_factor_service_skips_yes_price_factors_for_sentinel_book_signals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -472,6 +505,42 @@ async def test_factor_service_retries_failed_dirty_market_on_next_cadence(
         await asyncio.gather(task, return_exceptions=True)
 
     assert calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_factor_service_quarantines_persistence_after_bounded_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def always_failing_persist(
+        pool: Any,
+        row: FactorValueRow,
+        *,
+        definition_version: str = "1",
+    ) -> None:
+        nonlocal calls
+        del pool, row, definition_version
+        calls += 1
+        raise RuntimeError("persistent database failure")
+
+    monkeypatch.setattr(
+        "pms.factors.service.persist_factor_value",
+        always_failing_persist,
+    )
+    service = FactorService(
+        pool=cast(Any, object()),
+        store=cast(Any, FakeStore()),
+        cadence_s=0.1,
+        factors=(PersistedFactor,),
+        signal_stream=SequenceSignalStream([]),
+    )
+    signal = _signal(market_id="persistence-quarantine-market")
+
+    for _ in range(6):
+        await service.compute_once([signal])
+
+    assert calls == 4  # initial attempt plus three bounded retries
 
 
 @pytest.mark.asyncio

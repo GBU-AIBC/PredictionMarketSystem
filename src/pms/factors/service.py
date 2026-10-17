@@ -18,6 +18,7 @@ from pms.storage.market_data_store import PostgresMarketDataStore
 
 
 logger = logging.getLogger(__name__)
+_MAX_PERSIST_RETRIES = 3
 
 
 async def persist_factor_value(
@@ -70,6 +71,18 @@ class FactorService:
     _stream_exhausted: bool = field(init=False, default=False)
     _known_market_ids: set[str] = field(init=False, default_factory=set)
     _last_failed_market_ids: set[str] = field(init=False, default_factory=set)
+    _quarantined_compute: dict[tuple[str, str], datetime] = field(
+        init=False,
+        default_factory=dict,
+    )
+    _persistence_failures: dict[tuple[str, str, str], int] = field(
+        init=False,
+        default_factory=dict,
+    )
+    _quarantined_persistence: set[tuple[str, str, str]] = field(
+        init=False,
+        default_factory=set,
+    )
 
     def __post_init__(self) -> None:
         if self.cadence_s <= 0.0:
@@ -129,6 +142,9 @@ class FactorService:
                     signal
                 ):
                     continue
+                quarantine_key = (signal.market_id, factor_cls.factor_id)
+                if self._quarantined_compute.get(quarantine_key) == signal.timestamp:
+                    continue
                 try:
                     row = factor_cls().compute(signal, self.store)
                 except Exception:
@@ -138,11 +154,17 @@ class FactorService:
                         signal.market_id,
                         signal.timestamp.isoformat(),
                     )
-                    failed_market_ids.add(signal.market_id)
+                    # A deterministic error for this observation must not be
+                    # retried on every cadence.  Quarantine the factor/market
+                    # pair until a newer observation arrives.
+                    self._quarantined_compute[quarantine_key] = signal.timestamp
                     continue
+                self._quarantined_compute.pop(quarantine_key, None)
                 if row is None:
                     continue
                 dedupe_key = (row.factor_id, row.market_id, row.param)
+                if dedupe_key in self._quarantined_persistence:
+                    continue
                 if self._last_persisted_ts.get(dedupe_key) == row.ts:
                     continue
                 try:
@@ -163,7 +185,21 @@ class FactorService:
                         row.market_id,
                         row.ts.isoformat(),
                     )
+                    attempts = self._persistence_failures.get(dedupe_key, 0) + 1
+                    self._persistence_failures[dedupe_key] = attempts
+                    if attempts <= _MAX_PERSIST_RETRIES:
+                        failed_market_ids.add(signal.market_id)
+                    else:
+                        self._quarantined_persistence.add(dedupe_key)
+                        logger.error(
+                            "factor persist quarantined after %d attempts "
+                            "factor_id=%s market_id=%s",
+                            attempts,
+                            row.factor_id,
+                            signal.market_id,
+                        )
                     continue
+                self._persistence_failures.pop(dedupe_key, None)
                 self._last_persisted_ts[dedupe_key] = row.ts
                 persisted += 1
         self._last_failed_market_ids = failed_market_ids

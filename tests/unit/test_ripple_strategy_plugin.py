@@ -13,7 +13,7 @@ from pms.config import PMSSettings, RiskSettings
 from pms.core.enums import TimeInForce
 from pms.core.models import Portfolio
 from pms.controller.sizers.kelly import KellySizer
-from pms.runner import Runner
+from pms.runner import Runner, _verify_runtime_strategy_version
 from pms.strategies.base import (
     StrategyAgent,
     StrategyController,
@@ -38,9 +38,11 @@ from pms.strategies.ripple.source import (
     RIPPLE_FACTOR_REQUIREMENTS,
     RippleMarketSnapshot,
     RippleObservationFixture,
+    build_ripple_strategy,
     RippleObservationSource,
     RipplePositionSizer,
 )
+from pms.strategies.versioning import compute_strategy_version_id
 from pms.strategies.ripple.strategy import RippleStrategyModule
 from pms.strategies.projections import FactorCompositionStep
 
@@ -459,6 +461,17 @@ def test_runner_builds_live_ripple_source_with_fractional_kelly_sizer() -> None:
     assert module.source.position_sizer.risk is not None
     assert module.source.position_sizer.risk.max_position_per_market == pytest.approx(1.0)
     assert module.source.position_sizer.fraction == Decimal("0.25")
+
+
+def test_ripple_runtime_requires_hashed_economics_version() -> None:
+    strategy = build_ripple_strategy("ripple")
+    version_id = compute_strategy_version_id(*strategy.snapshot())
+    assert (
+        _verify_runtime_strategy_version(strategy, version_id, legacy_ids=set())
+        == version_id
+    )
+    with pytest.raises(ValueError, match="runtime strategy projection"):
+        _verify_runtime_strategy_version(strategy, "arbitrary", legacy_ids=set())
 
 
 def test_ripple_evaluator_emits_beta_binomial_posterior_edge_and_confidence() -> None:

@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, TypeVar, cast
 
-from pms.config import PMSSettings
+from pms.config import PMSSettings, RiskSettings
 from pms.controller._price_utils import best_ask, spread_bps_at_decision
 from pms.controller.calibrators.extreme_clamp import ExtremeProbClamp
 from pms.controller.calibrators.netcal import NetcalCalibrator
@@ -163,7 +163,9 @@ class ControllerPipeline:
         if self.calibrator is None:
             self.calibrator = NetcalCalibrator()
         if self.sizer is None:
-            self.sizer = KellySizer(risk=self.settings.risk)
+            self.sizer = KellySizer(
+                risk=_strategy_risk_settings(self.strategy, self.settings)
+            )
         if self.router is None:
             self.router = Router(self.settings.controller)
 
@@ -272,6 +274,11 @@ class ControllerPipeline:
             strategy=self.strategy,
             sizer=sizer,
             settings=self.settings,
+        )
+        strategy_max_slippage_bps = _strategy_economic_int(
+            self.strategy,
+            "max_slippage_bps",
+            self.settings.controller.max_slippage_bps,
         )
         risk_group_id = _risk_group_id(signal)
         group_capacity_diagnostic = _risk_group_capacity_diagnostic(
@@ -743,10 +750,12 @@ class ControllerPipeline:
             decision_price=decision_price,
             spread_bps=decision_spread_bps,
             settings=self.settings,
-            fee_rate=market_fee_rate_from_metadata(
-                execution_signal.external_signal,
-                fallback_rate=self.settings.strategies.flb_fee_rate,
+            fee_rate=_strategy_fee_rate(
+                self.strategy,
+                execution_signal,
+                self.settings,
             ),
+            max_slippage_bps=strategy_max_slippage_bps,
             spread_already_in_price=spread_already_in_price,
         )
         net_edge_after_costs = decision_edge - decision_costs.total_edge
@@ -765,7 +774,7 @@ class ControllerPipeline:
                     "spread_already_in_price": spread_already_in_price,
                     "fee_rate": decision_costs.fee_rate,
                     "fee_edge": decision_costs.fee_edge,
-                    "max_slippage_bps": self.settings.controller.max_slippage_bps,
+                    "max_slippage_bps": strategy_max_slippage_bps,
                     "slippage_edge": decision_costs.slippage_edge,
                     "net_edge_after_costs": net_edge_after_costs,
                     "decision_outcome": decision_outcome,
@@ -831,7 +840,7 @@ class ControllerPipeline:
         executable_depth_usdc = _executable_buy_depth_usdc(
             execution_signal.orderbook,
             limit_price=decision_price,
-            max_slippage_bps=self.settings.controller.max_slippage_bps,
+            max_slippage_bps=strategy_max_slippage_bps,
         )
         if (
             executable_depth_usdc is not None
@@ -858,7 +867,7 @@ class ControllerPipeline:
                         "decision_outcome": decision_outcome,
                         "decision_price": decision_price,
                         "max_slippage_bps": (
-                            self.settings.controller.max_slippage_bps
+                            strategy_max_slippage_bps
                         ),
                     },
                 )
@@ -996,7 +1005,7 @@ class ControllerPipeline:
                 "spread_already_in_price": spread_already_in_price,
                 "fee_rate": decision_costs.fee_rate,
                 "fee_edge": decision_costs.fee_edge,
-                "max_slippage_bps": self.settings.controller.max_slippage_bps,
+                "max_slippage_bps": strategy_max_slippage_bps,
                 "slippage_edge": decision_costs.slippage_edge,
                 "net_edge_after_costs": net_edge_after_costs,
             },
@@ -1024,7 +1033,7 @@ class ControllerPipeline:
             limit_price=decision_price,
             notional_usdc=size,
             order_type="limit",
-            max_slippage_bps=self.settings.controller.max_slippage_bps,
+            max_slippage_bps=strategy_max_slippage_bps,
             stop_conditions=router.stop_conditions(signal),
             prob_estimate=decision_probability,
             expected_edge=decision_edge,
@@ -1263,6 +1272,7 @@ def _decision_cost_edges(
     spread_bps: int | None,
     settings: PMSSettings,
     fee_rate: float | None = None,
+    max_slippage_bps: int | None = None,
     spread_already_in_price: bool = False,
 ) -> _DecisionCostEdges:
     price = Decimal(str(decision_price))
@@ -1272,7 +1282,12 @@ def _decision_cost_edges(
     fee_rate_decimal = Decimal(str(effective_fee_rate))
     fee_edge = fee_rate_decimal * (Decimal("1.0") - price)
     slippage_edge = (
-        Decimal(settings.controller.max_slippage_bps) / Decimal("10000")
+        Decimal(
+            settings.controller.max_slippage_bps
+            if max_slippage_bps is None
+            else max_slippage_bps
+        )
+        / Decimal("10000")
     ) * price
     spread_edge = (
         Decimal("0")
@@ -1287,6 +1302,74 @@ def _decision_cost_edges(
     )
 
 
+def _strategy_metadata(strategy: ActiveStrategy | None) -> dict[str, str]:
+    if strategy is None:
+        return {}
+    return dict(strategy.config.metadata)
+
+
+def _strategy_economic_float(
+    strategy: ActiveStrategy | None,
+    key: str,
+    fallback: float,
+) -> float:
+    raw = _strategy_metadata(strategy).get(key)
+    if raw is None:
+        return fallback
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return value if isfinite(value) else fallback
+
+
+def _strategy_economic_int(
+    strategy: ActiveStrategy | None,
+    key: str,
+    fallback: int,
+) -> int:
+    value = _strategy_economic_float(strategy, key, float(fallback))
+    if value < 0.0 or not value.is_integer():
+        return fallback
+    return int(value)
+
+
+def _strategy_fee_rate(
+    strategy: ActiveStrategy | None,
+    signal: MarketSignal,
+    settings: PMSSettings,
+) -> float:
+    fallback = market_fee_rate_from_metadata(
+        signal.external_signal,
+        fallback_rate=settings.strategies.flb_fee_rate,
+    )
+    return _strategy_economic_float(strategy, "fee_rate", fallback)
+
+
+def _strategy_risk_settings(
+    strategy: ActiveStrategy | None,
+    settings: PMSSettings,
+) -> RiskSettings:
+    if strategy is None:
+        return settings.risk
+    return RiskSettings(
+        max_position_per_market=strategy.risk.max_position_notional_usdc,
+        max_total_exposure=settings.risk.max_total_exposure,
+        max_drawdown_pct=strategy.risk.max_daily_drawdown_pct,
+        max_daily_loss_usdc=settings.risk.max_daily_loss_usdc,
+        max_open_positions=settings.risk.max_open_positions,
+        max_exposure_per_risk_group=settings.risk.max_exposure_per_risk_group,
+        min_order_usdc=max(
+            strategy.risk.min_order_size_usdc,
+            settings.risk.min_order_usdc,
+        ),
+        slippage_threshold_bps=_strategy_economic_float(
+            strategy,
+            "max_slippage_bps",
+            settings.risk.slippage_threshold_bps,
+        ),
+        max_quantity_shares=settings.risk.max_quantity_shares,
+    )
 def _signal_outcome_context(
     *,
     signal_token_id: str,
@@ -1729,12 +1812,6 @@ def _yes_reference_price(
         return signal.yes_price
     executable_price = best_ask(signal)
     return signal.yes_price if executable_price is None else executable_price
-
-
-def _strategy_metadata(strategy: ActiveStrategy | None) -> dict[str, str]:
-    if strategy is None:
-        return {}
-    return dict(strategy.config.metadata)
 
 
 def _market_exposure_usdc(portfolio: Portfolio, *, market_id: str) -> float:

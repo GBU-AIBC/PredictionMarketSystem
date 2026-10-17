@@ -9,8 +9,13 @@ from typing import Any
 
 import pytest
 
-from pms.config import PMSSettings, StrategyRuntimeSettings
+from pms.config import ControllerSettings, PMSSettings, StrategyRuntimeSettings
 from pms.controller.forecasters.flb import FlbForecaster
+from pms.controller.pipeline import (
+    _decision_cost_edges,
+    _strategy_economic_int,
+    _strategy_fee_rate,
+)
 from pms.core.enums import RunMode
 from pms.core.models import EvalRecord, MarketSignal, Portfolio
 from pms.strategies.flb import H1_FLB_STRATEGY_ID, build_h1_flb_strategy
@@ -22,6 +27,7 @@ from pms.strategies.projections import (
     RiskParams,
     StrategyConfig,
 )
+from pms.strategies.versioning import compute_strategy_version_id
 
 
 def _load_symbol(module_name: str, symbol_name: str) -> Any:
@@ -61,6 +67,62 @@ def _portfolio() -> Portfolio:
         free_usdc=1000.0,
         locked_usdc=0.0,
         open_positions=[],
+    )
+
+
+def test_h1_decision_economics_come_from_hashed_projection() -> None:
+    strategy = build_h1_flb_strategy()
+    active = strategy.to_active(
+        strategy_version_id=compute_strategy_version_id(*strategy.snapshot())
+    )
+    settings_a = PMSSettings(
+        controller=ControllerSettings(max_slippage_bps=10),
+        strategies=StrategyRuntimeSettings(flb_fee_rate=0.01),
+    )
+    settings_b = PMSSettings(
+        controller=ControllerSettings(max_slippage_bps=250),
+        strategies=StrategyRuntimeSettings(flb_fee_rate=0.25),
+    )
+    signal = _signal()
+
+    def decision_cost(settings: PMSSettings, strategy_projection: Any) -> float:
+        return _decision_cost_edges(
+            decision_price=0.4,
+            spread_bps=20,
+            settings=settings,
+            fee_rate=_strategy_fee_rate(strategy_projection, signal, settings),
+            max_slippage_bps=_strategy_economic_int(
+                strategy_projection,
+                "max_slippage_bps",
+                settings.controller.max_slippage_bps,
+            ),
+        ).total_edge
+
+    assert decision_cost(settings_a, active) == pytest.approx(
+        decision_cost(settings_b, active)
+    )
+
+    changed_metadata = dict(strategy.config.metadata)
+    changed_metadata["fee_rate"] = "0.20"
+    changed_metadata["max_slippage_bps"] = "100"
+    changed_strategy = build_h1_flb_strategy()
+    changed_strategy = type(strategy)(
+        config=StrategyConfig(
+            strategy_id=changed_strategy.config.strategy_id,
+            factor_composition=changed_strategy.config.factor_composition,
+            metadata=tuple(changed_metadata.items()),
+        ),
+        risk=changed_strategy.risk,
+        eval_spec=changed_strategy.eval_spec,
+        forecaster=changed_strategy.forecaster,
+        market_selection=changed_strategy.market_selection,
+        calibration=changed_strategy.calibration,
+    )
+    changed_hash = compute_strategy_version_id(*changed_strategy.snapshot())
+    assert changed_hash != active.strategy_version_id
+    changed_active = changed_strategy.to_active(strategy_version_id=changed_hash)
+    assert decision_cost(settings_a, changed_active) != pytest.approx(
+        decision_cost(settings_a, active)
     )
 
 

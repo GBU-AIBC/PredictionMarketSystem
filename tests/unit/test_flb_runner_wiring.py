@@ -223,6 +223,9 @@ def test_runner_builds_flb_strategy_module_with_live_components() -> None:
     assert isinstance(module.agent, FlbAgent)
     assert module.strategy_id == "h1_flb"
     assert module.strategy_version_id == "h1-flb-v1"
+    position_sizer_risk = getattr(module.source.position_sizer, "risk")
+    assert position_sizer_risk is not None
+    assert position_sizer_risk.max_position_per_market == pytest.approx(1.0)
 
 
 def test_runner_rejects_configured_flb_calibration_without_provenance(
