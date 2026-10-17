@@ -1,6 +1,6 @@
 # Wave 3 end-to-end acceptance — 2026-10-18
 
-Target: `/Users/stometa/dev/pms-w3`, branch `feat/w3-e2e-acceptance`, ref `093d42b` (`feat/agent-framework` plus Waves 0, 1, 2A and 2B). No push was performed. Local scratch files are under the ignored `.data/w3-e2e/`; `config.local.paper-canary.yaml` is ignored by `config.local*.yaml`.
+Target: `/Users/stometa/dev/pms-w3`, branch `feat/w3-e2e-acceptance`, ref `c12b139` (rebased onto `feat/agent-framework` at `43d74fd`, including lane 2C). No push was performed. Local scratch files are under the ignored `.data/w3-e2e/`; `config.local.paper-canary.yaml` is ignored by `config.local*.yaml`.
 
 The acceptance used PostgreSQL `127.0.0.1:55432`, database `pms_e2e`, and never used port 5432. `uv run alembic upgrade head` advanced the preserved data from `0025_merge_wave1_heads` through `0027_merge_wave2_heads`; the existing market/book data remained available. A fresh empty `pms_w3` database was migrated for integration checks. The API was bound only to `127.0.0.1:8766`. Test bearer values were generated in the shell and are omitted here.
 
@@ -14,7 +14,7 @@ The acceptance used PostgreSQL `127.0.0.1:55432`, database `pms_e2e`, and never 
 | 4. Evidence reaches forecaster/replay input | **PASS (test-backed)** | `uv run pytest -q tests/integration/test_agent_contributions_w2b.py::test_posted_evidence_changes_paper_llm_prompt_but_not_before_as_of tests/integration/test_agent_contributions_w2b.py::test_paper_evidence_replays_through_backtest_factory_without_provider` → `2 passed in 1.17s`; this exercises PIT evidence and no-provider replay. |
 | 5. Resolution backfill and sweep | **PARTIAL** | Gamma backfill: `requested_market_count=929`, `resolved_market_count=169`. A queued worker completed a sweep, but the collected window's available strategy/data combination produced null Brier/PnL and no benchmark rows. A PAPER-only canary sweep is rejected in normal BACKTEST mode (`paper_canary forecaster is PAPER-only`); the default registry strategy has required `factor-a`/`factor-b` inputs absent from this collected market. This is an acceptance gap, not reported as a successful non-null report. |
 | 6. LIVE fail-closed | **PASS** | `pms-api --config config.live.yaml.example` exits 1: `Local secret file contains placeholder Polymarket credential fields: api_key, api_passphrase, api_secret, funder_address, private_key`; `pms-live preflight --json` returns `ok:false` with the same reason. No order was sent. Agent `/config {mode:live}` and `/live/halt/clear` both return 403. |
-| 7. MCP | **BLOCKED BY BRANCH STATE** | Lane 2C has not landed on this checkout: no `src/pms/agent_mcp`, no `pms[agent]` extra, and no `pms-mcp` entry point. The requested rebase/action must happen after lane 2C lands; no MCP claim is made. |
+| 7. MCP | **PASS** | Rebasing onto `feat/agent-framework` at `43d74fd`; `uv sync --extra agent` installed `mcp==1.26.0`; stdio `tools/list` returned 17 tools, and live MCP proxy calls to status/markets/selection/evidence/risk-check succeeded. |
 
 ## Commands and real outputs
 
@@ -83,6 +83,25 @@ The token matrix probes returned 403 for `/config` LIVE, `/live/reconcile-submis
 
 A factor observation was visible to the PIT reader in SQL and in the factor series. No subsequent `paper_agent_probability_v1` decision appeared during the live window: controller diagnostics were dominated by `decision_net_edge_not_positive`, and the strategy's only current runtime generated zero agent decisions. The existing unit/integration coverage proves the contribution path, but this machine run does not claim the requested next-decision mutation.
 
+### MCP
+
+After the coordinator notified that lane 2C landed, the branch was rebased onto `feat/agent-framework` (`43d74fd`) and the optional dependency was installed:
+
+```text
+$ uv sync --extra agent
+... + mcp==1.26.0 ...
+$ PMS_AGENT_API_BASE_URL=http://127.0.0.1:8766 PMS_AGENT_TOKEN=<local> uv run pms-mcp
+initialize: serverInfo.name=pms-mcp, protocolVersion=2025-06-18
+tools/list: 17 tools (get_status, list_markets, explain_selection, list_signals, get_factor_catalog, get_factor_series, submit_evidence, submit_agent_factor, run_backtest, get_research_report, get_evaluation_report, list_evaluation_reports, explain_decision, risk_check_decision, list_pending_approvals, list_positions, kill_switch)
+get_status: mode=paper, running=true, healthy=true
+list_markets: total=2074, rows=1
+explain_selection: available=true, reasons=[resolution_horizon]
+submit_evidence: 201, submitted_by_token_id=agent
+risk_check_decision: approved=false, reason=decision_filled
+```
+
+The static MCP tool list contains no LIVE start, mode switch, LIVE accept, halt-clear, or reconciliation operation. `kill_switch` is the only control tool and maps to the kill-scoped `/run/kill` endpoint.
+
 ### Resolution and research
 
 ```text
@@ -102,4 +121,4 @@ The resulting `strategy_runs` row had `decision_count=0`, `fill_count=0`, `brier
 - Read-only risk/explain behavior is covered by `tests/unit/test_api_agent_contract.py:639-701`.
 - LIVE startup validation is enforced by `src/pms/api/__main__.py:35-76` and `src/pms/config.py:620-770`.
 
-No source defect was safely fixed during this run. The two residual acceptance gaps are the agent decision mutation in this real snapshot window and the research report's null Brier/PnL. MCP remains pending lane 2C. No real order, venue credential, LLM provider call, or tracked secret was used.
+No source defect was safely fixed during this run. The two residual acceptance gaps are the agent decision mutation in this real snapshot window and the research report's null Brier/PnL. MCP is now verified after the lane 2C rebase. No real order, venue credential, LLM provider call, or tracked secret was used.
