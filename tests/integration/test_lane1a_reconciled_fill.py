@@ -502,6 +502,21 @@ async def test_legacy_fill_provenance_backfill_restores_restarts(
         live.bind_pg_pool(pool)
         with pytest.raises(RuntimeError, match=fill_id):
             await live._reconcile_portfolio_from_db()  # noqa: SLF001
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE fill_payloads
+                SET payload = jsonb_set(
+                    payload,
+                    '{anomaly_flags}',
+                    '["run_mode=staging", "execution_slippage_bps=0.000000000"]'::jsonb
+                )
+                WHERE fill_id = $1
+                """,
+                fill_id,
+            )
+        with pytest.raises(RuntimeError, match=fill_id):
+            await live._reconcile_portfolio_from_db()  # noqa: SLF001
 
         store = FillStore(pool)
         assert await store.tag_fill_provenance(
