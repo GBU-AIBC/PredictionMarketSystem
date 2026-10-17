@@ -137,6 +137,7 @@ from pms.storage.fill_store import FillStore
 from pms.storage.first_order_audit import JsonlFirstOrderAuditWriter
 from pms.storage.live_emergency_audit import LiveEmergencyAuditWriter
 from pms.storage.market_data_store import PostgresMarketDataStore
+from pms.storage.market_resolution_store import MarketResolutionStore
 from pms.storage.market_subscription_store import PostgresMarketSubscriptionStore
 from pms.storage.opportunity_store import OpportunityStore
 from pms.storage.order_store import OrderStore
@@ -2208,6 +2209,11 @@ class Runner:
                 decision_reader=self.decision_store,
                 eval_spool=self._evaluator_spool,
                 resolution_source=GammaResolutionSource(http_client=http_client),
+                resolution_store=(
+                    MarketResolutionStore(self._pg_pool)
+                    if self._pg_pool is not None
+                    else None
+                ),
             )
             return await sweeper.sweep_once()
 

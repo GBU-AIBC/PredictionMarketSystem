@@ -257,13 +257,16 @@ class MarketUniverseReplayEngine:
             if explicit_market_ids:
                 rows = await connection.fetch(
                     """
-                    SELECT condition_id, question, venue, resolves_at, closed,
-                           yes_price, no_price,
-                           (to_jsonb(markets)->>'resolved_outcome') AS resolved_outcome
+                    SELECT markets.condition_id, markets.question, markets.venue,
+                           markets.resolves_at, markets.closed,
+                           markets.yes_price, markets.no_price,
+                           resolutions.resolved_outcome
                     FROM markets
-                    WHERE condition_id = ANY($1::text[])
-                      AND ($2::text IS NULL OR venue = $2)
-                    ORDER BY condition_id ASC
+                    LEFT JOIN market_resolutions AS resolutions
+                      ON resolutions.market_id = markets.condition_id
+                    WHERE markets.condition_id = ANY($1::text[])
+                      AND ($2::text IS NULL OR markets.venue = $2)
+                    ORDER BY markets.condition_id ASC
                     """,
                     list(explicit_market_ids),
                     venue,
@@ -271,12 +274,15 @@ class MarketUniverseReplayEngine:
             else:
                 rows = await connection.fetch(
                     """
-                    SELECT condition_id, question, venue, resolves_at, closed,
-                           yes_price, no_price,
-                           (to_jsonb(markets)->>'resolved_outcome') AS resolved_outcome
+                    SELECT markets.condition_id, markets.question, markets.venue,
+                           markets.resolves_at, markets.closed,
+                           markets.yes_price, markets.no_price,
+                           resolutions.resolved_outcome
                     FROM markets
-                    WHERE ($1::text IS NULL OR venue = $1)
-                    ORDER BY condition_id ASC
+                    LEFT JOIN market_resolutions AS resolutions
+                      ON resolutions.market_id = markets.condition_id
+                    WHERE ($1::text IS NULL OR markets.venue = $1)
+                    ORDER BY markets.condition_id ASC
                     """,
                     venue,
                 )

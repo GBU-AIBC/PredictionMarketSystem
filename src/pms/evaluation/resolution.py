@@ -28,6 +28,18 @@ class ResolutionSource(Protocol):
     ) -> Mapping[str, float]: ...
 
 
+class MarketResolutionStore(Protocol):
+    async def upsert(
+        self,
+        market_id: str,
+        *,
+        resolved_outcome: object,
+        resolved_at: Any | None = None,
+        source: str,
+        observed_at: Any | None = None,
+    ) -> None: ...
+
+
 class ResolutionFillStore(Protocol):
     async def read_unresolved_fills(self) -> list[FillRecord]: ...
 
@@ -146,6 +158,7 @@ class ResolutionSweeper:
     decision_reader: ResolutionDecisionReader
     eval_spool: ResolutionEvalSpool
     resolution_source: ResolutionSource
+    resolution_store: MarketResolutionStore | None = None
 
     async def sweep_once(self) -> ResolutionSweepResult:
         unresolved = await self.fill_store.read_unresolved_fills()
@@ -158,6 +171,13 @@ class ResolutionSweeper:
             )
         condition_ids = list(dict.fromkeys(fill.market_id for fill in unresolved))
         resolutions = await self.resolution_source.fetch_resolutions(condition_ids)
+        if self.resolution_store is not None:
+            for market_id, label in resolutions.items():
+                await self.resolution_store.upsert(
+                    market_id,
+                    resolved_outcome=label,
+                    source="gamma",
+                )
         fills_resolved = 0
         eval_records_appended = 0
         fills_failed = 0
