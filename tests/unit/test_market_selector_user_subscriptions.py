@@ -94,7 +94,7 @@ def _selector(
 
 
 @pytest.mark.asyncio
-async def test_select_appends_user_subscriptions_to_merge_result() -> None:
+async def test_select_prioritizes_user_subscriptions_before_cap() -> None:
     selector, user_store = _selector(
         strategy_token_ids=["strategy-token"],
         user_results=[{"user-token"}],
@@ -102,7 +102,7 @@ async def test_select_appends_user_subscriptions_to_merge_result() -> None:
 
     result = await selector.select()
 
-    assert result.asset_ids == ["strategy-token", "user-token"]
+    assert result.asset_ids == ["user-token", "strategy-token"]
     assert user_store.calls == 1
 
 
@@ -128,8 +128,8 @@ async def test_select_reads_user_subscriptions_on_every_call() -> None:
     first = await selector.select()
     second = await selector.select()
 
-    assert first.asset_ids == ["strategy-token", "first-user-token"]
-    assert second.asset_ids == ["strategy-token", "second-user-token"]
+    assert first.asset_ids == ["first-user-token", "strategy-token"]
+    assert second.asset_ids == ["second-user-token", "strategy-token"]
     assert user_store.calls == 2
     assert user_store.seen_results == [{"first-user-token"}, {"second-user-token"}]
 

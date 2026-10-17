@@ -394,6 +394,9 @@ def create_app(
             )
         except UnknownSubscriptionTokenError as exc:
             raise HTTPException(status_code=404, detail="Token not found") from exc
+        request_reselection = getattr(active_runner, "_request_reselection", None)
+        if callable(request_reselection):
+            await request_reselection()
         return payload.model_dump(mode="json")
 
     @app.delete(

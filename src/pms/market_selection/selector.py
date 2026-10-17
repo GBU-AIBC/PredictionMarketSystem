@@ -38,6 +38,11 @@ class MarketSelector:
         self._merge_policy = merge_policy
         self._market_subscription_store = market_subscription_store
         self._last_discovered_count = 0
+        self._last_user_subscription_asset_ids: frozenset[str] = frozenset()
+
+    @property
+    def last_user_subscription_asset_ids(self) -> frozenset[str]:
+        return self._last_user_subscription_asset_ids
 
     async def select(self) -> MergeResult:
         selections = await self.select_per_strategy()
@@ -52,14 +57,18 @@ class MarketSelector:
             )
         merged = self._merge_policy.merge(selections)
         user_asset_ids = await self._read_user_subscriptions()
+        self._last_user_subscription_asset_ids = user_asset_ids
         if not user_asset_ids:
             _log_selector_funnel(self._last_discovered_count, len(merged.asset_ids))
             return merged
-        asset_ids = list(merged.asset_ids)
+        # User pins are ordered first so the runner's hard cap preserves them
+        # ahead of strategy-selected assets. The runner also passes these ids
+        # as protected ids when it applies the cap during runtime refreshes.
+        asset_ids = sorted(user_asset_ids)
         seen_asset_ids = set(asset_ids)
         asset_ids.extend(
             asset_id
-            for asset_id in sorted(user_asset_ids)
+            for asset_id in merged.asset_ids
             if asset_id not in seen_asset_ids
         )
         result = MergeResult(

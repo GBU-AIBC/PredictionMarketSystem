@@ -927,6 +927,41 @@ async def test_refresh_subscription_caps_asset_ids() -> None:
 
 
 @pytest.mark.asyncio
+async def test_refresh_subscription_protects_user_pins_under_cap() -> None:
+    events: list[list[str]] = []
+
+    @dataclass
+    class RecordingSubscriptionController:
+        async def update(self, asset_ids: list[str]) -> bool:
+            events.append(list(asset_ids))
+            return True
+
+    runner = Runner(
+        config=PMSSettings(
+            mode=RunMode.PAPER,
+            auto_migrate_default_v2=False,
+            sensor=SensorSettings(max_subscription_asset_ids=2),
+        ),
+        historical_data_path=FIXTURE_PATH,
+    )
+    runner._subscription_controller = cast(Any, RecordingSubscriptionController())  # noqa: SLF001
+    runner._market_selector = cast(  # noqa: SLF001
+        Any,
+        SimpleNamespace(last_user_subscription_asset_ids=frozenset({"user-pin"})),
+    )
+    runner._controller_runtimes = {  # noqa: SLF001
+        "alpha": cast(
+            Any,
+            SimpleNamespace(asset_ids=frozenset({"strategy-a", "strategy-b", "user-pin"})),
+        )
+    }
+
+    await runner._refresh_subscription_assets_locked()  # noqa: SLF001
+
+    assert events == [["user-pin", "strategy-a"]]
+
+
+@pytest.mark.asyncio
 async def test_refresh_subscription_protects_open_position_tokens_under_cap() -> None:
     events: list[list[str]] = []
 

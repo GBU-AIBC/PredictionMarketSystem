@@ -643,8 +643,7 @@ async def test_market_data_sensor_ignores_book_payload_last_trade_without_token_
 
 
 @pytest.mark.asyncio
-async def test_market_data_sensor_update_subscription_warns_and_retries_on_slow_pool(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_market_data_sensor_update_subscription_does_not_probe_pool(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     store = _store_mock()
@@ -654,21 +653,11 @@ async def test_market_data_sensor_update_subscription_warns_and_retries_on_slow_
     fake_websocket = FakeWebSocket([])
     sensor._websocket = cast(Any, fake_websocket)
 
-    real_sleep = asyncio.sleep
-    sleeps: list[float] = []
-
-    async def fake_sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-        await real_sleep(0)
-
-    monkeypatch.setattr(sensor, "_sleep", fake_sleep)
-
     with caplog.at_level(logging.WARN):
         await sensor.update_subscription(["asset-a", "asset-b"])
 
-    assert store_mock.pool.attempts == 2
-    assert sleeps == [0.05]
-    assert "subscription update delayed: pool saturated" in caplog.text
+    assert store_mock.pool.attempts == 0
+    assert "pool saturated" not in caplog.text
     assert fake_websocket.sent_messages == [
         {
             "assets_ids": ["asset-a", "asset-b"],
@@ -701,6 +690,66 @@ async def test_market_data_sensor_dynamic_update_sends_subscribe_and_unsubscribe
 
 
 @pytest.mark.asyncio
+async def test_market_data_sensor_serializes_initial_and_dynamic_subscription_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingInitialWebSocket(FakeWebSocket):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.initial_send_started = asyncio.Event()
+            self.release_initial_send = asyncio.Event()
+            self.wait_for_close = asyncio.Event()
+
+        async def send(self, payload: str) -> None:
+            decoded = cast(dict[str, Any], json.loads(payload))
+            if not self.sent_messages:
+                self.initial_send_started.set()
+                await self.release_initial_send.wait()
+            self.sent_messages.append(decoded)
+
+        async def __anext__(self) -> str | bytes:
+            await self.wait_for_close.wait()
+            raise StopAsyncIteration
+
+    websocket = BlockingInitialWebSocket()
+    monkeypatch.setattr(
+        "pms.sensor.adapters.market_data.connect",
+        lambda url: FakeConnect(websocket),
+    )
+    sensor = MarketDataSensor(
+        store=_store_mock(),
+        ws_url="ws://market-data.example.test",
+        asset_ids=["asset-a"],
+    )
+    sensor._INITIAL_BACKOFF_S = 0.0
+    iterator = cast(Any, sensor.__aiter__())
+    consume_task = asyncio.create_task(anext(iterator))
+
+    await asyncio.wait_for(websocket.initial_send_started.wait(), timeout=0.5)
+    update_task = asyncio.create_task(sensor.update_subscription(["asset-b"]))
+    await asyncio.sleep(0)
+    assert not update_task.done()
+
+    websocket.release_initial_send.set()
+    await asyncio.wait_for(update_task, timeout=0.5)
+    assert websocket.sent_messages == [
+        {
+            "assets_ids": ["asset-a"],
+            "type": "market",
+            "initial_dump": True,
+            "level": 2,
+        },
+        {"assets_ids": ["asset-a"], "operation": "unsubscribe"},
+        {"assets_ids": ["asset-b"], "operation": "subscribe"},
+    ]
+    assert sensor._subscribed_asset_ids == frozenset({"asset-b"})
+
+    consume_task.cancel()
+    await asyncio.gather(consume_task, return_exceptions=True)
+    await sensor.aclose()
+
+
+@pytest.mark.asyncio
 async def test_market_data_sensor_accepts_subscription_update_when_socket_closes(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -721,31 +770,29 @@ async def test_market_data_sensor_accepts_subscription_update_when_socket_closes
 
 
 @pytest.mark.asyncio
-async def test_market_data_sensor_propagates_programming_errors(
+async def test_market_data_sensor_survives_persistence_type_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _store_mock()
     store_mock = cast(StoreMock, store)
-    store_mock.write_book_snapshot_mock.side_effect = TypeError("boom")
-    fake_websocket = FakeWebSocket(
-        [
-            json.dumps(
-                {
-                    "event_type": "book",
-                    "market": "m-broken",
-                    "asset_id": "asset-broken",
-                    "timestamp": "1757908892351",
-                    "hash": "book-broken",
-                    "bids": [{"price": "0.48", "size": "30"}],
-                    "asks": [{"price": "0.52", "size": "25"}],
-                    "last_trade_price": "0.50",
-                }
-            )
-        ]
+    store_mock.write_book_snapshot_mock.side_effect = [TypeError("boom"), 1]
+    payload = json.dumps(
+        {
+            "event_type": "book",
+            "market": "m-broken",
+            "asset_id": "asset-broken",
+            "timestamp": "1757908892351",
+            "hash": "book-broken",
+            "bids": [{"price": "0.48", "size": "30"}],
+            "asks": [{"price": "0.52", "size": "25"}],
+            "last_trade_price": "0.50",
+        }
     )
+    fake_websocket = FakeWebSocket([payload])
+    second_websocket = FakeWebSocket([payload.replace("book-broken", "book-recovered")])
     monkeypatch.setattr(
         "pms.sensor.adapters.market_data.connect",
-        lambda url: FakeConnect(fake_websocket),
+        ConnectSequence([fake_websocket, second_websocket]),
     )
     sensor = MarketDataSensor(
         store=store,
@@ -753,12 +800,14 @@ async def test_market_data_sensor_propagates_programming_errors(
         asset_ids=["asset-broken"],
     )
     sensor._heartbeat_interval_s = 1.0
+    sensor._INITIAL_BACKOFF_S = 0.0
     iterator = cast(Any, sensor.__aiter__())
 
-    with pytest.raises(TypeError, match="boom"):
-        await asyncio.wait_for(anext(iterator), timeout=0.5)
+    signal = await asyncio.wait_for(anext(iterator), timeout=0.5)
 
     await sensor.aclose()
+    assert signal.market_id == "m-broken"
+    assert store_mock.write_book_snapshot_mock.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -996,6 +1045,7 @@ async def test_market_data_sensor_reconnects_and_marks_next_snapshot_as_reconnec
         ws_url="ws://market-data.example.test",
         asset_ids=["asset-reconnect"],
     )
+    sensor._INITIAL_BACKOFF_S = 0.0
     iterator = cast(Any, sensor.__aiter__())
 
     await anext(iterator)
@@ -1265,6 +1315,7 @@ async def test_market_data_sensor_reconnects_when_pong_is_missing(
         ws_url="ws://market-data.example.test",
         asset_ids=["asset-pong"],
     )
+    sensor._INITIAL_BACKOFF_S = 0.0
     sensor._heartbeat_interval_s = 0.01
     sensor._pong_timeout_s = 0.02
     sensor._watchdog.timeout_s = 1.0
@@ -1320,6 +1371,7 @@ async def test_market_data_sensor_logs_heartbeat_connection_close_as_reconnect(
         ws_url="ws://market-data.example.test",
         asset_ids=["asset-heartbeat-close"],
     )
+    sensor._INITIAL_BACKOFF_S = 0.0
     sensor._heartbeat_interval_s = 0.01
     sensor._pong_timeout_s = 0.02
     sensor._watchdog.timeout_s = 1.0
@@ -1583,7 +1635,9 @@ async def test_market_data_sensor_reconnect_backoff_caps_and_resets_after_succes
     await iterator.aclose()
     await sensor.aclose()
 
-    assert sleeps[:4] == [0.01, 0.02, 0.02, 0.01]
+    # The first successful connection closes cleanly; the fourth sleep is the
+    # bounded delay after that clean close, before the next transient error.
+    assert sleeps[:5] == [0.01, 0.02, 0.02, 0.01, 0.01]
 
 
 @pytest.mark.asyncio
