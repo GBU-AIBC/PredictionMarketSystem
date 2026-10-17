@@ -3388,6 +3388,8 @@ class Runner:
                     missing.append("fee")
                 if trade.slippage_bps is None:
                     missing.append("execution_slippage")
+                if trade.fee_reconcile_audit_pending:
+                    missing.append("fee_audit")
                 if missing:
                     unresolved_telemetry.append(
                         f"{trade.fill_id} ({', '.join(missing)})"

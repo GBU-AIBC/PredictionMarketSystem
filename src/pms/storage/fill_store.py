@@ -171,6 +171,7 @@ class FillStore:
         reconciled_by: str | None = None,
         evidence: str | None = None,
         override: bool = False,
+        audit_pending: bool = False,
     ) -> bool:
         """Record verified venue fee telemetry for an unresolved fill once."""
         if not fill_id.strip():
@@ -244,6 +245,8 @@ class FillStore:
                 if slippage_bps is not None:
                     flags.append(f"execution_slippage_bps={slippage_bps:.9f}")
                 payload["anomaly_flags"] = flags
+                if audit_pending:
+                    payload["fee_reconcile_audit_pending"] = True
                 await connection.execute(
                     """
                     UPDATE fill_payloads
@@ -254,6 +257,22 @@ class FillStore:
                     json.dumps(payload),
                 )
         return True
+
+    async def mark_fee_reconcile_audited(self, fill_id: str) -> bool:
+        """Clear the fail-closed audit marker after the external audit append."""
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            row = await connection.fetchrow(
+                """
+                UPDATE fill_payloads
+                SET payload = payload - 'fee_reconcile_audit_pending'
+                WHERE fill_id = $1
+                  AND payload->>'fee_reconcile_audit_pending' = 'true'
+                RETURNING fill_id
+                """,
+                fill_id,
+            )
+        return row is not None
 
     async def read_positions(self) -> list[Position]:
         return await self._read_positions(run_mode=None)
@@ -510,6 +529,7 @@ class StoredTradeRow:
     slippage_bps: float | None = None
     risk_group_id: str | None = None
     run_mode: str | None = None
+    fee_reconcile_audit_pending: bool = False
 
 
 class _PositionAccumulator:
@@ -834,6 +854,9 @@ def _trade_from_row(row: asyncpg.Record) -> StoredTradeRow:
             slippage_bps=_slippage_from_anomaly_flags(payload.get("anomaly_flags")),
             risk_group_id=cast(str | None, payload.get("risk_group_id")),
             run_mode=_run_mode_from_anomaly_flags(payload.get("anomaly_flags")),
+            fee_reconcile_audit_pending=bool(
+                payload.get("fee_reconcile_audit_pending", False)
+            ),
         )
     except (RuntimeError, json.JSONDecodeError, TypeError, ValueError, KeyError) as error:
         raise RuntimeError(

@@ -225,6 +225,7 @@ async def test_live_fee_reconcile_cli_updates_store_and_audits(
             reconciled_by: str | None = None,
             evidence: str | None = None,
             override: bool = False,
+            audit_pending: bool = False,
         ) -> bool:
             calls["fee"] = (
                 fill_id,
@@ -235,6 +236,10 @@ async def test_live_fee_reconcile_cli_updates_store_and_audits(
                 evidence,
                 override,
             )
+            return True
+
+        async def mark_fee_reconcile_audited(self, fill_id: str) -> bool:
+            calls["audit_marked"] = fill_id
             return True
 
     class Audit:

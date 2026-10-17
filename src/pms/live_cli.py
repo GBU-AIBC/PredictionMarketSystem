@@ -373,6 +373,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                     reconciled_by=reconciled_by,
                     evidence=evidence,
                     override=bool(args.override),
+                    audit_pending=True,
                 )
                 if updated:
                     try:
@@ -387,6 +388,13 @@ async def _main_async(args: argparse.Namespace) -> int:
                             evidence=evidence,
                             override=bool(args.override),
                         )
+                        audit_marked = await FillStore(pool).mark_fee_reconcile_audited(
+                            fill_id
+                        )
+                        if not audit_marked:
+                            raise RuntimeError(
+                                "fee reconciliation audit marker was not persisted"
+                            )
                     except Exception as exc:  # noqa: BLE001
                         audit_error = exc
             except Exception as exc:  # noqa: BLE001
