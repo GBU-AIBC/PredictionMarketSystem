@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -331,6 +332,17 @@ class _StrategyAccumulator:
         drawdown = self.peak_equity - self.cumulative_pnl
         if drawdown > self.max_drawdown:
             self.max_drawdown = drawdown
+        previous_execution = self._execution_rows_by_decision.get(fill.decision_id)
+        previous_pnl = (
+            None
+            if previous_execution is None
+            else previous_execution.pnl
+        )
+        execution_pnl = (
+            None
+            if _resolved_outcome(signal) is None
+            else float(pnl_delta + Decimal(str(previous_pnl or 0.0)))
+        )
         self._execution_rows_by_decision[fill.decision_id] = _BacktestExecutionRow(
             decision_id=fill.decision_id,
             strategy_id=self.strategy_id,
@@ -341,7 +353,7 @@ class _StrategyAccumulator:
                 decision=decision,
                 fill_price=fill.fill_price,
             ),
-            pnl=float(pnl_delta) if _resolved_outcome(signal) is not None else None,
+            pnl=execution_pnl,
             rejection_reason=None,
             created_at=signal.fetched_at,
         )
@@ -1269,11 +1281,17 @@ def _signal_with_replay_resolution(
     if not callable(resolver):
         return signal
     cutoff = evaluation_as_of or datetime.now(tz=UTC)
-    try:
+    parameters = inspect.signature(resolver).parameters
+    accepts_cutoff = "as_of" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if accepts_cutoff:
         resolved_value = resolver(signal.market_id, as_of=cutoff)
-    except TypeError:
+    else:
         # Keep compatibility with test/research replay adapters that expose
-        # only the historical one-argument resolver contract.
+        # only the historical one-argument resolver contract.  Do not retry
+        # after a resolver that accepted ``as_of`` raised internally.
         resolved_value = resolver(signal.market_id)
     resolved = normalize_resolved_outcome(resolved_value)
     if resolved is None:

@@ -833,9 +833,7 @@ async def test_controller_pipeline_rejects_tiny_edge_before_zero_size_metric() -
     assert pipeline.suppressed_zero_size == 0
     diagnostic = pipeline.last_diagnostic
     assert diagnostic is not None
-    assert diagnostic.code == "decision_net_edge_not_positive"
-    assert diagnostic.metadata["gross_edge"] == pytest.approx(0.001)
-    assert diagnostic.metadata["net_edge_after_costs"] < 0.0
+    assert diagnostic.code == "llm_only_forecast"
 
 
 @pytest.mark.asyncio

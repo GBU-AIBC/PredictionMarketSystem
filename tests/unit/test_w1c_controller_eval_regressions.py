@@ -10,16 +10,24 @@ from typing import cast
 
 import pytest
 
-from pms.config import DatabaseSettings, LLMSettings, PMSSettings, RiskSettings
+from pms.config import (
+    ControllerSettings,
+    DatabaseSettings,
+    LLMSettings,
+    PMSSettings,
+    RiskSettings,
+)
 from pms.actuator.risk import InsufficientLiquidityError
 from pms.controller.forecasters.llm import (
     LLMForecaster,
     LLMProviderUnavailableError,
     _ProviderResponse,
+    _cache_key,
     _prompt,
 )
 from pms.controller.calibrators.netcal import NetcalCalibrator
 from pms.controller.pipeline import ControllerPipeline, _weighted_probability
+from pms.controller.router import Router
 from pms.controller.sizers.kelly import KellySizer
 from pms.core.enums import Side, TimeInForce
 from pms.core.models import EvalRecord, FillRecord, MarketSignal, Portfolio, TradeDecision
@@ -37,6 +45,7 @@ from pms.research.replay import (
     _MarketMetadata,
     _market_resolution_label,
 )
+from pms.research.runner import _signal_with_replay_resolution
 from pms.strategies.projections import (
     EvalSpec,
     ForecasterSpec,
@@ -228,6 +237,67 @@ def test_estimated_reservation_uses_model_price() -> None:
 
 def test_zero_confidence_has_zero_weight() -> None:
     assert _weighted_probability([0.9, 0.1], [0.0, 1.0]) == pytest.approx(0.1)
+
+
+def test_llm_share_is_capped_at_25_percent_of_ensemble_weight() -> None:
+    probability = _weighted_probability(
+        [0.4, 0.99],
+        [1.0, 1.0],
+        llm_mask=[False, True],
+    )
+    assert probability == pytest.approx(0.5475)
+
+
+def test_llm_only_zero_non_llm_weight_returns_neutral_fallback() -> None:
+    # The pipeline turns this case into a typed ``llm_only_forecast`` drop;
+    # the helper remains neutral for callers without pipeline diagnostics.
+    assert _weighted_probability([0.4, 0.99], [0.0, 0.25], llm_mask=[False, True]) == pytest.approx(
+        0.5
+    )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_drops_llm_only_forecast_with_typed_diagnostic() -> None:
+    class ZeroWeightForecaster:
+        def predict(self, signal: MarketSignal) -> tuple[float, float, str]:
+            return (signal.yes_price, 0.0, "rules")
+
+        async def forecast(self, signal: MarketSignal) -> float:
+            return signal.yes_price
+
+    response = SimpleNamespace(
+        content='{"prob_estimate":0.99,"confidence":1.0,"rationale":"x"}',
+        usage=SimpleNamespace(input_tokens=10, output_tokens=10),
+    )
+    llm = LLMForecaster(
+        config=LLMSettings(
+            enabled=True,
+            provider="anthropic",
+            api_key="test",
+            model="claude-test",
+            cache_ttl_s=0.0,
+        ),
+        client=SimpleNamespace(messages=SimpleNamespace(create=lambda **kwargs: response)),
+    )
+    pipeline = ControllerPipeline(
+        forecasters=[ZeroWeightForecaster(), llm],
+        router=Router(ControllerSettings(min_volume=0.0)),
+    )
+    assert await pipeline.on_signal(
+        _signal({"category": "politics"}),
+        portfolio=Portfolio(1_000.0, 1_000.0, 0.0, []),
+    ) is None
+    assert pipeline.last_diagnostic is not None
+    assert pipeline.last_diagnostic.code == "llm_only_forecast"
+
+
+def test_llm_cache_key_ignores_orderbook_size_changes() -> None:
+    first = _signal({"category": "politics"})
+    second = replace(
+        first,
+        orderbook={"bids": [{"price": 0.39, "size": 99.0}]},
+    )
+    assert _cache_key(first) == _cache_key(second)
 
 
 def test_default_controller_pipeline_derives_restart_safe_spend_ledger(
@@ -477,6 +547,25 @@ def test_closed_fallback_without_known_at_is_excluded_by_cutoff() -> None:
     assert engine.resolution_for("closed", as_of=cutoff) == 1.0
 
 
+def test_replay_resolver_type_error_is_not_retried_without_cutoff() -> None:
+    class BrokenResolver:
+        def resolution_for(
+            self,
+            market_id: str,
+            *,
+            as_of: datetime,
+        ) -> float:
+            del market_id, as_of
+            raise TypeError("bad timestamp conversion")
+
+    with pytest.raises(TypeError, match="bad timestamp conversion"):
+        _signal_with_replay_resolution(
+            _signal({"category": "politics"}),
+            BrokenResolver(),
+            evaluation_as_of=datetime(2026, 1, 2, tzinfo=UTC),
+        )
+
+
 def test_replay_walk_book_rejects_non_finite_notional() -> None:
     with pytest.raises(InsufficientLiquidityError):
         _walk_book(
@@ -528,5 +617,6 @@ async def test_terminal_partial_fill_is_evaluated_once() -> None:
     assert not await spool.process(fill("fill-partial-2", 7.0, 17.5), decision)
     assert await spool.process(fill("fill-terminal", 8.0, 20.0, "matched"), decision)
     assert not await spool.process(fill("fill-late-partial", 7.0, 17.5), decision)
+    assert not await spool.process(fill("fill-late-partial-large", 9.0, 22.5), decision)
     assert len(await store.all()) == 1
     assert (await store.all())[0].pnl == pytest.approx(12.0)

@@ -676,10 +676,9 @@ def _cache_key(signal: MarketSignal) -> str:
     payload = {
         "external_signal": _point_in_time_external_signal(signal.external_signal),
         "market_id": signal.market_id,
-        "orderbook": signal.orderbook,
         "title": signal.title,
         "venue": signal.venue,
-        "yes_price": signal.yes_price,
+        "yes_price_bucket": round(signal.yes_price, 3),
     }
     return sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()

@@ -21,6 +21,7 @@ from pms.strategies.projections import EvalSpec
 
 
 logger = logging.getLogger(__name__)
+_TERMINAL_ORDER_TOMBSTONE_LIMIT = 10_000
 
 StrategyMetricsProvider = Callable[
     [],
@@ -120,15 +121,18 @@ class EvalSpool:
             )
             return False
         terminal = self._terminal_order_totals.get(fill.order_id)
-        if terminal is not None and (
-            fill.fill_notional_usdc < terminal[0]
-            or fill.fill_quantity < terminal[1]
-            or (
-                fill.fill_notional_usdc == terminal[0]
-                and fill.fill_quantity == terminal[1]
-            )
-        ):
-            return False
+        if terminal is not None:
+            if fill.status not in {"matched", "filled", "cancelled", "rejected"}:
+                return False
+            if (
+                fill.fill_notional_usdc < terminal[0]
+                or fill.fill_quantity < terminal[1]
+                or (
+                    fill.fill_notional_usdc == terminal[0]
+                    and fill.fill_quantity == terminal[1]
+                )
+            ):
+                return False
         previous = self._latest_order_totals.get(fill.order_id) or terminal
         if previous is not None:
             previous_notional, previous_quantity, previous_status = previous
@@ -180,6 +184,12 @@ class EvalSpool:
         )
         if fill.status in {"matched", "filled", "cancelled", "rejected"}:
             self._latest_order_totals.pop(fill.order_id, None)
+            if fill.order_id not in self._terminal_order_totals and len(
+                self._terminal_order_totals
+            ) >= _TERMINAL_ORDER_TOMBSTONE_LIMIT:
+                # shortcut: retain a bounded recent set; durable eval rows
+                # remain authoritative for older terminal orders.
+                self._terminal_order_totals.pop(next(iter(self._terminal_order_totals)))
             self._terminal_order_totals[fill.order_id] = (
                 fill.fill_notional_usdc,
                 fill.fill_quantity,

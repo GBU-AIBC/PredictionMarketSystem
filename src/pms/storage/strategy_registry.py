@@ -108,13 +108,18 @@ class PostgresStrategyRegistry:
         pass `activate=False` to populate dependent rows before activation.
         """
         strategy_id = strategy.config.strategy_id
+        llm_identity = (
+            self._llm_identity
+            if any(name == "llm" for name, _ in strategy.forecaster.forecasters)
+            else None
+        )
         strategy_version_id = compute_strategy_version_id(
             *strategy.snapshot(),
-            llm_identity=self._llm_identity,
+            llm_identity=llm_identity,
         )
         config_json = _strategy_to_config_json(
             strategy,
-            llm_identity=self._llm_identity,
+            llm_identity=llm_identity,
         )
         metadata_json = json.dumps(
             dict(strategy.config.metadata),

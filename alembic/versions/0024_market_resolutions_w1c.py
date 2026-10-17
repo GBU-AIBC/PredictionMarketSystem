@@ -34,3 +34,6 @@ def upgrade() -> None:
 def downgrade() -> None:
     connection: Connection = op.get_bind()
     connection.exec_driver_sql("DROP TABLE IF EXISTS market_resolutions")
+    connection.exec_driver_sql(
+        "ALTER TABLE eval_records DROP COLUMN IF EXISTS calibration_prob_estimate"
+    )

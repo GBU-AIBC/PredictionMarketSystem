@@ -332,6 +332,7 @@ class ControllerPipeline:
 
         probabilities: list[float] = []
         confidence_weights: list[float] = []
+        llm_weight_flags: list[bool] = []
         model_ids: list[str] = []
         rationales: list[str] = []
         runtime_probabilities: dict[str, float] = {}
@@ -364,6 +365,7 @@ class ControllerPipeline:
                 # Cap LLM influence at 25%; zero confidence means zero weight.
                 confidence_weight = min(confidence_weight, 0.25)
             confidence_weights.append(confidence_weight)
+            llm_weight_flags.append(isinstance(forecaster, LLMForecaster))
             if result[2]:
                 rationales.append(f"{model_id}:{result[2]}")
             runtime_factor_id = _runtime_factor_id(
@@ -395,8 +397,38 @@ class ControllerPipeline:
             )
             return None
 
+        non_llm_weight = sum(
+            weight
+            for weight, is_llm in zip(
+                confidence_weights,
+                llm_weight_flags,
+                strict=True,
+            )
+            if not is_llm
+        )
+        if any(llm_weight_flags) and non_llm_weight <= 0.0 and not has_factor_composition:
+            self._set_drop_diagnostic(
+                signal,
+                code="llm_only_forecast",
+                message=(
+                    "Skipping decision because no non-LLM forecaster has "
+                    "positive confidence to bound LLM influence."
+                ),
+                severity="info",
+            )
+            _log_pipeline_funnel(
+                signal,
+                forecasted_count=len(probabilities),
+                emitted_count=0,
+            )
+            return None
+
         prob_estimate = (
-            _weighted_probability(probabilities, confidence_weights)
+            _weighted_probability(
+                probabilities,
+                confidence_weights,
+                llm_mask=llm_weight_flags,
+            )
             if probabilities
             else signal.yes_price
         )
@@ -1283,10 +1315,33 @@ def _apply_pre_calibrators(
     return current
 
 
-def _weighted_probability(probabilities: Sequence[float], weights: Sequence[float]) -> float:
+def _weighted_probability(
+    probabilities: Sequence[float],
+    weights: Sequence[float],
+    *,
+    llm_mask: Sequence[bool] | None = None,
+) -> float:
     if not probabilities:
         return 0.5
     effective = [max(0.0, weight) for weight in weights]
+    if llm_mask is not None:
+        if len(llm_mask) != len(effective):
+            raise ValueError("llm_mask must match probabilities and weights")
+        non_llm_total = sum(
+            weight for weight, is_llm in zip(effective, llm_mask, strict=True) if not is_llm
+        )
+        llm_total = sum(
+            weight for weight, is_llm in zip(effective, llm_mask, strict=True) if is_llm
+        )
+        if non_llm_total <= 0.0 and llm_total > 0.0:
+            return 0.5
+        max_llm_total = non_llm_total / 3.0
+        if llm_total > max_llm_total > 0.0:
+            scale = max_llm_total / llm_total
+            effective = [
+                weight * scale if is_llm else weight
+                for weight, is_llm in zip(effective, llm_mask, strict=True)
+            ]
     total = sum(effective)
     if total <= 0.0:
         return sum(probabilities) / len(probabilities)

@@ -678,23 +678,10 @@ class Runner:
                     msg = "Runner PostgreSQL pool is not initialized"
                     raise RuntimeError(msg)
                 llm_identity = llm_identity_for_settings(self.config)
-                registry_parameters = inspect.signature(
-                    PostgresStrategyRegistry
-                ).parameters
-                accepts_identity = "llm_identity" in registry_parameters or any(
-                    parameter.kind is inspect.Parameter.VAR_KEYWORD
-                    for parameter in registry_parameters.values()
-                )
-                if accepts_identity:
-                    self._strategy_registry = PostgresStrategyRegistry(
-                        self._pg_pool,
-                        llm_identity=llm_identity,
-                    )
-                else:
-                    # Test/runtime registry doubles may still expose the
-                    # historical pool-only constructor.
-                    self._strategy_registry = PostgresStrategyRegistry(self._pg_pool)
-                    setattr(self._strategy_registry, "_llm_identity", llm_identity)
+                # Keep construction compatible with registry test doubles;
+                # the concrete registry reads this identity during versioning.
+                self._strategy_registry = PostgresStrategyRegistry(self._pg_pool)
+                setattr(self._strategy_registry, "_llm_identity", llm_identity)
                 if self.config.mode == RunMode.LIVE:
                     self._live_preflight_active_strategies_fingerprint = (
                         await require_live_preflight_active_strategies_artifact(
