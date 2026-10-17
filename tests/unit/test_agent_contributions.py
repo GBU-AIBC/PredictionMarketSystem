@@ -28,6 +28,11 @@ from pms.core.models import MarketSignal
 from pms.core.enums import MarketStatus, RunMode
 from pms.factors.composition import _rule_delta
 from pms.research.runner import BacktestRunner
+from pms.research.cli import (
+    _ReplayPruneArgs,
+    _parse_required_prune_datetime,
+    _run_replay_prune,
+)
 from pms.storage.agent_evidence_store import (
     AgentEvidence,
     canonical_content_hash,
@@ -39,6 +44,56 @@ from pms.strategies.paper_multifactor import (
 )
 from pms.strategies.agent_evidence import AgentEvidenceObservationSource
 from pms.strategies.projections import ForecasterSpec
+
+
+def test_prune_requires_past_timezone_aware_cutoff() -> None:
+    assert _parse_required_prune_datetime("2026-10-17T00:00:00+00:00") == datetime(
+        2026, 10, 17, tzinfo=UTC
+    )
+    for value in ("", "   ", "2026-10-17T00:00:00", "not-a-date"):
+        with pytest.raises(ValueError):
+            _parse_required_prune_datetime(value)
+    with pytest.raises(ValueError, match="future"):
+        _parse_required_prune_datetime("2999-01-01T00:00:00+00:00")
+
+
+@pytest.mark.asyncio
+async def test_prune_dry_run_reports_count_without_deleting(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakePool:
+        async def close(self) -> None:
+            return None
+
+    class FakeStore:
+        def __init__(self, pool: object) -> None:
+            del pool
+
+        async def count_before(self, before: datetime) -> int:
+            assert before == datetime(2026, 10, 17, tzinfo=UTC)
+            return 7
+
+        async def prune_before(self, before: datetime) -> int:
+            raise AssertionError(f"dry-run deleted rows before {before}")
+
+    import pms.research.cli as research_cli
+
+    monkeypatch.setattr(research_cli, "_create_pool", lambda _url: _fake_pool(FakePool()))
+    monkeypatch.setattr(research_cli, "PostgresLLMReplayStore", FakeStore)
+    result = await _run_replay_prune(
+        _ReplayPruneArgs(
+            database_url=None,
+            before=datetime(2026, 10, 17, tzinfo=UTC),
+            dry_run=True,
+        )
+    )
+    assert result == 0
+    assert "would delete 7 llm replay rows" in capsys.readouterr().out
+
+
+async def _fake_pool(pool: object) -> object:
+    return pool
 
 
 def test_agent_evidence_hash_and_time_validation() -> None:
@@ -467,8 +522,13 @@ async def test_controller_research_replay_cache_miss_is_fatal() -> None:
 @pytest.mark.asyncio
 async def test_controller_research_replay_timeout_is_fatal() -> None:
     class SlowReplayForecaster(LLMForecaster):
-        async def apredict(self, signal: MarketSignal) -> LLMForecastResult | None:
-            del signal
+        async def apredict(
+            self,
+            signal: MarketSignal,
+            *,
+            defer_record: bool = False,
+        ) -> LLMForecastResult | None:
+            del signal, defer_record
             await asyncio.sleep(1.0)
             return None
 
@@ -524,6 +584,67 @@ async def test_paper_timeout_records_no_forecast_for_replay() -> None:
         replay_store=cast(Any, store),
     )
     assert await replay.apredict(_signal()) is None
+
+
+@pytest.mark.asyncio
+async def test_paper_recording_after_pipeline_result_avoids_commit_cancel_race() -> None:
+    class CommitThenSlowAckStore(MemoryReplayStore):
+        async def put(
+            self,
+            *,
+            replay_key: str,
+            model: str,
+            prompt_hash: str,
+            input_hash: str,
+            prompt: str,
+            response: Mapping[str, object],
+            recorded_at: datetime,
+            run_mode: str,
+        ) -> None:
+            await super().put(
+                replay_key=replay_key,
+                model=model,
+                prompt_hash=prompt_hash,
+                input_hash=input_hash,
+                prompt=prompt,
+                response=response,
+                recorded_at=recorded_at,
+                run_mode=run_mode,
+            )
+            await asyncio.sleep(0.1)
+
+    store = CommitThenSlowAckStore()
+    forecaster = LLMForecaster(
+        config=LLMSettings(
+            enabled=True,
+            provider="openai",
+            api_key="test",
+            model="openai-test",
+        ),
+        client=_openai_client(
+            '{"prob_estimate":0.8,"confidence":0.5,"rationale":"ok"}'
+        ),
+        record_replay_mode="record",
+        replay_store=cast(Any, store),
+    )
+    pipeline = ControllerPipeline(
+        settings=PMSSettings(llm=LLMSettings(timeout_s=0.05)),
+    )
+    result = await pipeline._predict_forecaster(forecaster, _signal())
+    assert result is not None
+    assert result[0] == pytest.approx(0.8)
+    assert len(store.rows) == 1
+    row = store.rows[next(iter(store.rows))]
+    assert row["prob_estimate"] == pytest.approx(0.8)
+    assert "no_forecast" not in row
+    replay = LLMForecaster(
+        config=forecaster.config,
+        record_replay_mode="replay",
+        replay_store=cast(Any, store),
+    )
+    replayed = await replay.apredict(_signal())
+    assert replayed is not None
+    assert replayed[0] == pytest.approx(0.8)
 
 
 @pytest.mark.asyncio

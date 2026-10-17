@@ -7,9 +7,6 @@ from fastapi import HTTPException, Request
 from pms.core.enums import RunMode
 
 
-AGENT_CONTRIBUTION_SCOPES = frozenset({"paper_operate", "research"})
-
-
 def pool_from_request(request: Request) -> asyncpg.Pool:
     runner = getattr(request.app.state, "runner", None)
     pool = getattr(runner, "pg_pool", None)

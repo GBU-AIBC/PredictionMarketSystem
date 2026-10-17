@@ -207,6 +207,9 @@ class LLMForecaster:
     strategy_id: str | None = None
     strategy_version_id: str | None = None
     last_failure_reason: str | None = field(init=False, default=None)
+    _pending_replay_inputs: dict[
+        int, tuple[tuple[str, str, str], str, str | None]
+    ] = field(init=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.config is None:
@@ -301,7 +304,12 @@ class LLMForecaster:
         self._cache_put(cache_key, result, response_text=response.text)
         return result
 
-    async def apredict(self, signal: MarketSignal) -> LLMForecastResult | None:
+    async def apredict(
+        self,
+        signal: MarketSignal,
+        *,
+        defer_record: bool = False,
+    ) -> LLMForecastResult | None:
         if self.config is None or not self.config.enabled:
             return None
         evidence: Sequence[AgentEvidence] = ()
@@ -329,42 +337,84 @@ class LLMForecaster:
         )
         if self.record_replay_mode == "replay":
             return await self._replay_from_store(replay_key)
+        if self.record_replay_mode == "record":
+            self._pending_replay_inputs[id(signal)] = (
+                replay_key,
+                prompt,
+                None,
+            )
         try:
             result = await asyncio.to_thread(self.predict, signal, evidence=evidence)
         except Exception:
             if self.record_replay_mode == "record":
                 self.last_failure_reason = self.last_failure_reason or "provider_error"
-                await self._record_store_result(replay_key, None, prompt=prompt)
+                context = self._pending_replay_inputs.pop(id(signal), None)
+                if not defer_record:
+                    await self._record_store_result(
+                        replay_key,
+                        None,
+                        prompt=prompt,
+                        failure_reason=self.last_failure_reason,
+                    )
+                elif context is not None:
+                    self._pending_replay_inputs[id(signal)] = (
+                        context[0],
+                        context[1],
+                        self.last_failure_reason,
+                    )
             raise
         if self.record_replay_mode == "record":
-            await self._record_store_result(replay_key, result, prompt=prompt)
+            failure_reason = self.last_failure_reason
+            if defer_record:
+                self._pending_replay_inputs[id(signal)] = (
+                    replay_key,
+                    prompt,
+                    failure_reason,
+                )
+            else:
+                self._pending_replay_inputs.pop(id(signal), None)
+                await self._record_store_result(
+                    replay_key,
+                    result,
+                    prompt=prompt,
+                    failure_reason=failure_reason,
+                )
         return result
+
+    async def record_outcome(
+        self,
+        signal: MarketSignal,
+        result: LLMForecastResult | None,
+        *,
+        failure_reason: str | None = None,
+    ) -> None:
+        """Persist the outcome after the pipeline has consumed the result."""
+        if self.config is None or self.record_replay_mode != "record":
+            return
+        context = self._pending_replay_inputs.pop(id(signal), None)
+        if context is None:
+            return
+        await self._record_store_result(
+            context[0],
+            result,
+            prompt=context[1],
+            failure_reason=failure_reason or context[2],
+        )
 
     async def record_timeout(self, signal: MarketSignal) -> None:
         """Persist PAPER timeout outcome after the controller deadline expires."""
         if self.config is None or self.record_replay_mode != "record":
             return
-        evidence: Sequence[AgentEvidence] = ()
-        if self.evidence_reader is not None:
-            try:
-                evidence = await self.evidence_reader.read_evidence(
-                    signal.market_id,
-                    as_of=signal.timestamp,
-                    limit=8,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("LLM evidence read failed while recording timeout")
-        prompt = _prompt(signal, evidence=evidence)
-        key = _replay_key(
-            self.config,
-            signal,
-            prompt,
-            evidence=evidence,
-            strategy_id=self.strategy_id,
-            strategy_version_id=self.strategy_version_id,
-        )
+        context = self._pending_replay_inputs.pop(id(signal), None)
+        if context is None:
+            return
         self.last_failure_reason = "timeout"
-        await self._record_store_result(key, None, prompt=prompt)
+        await self._record_store_result(
+            context[0],
+            None,
+            prompt=context[1],
+            failure_reason="timeout",
+        )
 
     async def _replay_from_store(
         self,
@@ -404,6 +454,7 @@ class LLMForecaster:
         result: LLMForecastResult | None,
         *,
         prompt: str,
+        failure_reason: str | None = None,
     ) -> None:
         if self.replay_store is None or self.config is None:
             return
@@ -411,7 +462,7 @@ class LLMForecaster:
         if result is None:
             response = {
                 "no_forecast": True,
-                "reason": self.last_failure_reason or "no_forecast",
+                "reason": failure_reason or self.last_failure_reason or "no_forecast",
             }
         else:
             response = {

@@ -76,6 +76,15 @@ class PostgresLLMReplayStore:
             )
         return int(result.rsplit(" ", 1)[-1])
 
+    async def count_before(self, before: datetime) -> int:
+        """Count rows eligible for an explicit prune without mutating storage."""
+        async with self.pool.acquire() as connection:
+            count = await connection.fetchval(
+                "SELECT COUNT(*) FROM llm_replay_records WHERE recorded_at < $1",
+                before,
+            )
+        return int(count or 0)
+
 
 def _json_response(response: Mapping[str, Any]) -> str:
     return json.dumps(dict(response), sort_keys=True, separators=(",", ":"))

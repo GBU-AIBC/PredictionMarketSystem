@@ -66,6 +66,7 @@ class _ResolutionBackfillArgs:
 class _ReplayPruneArgs:
     database_url: str | None
     before: datetime
+    dry_run: bool
 
 
 @dataclass(slots=True)
@@ -99,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     prune_parser = subparsers.add_parser("prune-llm-replay")
     prune_parser.add_argument("--database-url")
     prune_parser.add_argument("--before", required=True)
+    prune_parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -143,9 +145,14 @@ def main() -> None:
         raise SystemExit(asyncio.run(_run_resolution_backfill(args)))
 
     if namespace.command == "prune-llm-replay":
+        try:
+            before = _parse_required_prune_datetime(namespace.before)
+        except ValueError as exc:
+            parser.error(str(exc))
         prune_args = _ReplayPruneArgs(
             database_url=_optional_string(namespace.database_url),
-            before=_parse_cli_datetime(namespace.before) or datetime.now(tz=UTC),
+            before=before,
+            dry_run=bool(namespace.dry_run),
         )
         raise SystemExit(asyncio.run(_run_replay_prune(prune_args)))
 
@@ -199,8 +206,13 @@ async def _run_sweep(args: _SweepArgs) -> int:
 async def _run_replay_prune(args: _ReplayPruneArgs) -> int:
     pool = await _create_pool(args.database_url)
     try:
-        deleted = await PostgresLLMReplayStore(pool).prune_before(args.before)
-        print(f"deleted {deleted} llm replay rows before {args.before.isoformat()}")
+        store = PostgresLLMReplayStore(pool)
+        if args.dry_run:
+            count = await store.count_before(args.before)
+            print(f"would delete {count} llm replay rows before {args.before.isoformat()}")
+        else:
+            deleted = await store.prune_before(args.before)
+            print(f"deleted {deleted} llm replay rows before {args.before.isoformat()}")
         return 0
     finally:
         await pool.close()
@@ -341,6 +353,24 @@ def _parse_cli_datetime(value: object) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _parse_required_prune_datetime(value: object) -> datetime:
+    raw = str(value).strip()
+    if not raw:
+        raise ValueError("--before must be a non-empty timezone-aware ISO-8601 timestamp")
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError("--before must be a valid ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("--before must include a timezone offset")
+    normalized = parsed.astimezone(UTC)
+    if normalized > datetime.now(tz=UTC):
+        raise ValueError("--before must not be in the future")
+    return normalized
 
 
 def _parameter_grid(raw_value: object) -> dict[str, Sequence[object]]:

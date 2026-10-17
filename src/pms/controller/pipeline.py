@@ -1311,6 +1311,14 @@ class ControllerPipeline:
         async_predict = getattr(forecaster, "apredict", None)
         if callable(async_predict) and not _predict_method_overridden(forecaster):
             try:
+                if isinstance(forecaster, LLMForecaster):
+                    pending_result = await asyncio.wait_for(
+                        forecaster.apredict(signal, defer_record=True),
+                        timeout=self.settings.llm.timeout_s,
+                    )
+                    if forecaster.record_replay_mode == "record":
+                        await forecaster.record_outcome(signal, pending_result)
+                    return pending_result
                 return await asyncio.wait_for(
                     cast(
                         Callable[[MarketSignal], Awaitable[ForecastResult | None]],
@@ -1328,6 +1336,16 @@ class ControllerPipeline:
                 ):
                     await forecaster.record_timeout(signal)
                 return None
+            except Exception:
+                if isinstance(forecaster, LLMForecaster) and (
+                    forecaster.record_replay_mode == "record"
+                ):
+                    await forecaster.record_outcome(
+                        signal,
+                        None,
+                        failure_reason=forecaster.last_failure_reason or "provider_error",
+                    )
+                raise
         timeout_s = self.settings.llm.timeout_s
         try:
             return await asyncio.wait_for(

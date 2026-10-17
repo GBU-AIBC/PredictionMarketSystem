@@ -212,7 +212,7 @@ def validate_registered_factor_catalog() -> None:
         entry.factor_id
         for entry in FACTOR_CATALOG_ROWS
         if (
-            entry.owner not in {"deferred", "agent:llm"}
+            entry.owner != "deferred" and not entry.owner.startswith("agent:")
             and entry.factor_id not in registered_ids
         )
     )
