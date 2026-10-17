@@ -69,6 +69,36 @@ def test_apply_composition_rejects_non_finite_factor_values() -> None:
         )
 
 
+def test_rule_delta_piecewise_floor_and_threshold_boundaries() -> None:
+    composition = (
+        _step("favorite_longshot_bias", role="rule_delta", weight=2.0, threshold=0.01),
+    )
+
+    assert apply_composition(
+        composition,
+        {
+            ("favorite_longshot_bias", ""): -0.05,
+            ("yes_price", ""): 0.05,
+        },
+    ) == pytest.approx(1e-6)
+    # Exactly at the threshold the gate is inclusive; only values below it
+    # are neutralized.
+    assert apply_composition(
+        composition,
+        {
+            ("favorite_longshot_bias", ""): 0.01,
+            ("yes_price", ""): 0.50,
+        },
+    ) == pytest.approx(0.52)
+    assert apply_composition(
+        composition,
+        {
+            ("favorite_longshot_bias", ""): 0.009,
+            ("yes_price", ""): 0.50,
+        },
+    ) == pytest.approx(0.50)
+
+
 def test_validate_composition_rejects_unknown_role_and_factor() -> None:
     with pytest.raises(ValueError, match="unknown composition role"):
         validate_composition((_step("yes_price", role="typo", weight=1.0),))
