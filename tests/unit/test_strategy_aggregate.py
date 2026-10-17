@@ -33,7 +33,7 @@ def _build_projections() -> dict[str, Any]:
             strategy_id="default",
             factor_composition=(
                 factor_composition_step(
-                    factor_id="factor-a",
+                    factor_id="yes_price",
                     role="weighted",
                     param="",
                     weight=1.0,

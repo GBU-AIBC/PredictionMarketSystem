@@ -166,16 +166,19 @@ def build_imbalance_with_prior_strategy() -> Strategy:
             factor_composition=(
                 FactorCompositionStep(
                     factor_id="orderbook_imbalance",
-                    role="threshold_edge",
+                    # Raw depth is scaled as a rule delta before it becomes a
+                    # probability; threshold_edge is reserved for already
+                    # probability-shaped edges such as fair_value_spread.
+                    role="rule_delta",
                     param="",
-                    weight=1.0,
+                    weight=0.25,
                     threshold=0.15,
                     required=True,
                     freshness_sla_s=_FACTOR_FRESHNESS_S,
                 ),
                 FactorCompositionStep(
                     factor_id="metaculus_prior",
-                    role="posterior_prior",
+                    role="threshold_edge",
                     param="",
                     weight=1.0,
                     threshold=0.60,
@@ -228,9 +231,10 @@ def build_imbalance_with_prior_strategy() -> Strategy:
     )
 ```
 
-Field-level reference is in §5. The constructor's `__init__` rejects
-`None` for any required projection (`aggregate.py:55-62`); typos surface
-as `TypeError` immediately, not at runtime.
+Field-level reference is in §5. The constructor validates every composition
+role and factor id against the catalog (`pms.factors.composition`); unknown
+roles, factor ids, and forbidden raw-factor role combinations fail loudly
+before a version can be registered.
 
 **Run mypy before going further.** This file ships with the strict-mypy
 baseline:
@@ -777,6 +781,15 @@ or thresholds, it isn't raw. Move the parameter to the strategy's
 ---
 
 ## 9. Common pitfalls
+
+### Deferred infrastructure
+
+Meta-evidence producers (F-12) and cross-market relation factor lifecycle
+integration (F-13) remain deferred until they have a bounded producer,
+freshness contract, and production writer. Their factor ids are therefore
+excluded from the seeded/public catalog; do not author a strategy against
+`subset_relation`, `contradiction_relation`, `semantic_similarity`, or
+`cross_market_mispricing` yet.
 
 Listed in rough frequency order based on retro patterns plus the
 invariants most likely to bite during strategy authoring.

@@ -23,6 +23,7 @@ from pms.strategies.ripple.evaluator import (
 
 
 LIVE_RIPPLE_SOURCE = "live_factor_service"
+RIPPLE_ECONOMICS_VERSION = "ripple-economics-v1"
 RIPPLE_FACTOR_REQUIREMENTS: tuple[FactorCompositionStep, ...] = (
     FactorCompositionStep(
         factor_id="metaculus_prior",
@@ -312,6 +313,17 @@ def _live_observation(
     max_slippage_bps: int,
     time_in_force: TimeInForce,
 ) -> StrategyObservation | None:
+    prior_key = ("metaculus_prior", "")
+    if (
+        prior_key in snapshot.missing_factors
+        or prior_key in snapshot.stale_factors
+        or prior_key not in snapshot.values
+        or snapshot.snapshot_hash is None
+    ):
+        # Ripple's posterior is only meaningful when its external prior was
+        # actually observed in the point-in-time snapshot.  Falling back to
+        # the market price turns missing evidence into false provenance.
+        return None
     prior_probability = _bounded_probability(
         _factor_value(snapshot, "metaculus_prior", fallback=market.yes_price),
         "metaculus_prior",
@@ -351,6 +363,10 @@ def _live_observation(
     evidence_refs = _live_evidence_refs(market, snapshot)
     payload_metadata = {
         "source": LIVE_RIPPLE_SOURCE,
+        "economics_version": RIPPLE_ECONOMICS_VERSION,
+        "prior_strength": prior_strength,
+        "min_expected_edge": min_expected_edge,
+        "max_slippage_bps": max_slippage_bps,
         "factor_snapshot_hash": snapshot.snapshot_hash,
         "factor_values": _string_factor_values(snapshot.values),
         "missing_factors": _string_factor_keys(snapshot.missing_factors),
@@ -362,7 +378,6 @@ def _live_observation(
         "resolves_at": market.resolves_at.isoformat() if market.resolves_at else None,
         "orderbook_imbalance": orderbook_imbalance,
         "metaculus_prior": prior_probability,
-        "prior_strength": prior_strength,
         "yes_count": yes_count,
         "no_count": no_count,
         "posterior_probability": probability_estimate,

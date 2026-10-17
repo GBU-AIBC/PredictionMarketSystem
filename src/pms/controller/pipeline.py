@@ -1675,6 +1675,8 @@ def _external_text(signal: MarketSignal, key: str) -> str | None:
 
 
 def _strict_factor_gates(settings: PMSSettings) -> bool:
+    # Strictness is a runtime safety policy owned by ControllerSettings (and
+    # forced on in LIVE). Strategy metadata does not carry a second gate flag.
     return settings.mode == RunMode.LIVE or settings.controller.strict_factor_gates
 
 

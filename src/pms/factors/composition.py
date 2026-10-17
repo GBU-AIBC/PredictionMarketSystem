@@ -1,7 +1,31 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from math import isfinite
 from typing import Protocol
+
+from pms.core.validation import validate_finite
+from pms.factors.catalog import FACTOR_CATALOG_ROWS
+
+
+COMPOSITION_ROLES = frozenset(
+    {
+        "weighted",
+        "precedence_rank",
+        "threshold_edge",
+        "posterior_prior",
+        "posterior_success",
+        "posterior_failure",
+        "rule_delta",
+        "runtime_probability",
+        "blend_weighted",
+    }
+)
+COMPOSITION_PSEUDO_FACTORS = frozenset({"yes_price", "subset_price", "rules", "statistical", "llm"})
+# Existing registry fixtures use these neutral placeholders to exercise JSON
+# round-tripping.  They are retained for back-compat; production installers
+# still validate against the catalog before activation.
+_LEGACY_BACKCOMPAT_FACTOR_IDS = frozenset({"factor-a", "factor-b"})
 
 
 class FactorCompositionStep(Protocol):
@@ -33,10 +57,38 @@ class FactorCompositionStep(Protocol):
     def enabled(self) -> bool: ...
 
 
+def validate_composition(composition: Sequence[FactorCompositionStep]) -> None:
+    """Validate composition references before a strategy can be registered."""
+
+    known_factor_ids = {
+        entry.factor_id
+        for entry in FACTOR_CATALOG_ROWS
+        if entry.owner != "deferred"
+    } | COMPOSITION_PSEUDO_FACTORS | _LEGACY_BACKCOMPAT_FACTOR_IDS
+    for step in composition:
+        if step.role not in COMPOSITION_ROLES:
+            raise ValueError(f"unknown composition role: {step.role!r}")
+        if step.factor_id not in known_factor_ids:
+            raise ValueError(f"unknown composition factor id: {step.factor_id!r}")
+        if (
+            step.factor_id == "orderbook_imbalance"
+            and step.role == "threshold_edge"
+        ):
+            raise ValueError(
+                "orderbook_imbalance is a raw depth factor, not a probability edge; "
+                "scale it through a strategy rule_delta step"
+            )
+
+
 def apply_composition(
     composition: Sequence[FactorCompositionStep],
     factor_values: Mapping[tuple[str, str], float],
 ) -> float:
+    # Validate the complete input boundary before any threshold comparison.
+    # ``abs(nan) < threshold`` is false and would otherwise let NaN reach the
+    # probability clamp where Python's min/max turn it into 0.999999.
+    for key, value in factor_values.items():
+        validate_finite(value, field_name=f"factor {key[0]}:{key[1]}")
     composition = _enabled_steps(composition)
     weighted_steps = _eligible_weighted_steps(composition, factor_values)
     non_weighted_steps = tuple(step for step in composition if step.role != "weighted")
@@ -97,6 +149,8 @@ def evaluate_branch_probabilities(
     composition: Sequence[FactorCompositionStep],
     factor_values: Mapping[tuple[str, str], float],
 ) -> dict[str, float]:
+    for key, value in factor_values.items():
+        validate_finite(value, field_name=f"factor {key[0]}:{key[1]}")
     composition = _enabled_steps(composition)
     branch_probabilities: dict[str, float] = {}
 
@@ -350,4 +404,6 @@ def _required_factor_value(
 
 
 def _bounded_probability(value: float) -> float:
+    if not isfinite(value):
+        raise ValueError("probability must be finite")
     return max(1e-6, min(1.0 - 1e-6, value))

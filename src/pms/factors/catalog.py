@@ -81,7 +81,7 @@ FACTOR_CATALOG_ROWS: tuple[FactorCatalogEntry, ...] = (
         input_schema_hash="27ec38b9caa18da4ad771cdfac2bb3c1727dd44da8d50c7d9a9e2bbd84f552a4",
         output_type="scalar",
         direction="neutral",
-        owner="system",
+        owner="deferred",
     ),
     FactorCatalogEntry(
         factor_id="contradiction_relation",
@@ -90,7 +90,7 @@ FACTOR_CATALOG_ROWS: tuple[FactorCatalogEntry, ...] = (
         input_schema_hash="f471eaed6525a85335173285f4fa692193678d027106d8d60458751c839acabc",
         output_type="scalar",
         direction="neutral",
-        owner="system",
+        owner="deferred",
     ),
     FactorCatalogEntry(
         factor_id="semantic_similarity",
@@ -99,7 +99,7 @@ FACTOR_CATALOG_ROWS: tuple[FactorCatalogEntry, ...] = (
         input_schema_hash="078ca015846d22223ad7cdce31e1cae9a75bc8b44919e0ee2fdb6d8733d7852d",
         output_type="scalar",
         direction="neutral",
-        owner="system",
+        owner="deferred",
     ),
     FactorCatalogEntry(
         factor_id="cross_market_mispricing",
@@ -108,7 +108,7 @@ FACTOR_CATALOG_ROWS: tuple[FactorCatalogEntry, ...] = (
         input_schema_hash="dafee0e995dadb1c8dc140a3d2b7a1186690ae33f4d9c21361b837a44c504385",
         output_type="scalar",
         direction="neutral",
-        owner="system",
+        owner="deferred",
     ),
     FactorCatalogEntry(
         factor_id="metaculus_prior",
@@ -154,13 +154,34 @@ class _AsyncAcquireContext(Protocol):
 def _select_entries(
     factor_ids: Sequence[str] | None,
 ) -> tuple[FactorCatalogEntry, ...]:
-    available = {entry.factor_id: entry for entry in FACTOR_CATALOG_ROWS}
+    # Relation factors are intentionally not advertised until a production
+    # writer/lifecycle is wired (F-13).  Keeping their definitions here makes
+    # the storage format forwards-compatible while preventing catalog users
+    # from depending on values that can never be populated.
+    available = {
+        entry.factor_id: entry
+        for entry in FACTOR_CATALOG_ROWS
+        if entry.owner != "deferred"
+    }
     selected_ids = tuple(factor_ids) if factor_ids is not None else tuple(available)
     missing_ids = sorted(set(selected_ids) - set(available))
     if missing_ids:
         msg = f"unknown factor catalog ids: {', '.join(missing_ids)}"
         raise ValueError(msg)
     return tuple(available[factor_id] for factor_id in selected_ids)
+
+
+def validate_registered_factor_catalog() -> None:
+    """Fail loudly if a compute-capable factor is absent from the catalog."""
+
+    from pms.factors.definitions import REGISTERED
+
+    registered_ids = {factor.factor_id for factor in REGISTERED}
+    catalog_ids = {entry.factor_id for entry in FACTOR_CATALOG_ROWS}
+    missing_ids = sorted(registered_ids - catalog_ids)
+    if missing_ids:
+        msg = "registered factors missing from catalog: " + ", ".join(missing_ids)
+        raise ValueError(msg)
 
 
 async def seed_factor_catalog(

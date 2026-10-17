@@ -151,8 +151,12 @@ CREATE TABLE IF NOT EXISTS factor_values (
     param TEXT NOT NULL DEFAULT '',
     market_id TEXT NOT NULL REFERENCES markets(condition_id) ON DELETE CASCADE,
     ts TIMESTAMPTZ NOT NULL,
-    value DOUBLE PRECISION NOT NULL
+    value DOUBLE PRECISION NOT NULL,
+    definition_version TEXT NOT NULL DEFAULT '1'
 );
+
+ALTER TABLE factor_values
+    ADD COLUMN IF NOT EXISTS definition_version TEXT NOT NULL DEFAULT '1';
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_factor_values_factor_param_market_ts
     ON factor_values(factor_id, param, market_id, ts DESC);

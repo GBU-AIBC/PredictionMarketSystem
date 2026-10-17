@@ -8,6 +8,7 @@ import json
 from typing import Protocol
 
 import asyncpg
+from pms.core.validation import validate_finite
 
 from pms.strategies.projections import FactorCompositionStep
 
@@ -160,7 +161,12 @@ class PostgresFactorSnapshotReader:
                 if key in required_key_set:
                     missing_factors.append(key)
                 continue
-            values[key] = float(value)
+            try:
+                values[key] = validate_finite(value, field_name=f"factor {key[0]} value")
+            except (TypeError, ValueError):
+                if key in required_key_set:
+                    missing_factors.append(key)
+                continue
             ts = row["ts"]
             if isinstance(ts, datetime):
                 timestamps[key] = ts
@@ -169,6 +175,10 @@ class PostgresFactorSnapshotReader:
                 freshness_sla_s = freshness_slas.get(key)
                 if freshness_sla_s is not None and age_ms > freshness_sla_s * 1000.0:
                     stale_factors.append(key)
+                    # A stale optional value is still unsafe to compose.  Keep
+                    # its identity for diagnostics while removing its value
+                    # from the usable snapshot.
+                    values.pop(key, None)
         return FactorSnapshot(
             values=values,
             missing_factors=tuple(missing_factors),
@@ -271,11 +281,10 @@ def _freshness_slas(
 ) -> dict[FactorKey, float | None]:
     slas: dict[FactorKey, float | None] = {}
     for step in steps:
-        if not _requires_raw_factor(step):
+        if not _uses_raw_factor(step):
             continue
         raw_sla = getattr(step, "freshness_sla_s", None)
         if raw_sla is None:
-            slas[(step.factor_id, step.param)] = None
             continue
         freshness_sla_s = float(raw_sla)
         key = (step.factor_id, step.param)

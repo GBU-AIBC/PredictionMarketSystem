@@ -20,6 +20,7 @@ from pms.strategies.intents import StrategyContext, StrategyObservation
 
 ANCHORING_RESEARCH_REF = "research:h2-anchoring-lag-spec#h2"
 LIVE_ANCHORING_SOURCE = "live_anchoring_lag_source"
+ANCHORING_ECONOMICS_VERSION = "anchoring-economics-v1"
 
 
 class AnchoringMarketSnapshotReader(Protocol):
@@ -184,6 +185,12 @@ def _observation_from_market(
     evidence_refs = _evidence_refs(market)
     metadata = {
         "source": LIVE_ANCHORING_SOURCE,
+        "economics_version": ANCHORING_ECONOMICS_VERSION,
+        "min_divergence": min_divergence,
+        "min_confidence": min_confidence,
+        "min_expected_edge": min_expected_edge,
+        "decay_window_hours": decay_window_hours,
+        "max_slippage_bps": max_slippage_bps,
         "h2_signal": signal.signal_name,
         "yes_price": market.yes_price,
         "llm_posterior": market.llm_posterior,
@@ -194,9 +201,6 @@ def _observation_from_market(
         "observed_at": market.observed_at.isoformat(),
         "resolves_at": market.resolves_at.isoformat() if market.resolves_at else None,
         "delta_effective": signal.delta_effective,
-        "min_divergence": min_divergence,
-        "decay_window_hours": decay_window_hours,
-        "min_expected_edge": min_expected_edge,
     }
     payload = {
         "market_id": market.market_id,

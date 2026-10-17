@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from pms.factors.composition import apply_composition, evaluate_branch_probabilities
+from pms.factors.composition import (
+    apply_composition,
+    evaluate_branch_probabilities,
+    validate_composition,
+)
 from pms.strategies.projections import FactorCompositionStep
 
 
@@ -52,6 +56,24 @@ def test_apply_composition_supports_weighted_legacy_shape() -> None:
     )
 
     assert result == pytest.approx(0.45)
+
+
+def test_apply_composition_rejects_non_finite_factor_values() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        apply_composition(
+            (_step("metaculus_prior", role="rule_delta", weight=1.0),),
+            {
+                ("metaculus_prior", ""): float("nan"),
+                ("yes_price", ""): 0.5,
+            },
+        )
+
+
+def test_validate_composition_rejects_unknown_role_and_factor() -> None:
+    with pytest.raises(ValueError, match="unknown composition role"):
+        validate_composition((_step("yes_price", role="typo", weight=1.0),))
+    with pytest.raises(ValueError, match="unknown composition factor id"):
+        validate_composition((_step("not_a_factor", role="weighted", weight=1.0),))
 
 
 def test_apply_composition_renormalizes_present_weighted_inputs() -> None:

@@ -110,7 +110,6 @@ def test_paper_multi_factor_strategy_matches_phase_a_contract() -> None:
         "purpose": "paper_multi_factor_phase_a",
         "price_reference": "best_ask",
         "live_allowed": "false",
-        "requires_strict_factor_gates": "false",
     }
     assert strategy.risk.max_position_notional_usdc == pytest.approx(1.0)
     assert strategy.risk.max_daily_drawdown_pct == pytest.approx(50.0)

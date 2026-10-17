@@ -45,6 +45,9 @@ def _candidate_from_observation(observation: StrategyObservation) -> StrategyCan
         "fixture_metadata": payload_metadata,
     }
     for field_name in (
+        "economics_version",
+        "min_expected_edge",
+        "max_slippage_bps",
         "entry_edge_threshold",
         "metaculus_prior",
         "no_count",
@@ -52,6 +55,9 @@ def _candidate_from_observation(observation: StrategyObservation) -> StrategyCan
         "prior_strength",
         "yes_count",
     ):
+        if field_name in payload_metadata:
+            metadata[field_name] = payload_metadata[field_name]
+    for field_name in ("missing_factors", "stale_factors", "factor_snapshot_hash"):
         if field_name in payload_metadata:
             metadata[field_name] = payload_metadata[field_name]
     return StrategyCandidate(

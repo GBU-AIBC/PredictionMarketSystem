@@ -10,8 +10,9 @@ from typing import Any
 import asyncpg
 
 from pms.core.models import Market, MarketSignal
+from pms.core.validation import validate_finite, validate_probability, validate_quantity
 from pms.factors.base import FactorDefinition, FactorValueRow
-from pms.factors.catalog import ensure_factor_catalog
+from pms.factors.catalog import ensure_factor_catalog, validate_registered_factor_catalog
 from pms.research.cache import FactorPanel, load_factor_panel
 from pms.storage.market_data_store import PostgresMarketDataStore
 
@@ -19,17 +20,25 @@ from pms.storage.market_data_store import PostgresMarketDataStore
 logger = logging.getLogger(__name__)
 
 
-async def persist_factor_value(pool: asyncpg.Pool, row: FactorValueRow) -> None:
+async def persist_factor_value(
+    pool: asyncpg.Pool,
+    row: FactorValueRow,
+    *,
+    definition_version: str = "1",
+) -> None:
+    _validate_factor_value(row)
     query = """
     INSERT INTO factor_values (
         factor_id,
         param,
         market_id,
         ts,
-        value
-    ) VALUES ($1, $2, $3, $4, $5)
+        value,
+        definition_version
+    ) VALUES ($1, $2, $3, $4, $5, $6)
     ON CONFLICT (factor_id, param, market_id, ts) DO UPDATE
-    SET value = EXCLUDED.value
+    SET value = EXCLUDED.value,
+        definition_version = EXCLUDED.definition_version
     """
     async with pool.acquire() as connection:
         await connection.execute(
@@ -39,6 +48,7 @@ async def persist_factor_value(pool: asyncpg.Pool, row: FactorValueRow) -> None:
             row.market_id,
             row.ts,
             row.value,
+            definition_version,
         )
 
 
@@ -59,22 +69,28 @@ class FactorService:
         default_factory=dict,
     )
     _stream_exhausted: bool = field(init=False, default=False)
+    _known_market_ids: set[str] = field(init=False, default_factory=set)
 
     def __post_init__(self) -> None:
         if self.cadence_s <= 0.0:
             msg = "cadence_s must be positive"
             raise ValueError(msg)
+        validate_registered_factor_catalog()
 
     async def run(self) -> None:
         stream_task = asyncio.create_task(self._forward_signals())
+        dirty_signals: dict[str, MarketSignal] = {}
         try:
             while True:
                 signals = self._drain_signal_buffer()
-                if signals:
-                    for signal in signals:
-                        self._latest_signals[signal.market_id] = signal
-                if self._latest_signals:
-                    await self.compute_once(list(self._latest_signals.values()))
+                for signal in signals:
+                    # Coalesce bursts for the same market and only recompute
+                    # markets that received a new observation this tick.
+                    self._latest_signals[signal.market_id] = signal
+                    dirty_signals[signal.market_id] = signal
+                if dirty_signals:
+                    await self.compute_once(list(dirty_signals.values()))
+                    dirty_signals.clear()
                 if self._stream_exhausted:
                     self._raise_stream_error(stream_task)
                     logger.warning("factor signal stream exhausted; factor service exiting")
@@ -96,7 +112,7 @@ class FactorService:
         for signal in signals:
             try:
                 await self._ensure_market_shell(signal)
-            except asyncpg.PostgresError:
+            except Exception:
                 logger.exception(
                     "market shell upsert failed market_id=%s; retrying next cadence",
                     signal.market_id,
@@ -123,8 +139,15 @@ class FactorService:
                 if self._last_persisted_ts.get(dedupe_key) == row.ts:
                     continue
                 try:
-                    await self._persist_factor_value(row, signal)
-                except asyncpg.PostgresError:
+                    if factor_cls.definition_version == "1":
+                        await self._persist_factor_value(row, signal)
+                    else:
+                        await self._persist_factor_value(
+                            row,
+                            signal,
+                            definition_version=factor_cls.definition_version,
+                        )
+                except Exception:
                     # Dedupe key intentionally not advanced: the same row
                     # retries on the next cadence instead of being lost.
                     logger.exception(
@@ -142,9 +165,18 @@ class FactorService:
         self,
         row: FactorValueRow,
         signal: MarketSignal,
+        *,
+        definition_version: str = "1",
     ) -> None:
         try:
-            await persist_factor_value(self.pool, row)
+            if definition_version == "1":
+                await persist_factor_value(self.pool, row)
+            else:
+                await persist_factor_value(
+                    self.pool,
+                    row,
+                    definition_version=definition_version,
+                )
         except asyncpg.ForeignKeyViolationError as exc:
             if _is_constraint_violation(exc, "factor_values_factor_id_fkey"):
                 await ensure_factor_catalog(self.pool, factor_ids=(row.factor_id,))
@@ -152,7 +184,14 @@ class FactorService:
                 await self._ensure_market_shell(signal)
             else:
                 raise
-            await persist_factor_value(self.pool, row)
+            if definition_version == "1":
+                await persist_factor_value(self.pool, row)
+            else:
+                await persist_factor_value(
+                    self.pool,
+                    row,
+                    definition_version=definition_version,
+                )
 
     async def get_panel(
         self,
@@ -202,7 +241,10 @@ class FactorService:
             raise exception
 
     async def _ensure_market_shell(self, signal: MarketSignal) -> None:
+        if signal.market_id in self._known_market_ids:
+            return
         if await self.store.read_market(signal.market_id) is not None:
+            self._known_market_ids.add(signal.market_id)
             return
         await self.store.write_market(
             Market(
@@ -215,6 +257,15 @@ class FactorService:
                 last_seen_at=signal.timestamp,
             )
         )
+        self._known_market_ids.add(signal.market_id)
+
+
+def _validate_factor_value(row: FactorValueRow) -> None:
+    value = validate_finite(row.value, field_name=f"factor {row.factor_id} value")
+    if row.factor_id == "metaculus_prior":
+        validate_probability(value, field_name="metaculus_prior")
+    elif row.factor_id in {"yes_count", "no_count"}:
+        validate_quantity(value, field_name=row.factor_id)
 
 
 def _is_constraint_violation(

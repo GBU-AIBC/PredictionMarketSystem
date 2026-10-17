@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TypeVar
 
+from pms.factors.composition import validate_composition
+
 from .projections import (
     ActiveStrategy,
     CalibrationSpec,
@@ -39,6 +41,7 @@ class Strategy:
         calibration: CalibrationSpec | None = None,
     ) -> None:
         self._config = self._require_projection("config", config)
+        validate_composition(self._config.factor_composition)
         self._risk = self._require_projection("risk", risk)
         self._eval_spec = self._require_projection("eval_spec", eval_spec)
         self._forecaster = self._require_projection("forecaster", forecaster)
