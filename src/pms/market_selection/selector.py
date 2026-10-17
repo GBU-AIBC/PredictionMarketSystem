@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import logging
 from typing import Literal, Protocol
 
@@ -34,6 +34,10 @@ SelectionReasonCode = Literal[
     "unresolved_market",
     "venue",
     "resolution_horizon",
+    "resolved",
+    "closed",
+    "inactive",
+    "stale",
     "volume",
     "accepting_orders",
     "liquidity",
@@ -161,7 +165,9 @@ class MarketSelector:
         specs = await self._registry.list_market_selections()
         for strategy_id, _version_id, spec in specs:
             strategy_ids.append(strategy_id)
-            reason = await self._explain_for_spec(market, spec)
+            reason = await self._discovery_reason(market, spec)
+            if reason is None:
+                reason = await self._explain_for_spec(market, spec)
             strategy_reasons[strategy_id] = "selected" if reason is None else reason
             if reason is not None:
                 reasons.append(reason)
@@ -221,6 +227,43 @@ class MarketSelector:
             strategy_reasons=strategy_reasons,
         )
 
+    async def _discovery_reason(
+        self,
+        market: Market,
+        spec: MarketSelectionSpec,
+    ) -> SelectionReasonCode | None:
+        """Use the store's eligibility query as the discovery source of truth."""
+        venue = normalize_venue(spec.venue, context="MarketSelector.explain")
+        eligible = await self._store.read_eligible_markets(
+            venue,
+            spec.resolution_time_max_horizon_days,
+            spec.volume_min_usdc,
+        )
+        if any(candidate.condition_id == market.condition_id for candidate, _ in eligible):
+            return None
+        if getattr(market.venue, "value", market.venue) != venue:
+            return "venue"
+        if spec.volume_min_usdc > 0 and (
+            market.volume_24h is None or market.volume_24h < spec.volume_min_usdc
+        ):
+            return "volume"
+        if market.closed is True:
+            return "closed"
+        if market.active is False:
+            return "inactive"
+        freshness_s = float(getattr(self._store, "_market_freshness_s", 900.0))
+        if market.last_seen_at < datetime.now(tz=UTC) - timedelta(seconds=freshness_s):
+            return "stale"
+        if market.resolves_at is not None and market.resolves_at <= datetime.now(tz=UTC):
+            return "resolved"
+        if spec.resolution_time_max_horizon_days is not None:
+            upper_bound = datetime.now(tz=UTC) + timedelta(
+                days=spec.resolution_time_max_horizon_days
+            )
+            if market.resolves_at is None or market.resolves_at > upper_bound:
+                return "resolution_horizon"
+        return None
+
     async def _explain_for_spec(
         self,
         market: Market,
@@ -235,7 +278,9 @@ class MarketSelector:
             horizon = market.resolves_at - datetime.now(tz=UTC)
             if horizon.total_seconds() > spec.resolution_time_max_horizon_days * 86400:
                 return "resolution_horizon"
-        if market.volume_24h is None or market.volume_24h < spec.volume_min_usdc:
+        if spec.volume_min_usdc > 0 and (
+            market.volume_24h is None or market.volume_24h < spec.volume_min_usdc
+        ):
             return "volume"
         return await self._filter_reason(market, spec)
 

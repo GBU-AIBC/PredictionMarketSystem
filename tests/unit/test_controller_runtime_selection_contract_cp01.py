@@ -190,6 +190,16 @@ async def test_controller_pipeline_uses_strategy_factor_composition_not_forecast
     opportunity, decision = emission
     assert decision.prob_estimate == pytest.approx(0.72)
     assert decision.expected_edge == pytest.approx(0.32)
+    assert [result["probability"] for result in pipeline.last_forecaster_results] == [
+        pytest.approx(0.10),
+        pytest.approx(0.90),
+    ]
+    assert [result["name"] for result in pipeline.last_forecaster_results] == ["rules", "llm"]
+    assert {outcome["name"] for outcome in pipeline.last_gate_outcomes} >= {
+        "router",
+        "factor_gates",
+    }
+    assert all(outcome["passed"] is True for outcome in pipeline.last_gate_outcomes)
     assert opportunity.expected_edge == pytest.approx(0.32)
     assert opportunity.selected_factor_values == {
         "orderbook_imbalance": pytest.approx(0.0),

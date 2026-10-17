@@ -283,6 +283,8 @@ async def test_explain_reports_market_filter_reasons(
     )
     explanation = await _explain_single_market(market, spec)
     assert reason in explanation.reasons
+    assert "selected" not in explanation.reasons
+    assert explanation.strategy_reasons == {"single": reason}
 
 
 @pytest.mark.asyncio
@@ -302,3 +304,51 @@ async def test_explain_reports_spread_depth_bootstrap_and_unresolved_market() ->
     unresolved = await _explain_single_market(None, spec)
     assert unresolved.available is False
     assert unresolved.reasons == ("unresolved_market",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("closed", True, "closed"),
+        ("active", False, "inactive"),
+        ("last_seen_at", datetime.now(tz=UTC) - timedelta(days=2), "stale"),
+        ("resolves_at", datetime.now(tz=UTC) - timedelta(days=1), "resolved"),
+    ],
+)
+async def test_explain_reports_sql_discovery_regimes(
+    field: str,
+    value: object,
+    reason: str,
+) -> None:
+    now = datetime.now(tz=UTC)
+    market = Market(
+        condition_id="single-market", slug="single", question="q", venue="polymarket",
+        resolves_at=now + timedelta(days=1), created_at=now, last_seen_at=now,
+        volume_24h=1_000.0,
+    )
+    market = replace(market, **cast(Any, {field: value}))
+    spec = MarketSelectionSpec(
+        venue="polymarket", resolution_time_max_horizon_days=30, volume_min_usdc=500.0,
+    )
+    explanation = await _explain_single_market(market, spec)
+    assert reason in explanation.reasons
+
+
+@pytest.mark.asyncio
+async def test_explain_depth_reason_comes_from_book_summary() -> None:
+    now = datetime.now(tz=UTC)
+    market = Market(
+        condition_id="single-market", slug="single", question="q", venue="polymarket",
+        resolves_at=now + timedelta(days=1), created_at=now, last_seen_at=now,
+        volume_24h=1_000.0,
+    )
+    summary = BookSummary(
+        best_bid=0.4, best_ask=0.6, spread_bps=10.0, depth_usdc=1.0, timestamp=now,
+    )
+    spec = MarketSelectionSpec(
+        venue="polymarket", resolution_time_max_horizon_days=30, volume_min_usdc=500.0,
+        depth_min_usdc=100.0,
+    )
+    explanation = await _explain_single_market(market, spec, summary)
+    assert "depth" in explanation.reasons
