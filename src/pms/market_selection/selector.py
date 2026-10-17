@@ -185,6 +185,8 @@ class MarketSelector:
                     spec,
                     eligible_markets=eligible,
                 )
+                if reason is None:
+                    reason = await self._explain_for_spec(market, spec)
             else:
                 candidate_market, candidate_tokens = candidate
                 reason = await self._filter_reason(candidate_market, spec)
