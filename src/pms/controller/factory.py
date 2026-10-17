@@ -153,6 +153,7 @@ def _build_forecaster(
             llm_payload["spend_ledger_path"] = durable_spend_ledger_path(
                 database_dsn=settings.database.dsn,
                 data_path=settings.live_emergency_audit_path,
+                scope=settings.mode.value,
             )
         llm_config = LLMSettings.model_validate(llm_payload)
         validate_llm_runtime_dependencies(llm_config)

@@ -170,6 +170,7 @@ class ControllerPipeline:
                         "spend_ledger_path": durable_spend_ledger_path(
                             database_dsn=self.settings.database.dsn,
                             data_path=self.settings.live_emergency_audit_path,
+                            scope=self.settings.mode.value,
                         )
                     }
                 )

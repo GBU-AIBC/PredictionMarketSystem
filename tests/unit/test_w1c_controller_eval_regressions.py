@@ -23,6 +23,10 @@ from pms.core.models import EvalRecord, FillRecord, MarketSignal, Portfolio, Tra
 from pms.evaluation.adapters.scoring import Scorer
 from pms.evaluation.spool import EvalSpool
 from pms.storage.eval_store import EvalStore
+from pms.storage.strategy_registry import (
+    _strategy_from_versioned_config_json,
+    _strategy_to_config_json,
+)
 from tests.support.fake_stores import InMemoryEvalStore
 from pms.research.execution import _walk_book
 from pms.research.replay import _market_resolution_label
@@ -33,6 +37,7 @@ from pms.strategies.projections import (
     RiskParams,
     StrategyConfig,
 )
+from pms.strategies.aggregate import Strategy
 from pms.strategies.versioning import compute_strategy_version_id
 
 
@@ -274,6 +279,40 @@ def test_strategy_version_hash_includes_effective_llm_identity() -> None:
     assert first != second
 
 
+def test_strategy_registry_round_trip_preserves_llm_identity_hash() -> None:
+    config = StrategyConfig(strategy_id="registry", factor_composition=(), metadata=())
+    risk = RiskParams(
+        max_position_notional_usdc=100.0,
+        max_daily_drawdown_pct=2.5,
+        min_order_size_usdc=1.0,
+    )
+    eval_spec = EvalSpec(metrics=("brier",))
+    forecaster = ForecasterSpec(forecasters=(("llm", ()),))
+    market_selection = MarketSelectionSpec(
+        venue="polymarket",
+        resolution_time_max_horizon_days=7,
+        volume_min_usdc=1.0,
+    )
+    strategy = Strategy(
+        config=config,
+        risk=risk,
+        eval_spec=eval_spec,
+        forecaster=forecaster,
+        market_selection=market_selection,
+    )
+    identity = ("anthropic", "claude-sonnet-4-6", "v1")
+    version_id = compute_strategy_version_id(
+        *strategy.snapshot(),
+        llm_identity=identity,
+    )
+    loaded = _strategy_from_versioned_config_json(
+        _strategy_to_config_json(strategy, llm_identity=identity),
+        strategy_id="registry",
+        strategy_version_id=version_id,
+    )
+    assert loaded.snapshot() == strategy.snapshot()
+
+
 def test_netcal_trains_on_persisted_pre_netcal_coordinate() -> None:
     now = datetime(2026, 1, 1, tzinfo=UTC)
     records = [
@@ -296,6 +335,48 @@ def test_netcal_trains_on_persisted_pre_netcal_coordinate() -> None:
     calibrator = NetcalCalibrator()
     calibrator.add_samples("ensemble", records)
     assert calibrator.calibrate(0.1, model_id="ensemble") == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_cumulative_fill_replaces_row_after_spool_restart() -> None:
+    class RestartStore(InMemoryEvalStore):
+        async def append(self, record: EvalRecord) -> bool:
+            if any(item.decision_id == record.decision_id for item in await self.all()):
+                return False
+            return await super().append(record)
+
+    decision = _decision()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def fill(notional: float, quantity: float, status: str) -> FillRecord:
+        return FillRecord(
+            trade_id=f"fill-{notional}",
+            order_id="restart-order",
+            decision_id=decision.decision_id,
+            market_id=decision.market_id,
+            token_id=decision.token_id,
+            venue="polymarket",
+            side="BUY",
+            fill_price=0.4,
+            fill_notional_usdc=notional,
+            fill_quantity=quantity,
+            executed_at=now,
+            filled_at=now,
+            status=status,
+            anomaly_flags=[],
+            strategy_id=decision.strategy_id,
+            strategy_version_id=decision.strategy_version_id,
+            resolved_outcome=1.0,
+        )
+
+    store = RestartStore()
+    first = EvalSpool(store=cast(EvalStore, store), scorer=Scorer())
+    assert await first.process(fill(4.0, 10.0, "partial"), decision)
+    restarted = EvalSpool(store=cast(EvalStore, store), scorer=Scorer())
+    assert not await restarted.process(fill(7.0, 17.5, "matched"), decision)
+    records = await store.all()
+    assert len(records) == 1
+    assert records[0].pnl == pytest.approx(10.5)
 
 
 def test_replay_resolution_label_accepts_closed_settlement_prices() -> None:

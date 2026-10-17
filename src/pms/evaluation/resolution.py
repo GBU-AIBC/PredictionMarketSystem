@@ -87,6 +87,7 @@ class ResolutionSweepResult:
     fills_resolved: int
     eval_records_appended: int
     fills_failed: int
+    persistence_failures: int = 0
 
 
 @dataclass(frozen=True)
@@ -176,17 +177,28 @@ class ResolutionSweeper:
             )
         condition_ids = list(dict.fromkeys(fill.market_id for fill in unresolved))
         resolutions = await self.resolution_source.fetch_resolutions(condition_ids)
+        persistence_failures = 0
         if self.resolution_store is not None:
             for market_id, label in resolutions.items():
-                resolved_at = getattr(self.resolution_source, "resolved_at_by_market", {}).get(
-                    market_id
-                )
-                await self.resolution_store.upsert(
-                    market_id,
-                    resolved_outcome=label,
-                    resolved_at=resolved_at,
-                    source="gamma",
-                )
+                resolved_at = getattr(
+                    self.resolution_source,
+                    "resolved_at_by_market",
+                    {},
+                ).get(market_id)
+                try:
+                    await self.resolution_store.upsert(
+                        market_id,
+                        resolved_outcome=label,
+                        resolved_at=resolved_at,
+                        source="gamma",
+                    )
+                except Exception:  # noqa: BLE001
+                    persistence_failures += 1
+                    logger.warning(
+                        "could not persist market resolution for %s; continuing sweep",
+                        market_id,
+                        exc_info=True,
+                    )
         fills_resolved = 0
         eval_records_appended = 0
         fills_failed = 0
@@ -217,6 +229,7 @@ class ResolutionSweeper:
             fills_resolved=fills_resolved,
             eval_records_appended=eval_records_appended,
             fills_failed=fills_failed,
+            persistence_failures=persistence_failures,
         )
 
     async def _append_and_resolve(

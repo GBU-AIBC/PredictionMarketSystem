@@ -21,7 +21,6 @@ from pms.strategies.projections import EvalSpec
 
 
 logger = logging.getLogger(__name__)
-_MAX_TRACKED_ORDER_SNAPSHOTS = 10_000
 
 StrategyMetricsProvider = Callable[
     [],
@@ -146,6 +145,14 @@ class EvalSpool:
         # dedups per (model_id, decision_id).
         if previous is None:
             inserted = await self.store.append(scored_record)
+            if not inserted:
+                # A process restart loses the in-memory cumulative snapshot.
+                # The durable decision row may already contain an earlier
+                # partial; replace it so a terminal snapshot cannot freeze
+                # evaluation at the partial value.
+                replace_record = getattr(self.store, "replace", None)
+                if callable(replace_record):
+                    await replace_record(scored_record)
         else:
             replace_record = getattr(self.store, "replace", None)
             if not callable(replace_record):
@@ -158,8 +165,6 @@ class EvalSpool:
             fill.fill_quantity,
             fill.status,
         )
-        if len(self._latest_order_totals) > _MAX_TRACKED_ORDER_SNAPSHOTS:
-            self._latest_order_totals.pop(next(iter(self._latest_order_totals)))
         if fill.status in {"matched", "filled", "cancelled", "rejected"}:
             self._latest_order_totals.pop(fill.order_id, None)
         if previous is None and inserted:

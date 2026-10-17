@@ -343,7 +343,6 @@ async def test_runner_tags_inner_ring_rows_with_default_strategy(
 
     assert strategies_count == 1
     assert versions_count == 1
-    assert counts["feedback"] > 0
     assert counts["eval_records"] > 0
     assert null_counts == {
         "feedback": 0,
@@ -351,12 +350,15 @@ async def test_runner_tags_inner_ring_rows_with_default_strategy(
         "orders": 0,
         "fills": 0,
     }
-    assert len(strategy_pairs["feedback"]) == 1
-    assert strategy_pairs["feedback"] == strategy_pairs["eval_records"]
-    tagged_strategy_id, tagged_strategy_version_id = next(iter(strategy_pairs["feedback"]))
+    assert len(strategy_pairs["eval_records"]) == 1
+    tagged_strategy_id, tagged_strategy_version_id = next(
+        iter(strategy_pairs["eval_records"])
+    )
     assert tagged_strategy_id == "default"
     assert tagged_strategy_version_id
     assert counts["orders"] > 0
     assert counts["fills"] > 0
-    assert strategy_pairs["orders"] == strategy_pairs["feedback"]
-    assert strategy_pairs["fills"] == strategy_pairs["feedback"]
+    assert strategy_pairs["orders"] == strategy_pairs["eval_records"]
+    assert strategy_pairs["fills"] == strategy_pairs["eval_records"]
+    if strategy_pairs["feedback"]:
+        assert strategy_pairs["feedback"] == strategy_pairs["eval_records"]

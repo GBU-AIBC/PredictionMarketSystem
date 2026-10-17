@@ -54,6 +54,7 @@ class _MarketMetadata:
     resolves_at: datetime | None
     resolved_outcome: float | None = None
     resolved_at: datetime | None = None
+    observed_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -167,7 +168,8 @@ class MarketUniverseReplayEngine:
         if metadata is None:
             return None
         if as_of is not None:
-            if metadata.resolved_at is None or metadata.resolved_at > as_of:
+            known_at = metadata.resolved_at or metadata.observed_at
+            if known_at is not None and known_at > as_of:
                 return None
         return metadata.resolved_outcome
 
@@ -272,7 +274,8 @@ class MarketUniverseReplayEngine:
                            markets.resolves_at, markets.closed,
                            markets.yes_price, markets.no_price,
                            resolutions.resolved_outcome,
-                           resolutions.resolved_at
+                           resolutions.resolved_at,
+                           resolutions.observed_at
                     FROM markets
                     LEFT JOIN market_resolutions AS resolutions
                       ON resolutions.market_id = markets.condition_id
@@ -290,7 +293,8 @@ class MarketUniverseReplayEngine:
                            markets.resolves_at, markets.closed,
                            markets.yes_price, markets.no_price,
                            resolutions.resolved_outcome,
-                           resolutions.resolved_at
+                           resolutions.resolved_at,
+                           resolutions.observed_at
                     FROM markets
                     LEFT JOIN market_resolutions AS resolutions
                       ON resolutions.market_id = markets.condition_id
@@ -309,6 +313,7 @@ class MarketUniverseReplayEngine:
                 resolves_at=cast(datetime | None, row["resolves_at"]),
                 resolved_outcome=_market_resolution_label(row),
                 resolved_at=cast(datetime | None, row.get("resolved_at")),
+                observed_at=cast(datetime | None, row.get("observed_at")),
             )
             for row in rows
         }
@@ -483,6 +488,8 @@ def _parse_jsonl_events(path: Path) -> tuple[dict[str, _MarketMetadata], list[_R
                 venue=cast(Venue, str(row.get("venue") or "polymarket")),
                 resolves_at=_optional_datetime(row.get("resolves_at")),
                 resolved_outcome=normalize_resolved_outcome(row.get("resolved_outcome")),
+                resolved_at=_optional_datetime(row.get("resolved_at")),
+                observed_at=_optional_datetime(row.get("observed_at")) or ts,
             ),
         )
 

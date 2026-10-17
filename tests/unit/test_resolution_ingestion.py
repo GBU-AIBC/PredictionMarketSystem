@@ -278,7 +278,7 @@ async def test_sweep_routes_resolved_fill_through_eval_spool_and_hooks() -> None
 
 
 @pytest.mark.asyncio
-async def test_resolution_persistence_failure_aborts_sweep() -> None:
+async def test_resolution_persistence_failure_continues_sweep() -> None:
     sweeper = _sweeper(
         fill_store=FakeResolutionFillStore([_fill()]),
         eval_spool=RecordingEvalSpool(),
@@ -291,8 +291,9 @@ async def test_resolution_persistence_failure_aborts_sweep() -> None:
         },
     )
     sweeper.resolution_store = cast(Any, FailingResolutionStore())
-    with pytest.raises(RuntimeError, match="persistence unavailable"):
-        await sweeper.sweep_once()
+    result = await sweeper.sweep_once()
+    assert result.persistence_failures == 1
+    assert result.fills_resolved == 1
 
 
 class _CallLogEvalStore(InMemoryEvalStore):

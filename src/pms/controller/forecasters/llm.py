@@ -44,8 +44,8 @@ _KNOWN_MODEL_PRICES: dict[str, tuple[Decimal, Decimal]] = {
     # Test providers still exercise the full budgeting path.  Giving them an
     # explicit price keeps those tests honest while unknown production models
     # fail closed before a paid request is made.
-    "claude-test": (Decimal("3"), Decimal("15")),
-    "openai-test": (Decimal("3"), Decimal("15")),
+    "claude-test": (Decimal("0.5"), Decimal("1")),
+    "openai-test": (Decimal("0.5"), Decimal("1")),
 }
 
 
@@ -62,10 +62,19 @@ _BUDGET_TRACKERS: dict[str, tuple[ReferenceType[LLMSettings], _BudgetTracker]] =
 _BUDGET_TRACKERS_LOCK = threading.Lock()
 
 
-def durable_spend_ledger_path(*, database_dsn: str, data_path: str) -> str:
+def durable_spend_ledger_path(
+    *,
+    database_dsn: str,
+    data_path: str,
+    scope: str = "default",
+) -> str:
     """Derive a restart-safe ledger path from the configured environment."""
     database_digest = sha256(database_dsn.encode("utf-8")).hexdigest()[:24]
-    return str(Path(data_path).expanduser().parent / f"llm-spend-{database_digest}.json")
+    scope_digest = sha256(scope.encode("utf-8")).hexdigest()[:8]
+    return str(
+        Path(data_path).expanduser().parent
+        / f"llm-spend-{database_digest}-{scope_digest}.json"
+    )
 
 
 class _LLMClient(Protocol):
@@ -433,15 +442,13 @@ class LLMForecaster:
             and self.config.output_price_usdc_per_million_tokens <= 0.0
         ):
             return _ESTIMATED_CALL_COST_USDC
-        output = Decimal(str(self.config.output_price_usdc_per_million_tokens))
-        input_price = Decimal(str(self.config.input_price_usdc_per_million_tokens))
+        input_price, output = _model_prices(self.config)
         return max(
             _ESTIMATED_CALL_COST_USDC,
             (
                 output * Decimal(self.config.max_tokens)
                 + input_price * Decimal(2_000)
-            )
-            / Decimal(1_000_000),
+            ) / Decimal(1_000_000),
         )
 
     def _usage_cost(self, response: _ProviderResponse) -> Decimal:
@@ -796,8 +803,10 @@ def _load_budget_ledger(tracker: _BudgetTracker, today: date) -> None:
         if payload.get("date") == today.isoformat():
             tracker.cost_day = today
             tracker.daily_cost_usdc = Decimal(str(payload.get("cost_usdc", "0")))
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        logger.warning("ignoring unreadable LLM spend ledger", exc_info=True)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise LLMProviderUnavailableError(
+            "LLM spend ledger is unreadable; refusing provider calls"
+        ) from exc
 
 
 def _write_budget_ledger(tracker: _BudgetTracker) -> None:
@@ -819,5 +828,7 @@ def _write_budget_ledger(tracker: _BudgetTracker) -> None:
             encoding="utf-8",
         )
         os.replace(temporary, tracker.ledger_path)
-    except OSError:
-        logger.warning("could not persist LLM spend ledger", exc_info=True)
+    except OSError as exc:
+        raise LLMProviderUnavailableError(
+            "LLM spend ledger could not be persisted; refusing provider calls"
+        ) from exc

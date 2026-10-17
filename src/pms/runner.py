@@ -675,6 +675,17 @@ class Runner:
                     msg = "Runner PostgreSQL pool is not initialized"
                     raise RuntimeError(msg)
                 self._strategy_registry = PostgresStrategyRegistry(self._pg_pool)
+                # Test/runtime registry doubles retain their legacy constructor;
+                # the concrete registry exposes this optional versioning hook.
+                setattr(
+                    self._strategy_registry,
+                    "_llm_identity",
+                    (
+                        self.config.llm.provider,
+                        self.config.llm.model,
+                        self.config.llm.prompt_version,
+                    ),
+                )
                 if self.config.mode == RunMode.LIVE:
                     self._live_preflight_active_strategies_fingerprint = (
                         await require_live_preflight_active_strategies_artifact(
@@ -3972,14 +3983,7 @@ def _default_active_strategy(settings: PMSSettings) -> ActiveStrategy:
         ),
         min_order_size_usdc=settings.risk.min_order_usdc,
     )
-    # The built-in paper controller keeps its historical one-fill alert
-    # behavior; user-defined EvalSpec instances default to a guarded sample
-    # window.  Explicit strategy configs can opt into the same threshold.
-    eval_spec = EvalSpec(
-        metrics=("brier", "pnl", "fill_rate"),
-        min_slippage_samples=1,
-        min_win_rate_samples=1,
-    )
+    eval_spec = EvalSpec(metrics=("brier", "pnl", "fill_rate"))
     forecaster = ForecasterSpec(
         forecasters=(
             ("rules", (("threshold", "0.55"),)),
