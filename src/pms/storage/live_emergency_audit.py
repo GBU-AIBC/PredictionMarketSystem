@@ -5,7 +5,7 @@ import json
 import math
 import os
 import stat
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -83,11 +83,15 @@ class LiveEmergencyAuditWriter:
         tagged_count: int,
         operator: str,
         evidence: str,
+        attestation: str,
+        fill_ids: Sequence[str] = (),
     ) -> None:
         if mode not in {"paper", "live"}:
             raise ValueError("mode must be paper or live")
         if tagged_count < 0:
             raise ValueError("tagged_count must be non-negative")
+        if attestation not in {"all", "explicit"}:
+            raise ValueError("attestation must be all or explicit")
         record = {
             "timestamp": datetime.now(tz=UTC).isoformat(),
             "phase": "live_fill_provenance_tag",
@@ -96,6 +100,8 @@ class LiveEmergencyAuditWriter:
             "tagged_count": tagged_count,
             "operator": _require_operator_id(operator, "operator"),
             "evidence": _require_operator_text(evidence, "evidence"),
+            "attestation": attestation,
+            "fill_ids": list(fill_ids),
         }
         await asyncio.to_thread(_append_jsonl, self.path, record)
 

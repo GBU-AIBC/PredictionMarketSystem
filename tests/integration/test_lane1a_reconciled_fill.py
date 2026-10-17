@@ -524,6 +524,7 @@ async def test_legacy_fill_provenance_backfill_restores_restarts(
             operator="r6-operator",
             evidence="legacy-ledger-review-r6",
         ) >= 1
+        assert await store.mark_provenance_tag_audited() >= 1
         assert await store.tag_fill_provenance(
             mode="live",
             operator="r6-operator",
@@ -537,6 +538,78 @@ async def test_legacy_fill_provenance_backfill_restores_restarts(
             position.market_id == "legacy-provenance-r6-market"
             for position in live.portfolio.open_positions
         )
+    finally:
+        async with pool.acquire() as connection:
+            await connection.execute(
+                "DELETE FROM fill_payloads WHERE fill_id = $1", fill_id
+            )
+            await connection.execute("DELETE FROM fills WHERE fill_id = $1", fill_id)
+        await pool.close()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("PMS_RUN_INTEGRATION") != "1",
+    reason="set PMS_RUN_INTEGRATION=1 to run integration tests",
+)
+@pytest.mark.asyncio
+async def test_missing_sidecar_provenance_tag_unblocks_live_restart(
+    tmp_path: Path,
+) -> None:
+    dsn = os.environ.get("PMS_TEST_DATABASE_URL")
+    if not dsn:
+        pytest.skip("PMS_TEST_DATABASE_URL is required")
+    pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=2)
+    fill_id = "legacy-provenance-r7-missing-sidecar"
+    filled_at = datetime(2026, 10, 18, 1, 0, tzinfo=UTC)
+    try:
+        async with pool.acquire() as connection:
+            await connection.execute("DELETE FROM fills WHERE fill_id = $1", fill_id)
+            await connection.execute(
+                """
+                INSERT INTO fills (
+                    fill_id, order_id, market_id, ts, fill_notional_usdc,
+                    fill_quantity, strategy_id, strategy_version_id
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                fill_id,
+                "legacy-provenance-r7-order",
+                "legacy-provenance-r7-market",
+                filled_at,
+                10.0,
+                20.0,
+                "lane-1a-strategy",
+                "lane-1a-v1",
+            )
+        store = FillStore(pool)
+        assert fill_id in await store.untagged_fill_ids(limit=100)
+        assert await store.tag_fill_provenance(
+            mode="live",
+            operator="r7-operator",
+            evidence="legacy-sidecar-review",
+            fill_ids=(fill_id,),
+        ) == 1
+        assert await store.mark_provenance_tag_audited() == 1
+        assert fill_id not in await store.untagged_fill_ids(limit=100)
+        async with pool.acquire() as connection:
+            payload = await connection.fetchval(
+                "SELECT payload FROM fill_payloads WHERE fill_id = $1", fill_id
+            )
+            payload = json.loads(payload) if isinstance(payload, str) else payload
+            assert payload["anomaly_flags"] == ["run_mode=live"]
+        live = Runner(
+            config=PMSSettings(
+                mode=RunMode.LIVE,
+                live_emergency_audit_path=str(tmp_path / "missing-sidecar-audit.jsonl"),
+            )
+        )
+        live.bind_pg_pool(pool)
+        await live._reconcile_portfolio_from_db()  # noqa: SLF001
+        assert any(
+            position.market_id == "legacy-provenance-r7-market"
+            for position in live.portfolio.open_positions
+        )
+        await live._reconcile_risk_from_db()  # noqa: SLF001
     finally:
         async with pool.acquire() as connection:
             await connection.execute(

@@ -352,8 +352,12 @@ async def test_tag_fill_provenance_cli_is_idempotent_and_audited(
             mode: str,
             operator: str,
             evidence: str,
+            fill_ids: tuple[str, ...] | None = None,
         ) -> int:
-            calls["tag"] = (mode, operator, evidence)
+            calls["tag"] = (mode, operator, evidence, fill_ids)
+            return 2 if calls.get("tag_count", 0) == 0 else 0
+
+        async def mark_provenance_tag_audited(self) -> int:
             return 2 if calls.get("tag_count", 0) == 0 else 0
 
     class Audit:
@@ -387,23 +391,45 @@ async def test_tag_fill_provenance_cli_is_idempotent_and_audited(
             "operator",
             "--evidence",
             "legacy-ledger-review",
+            "--all",
+            "--confirm",
             "--database-url",
             "postgres://test",
         ]
     )
 
     assert await live_cli._main_async(args) == 0
-    assert calls["tag"] == ("paper", "operator", "legacy-ledger-review")
+    assert calls["tag"] == ("paper", "operator", "legacy-ledger-review", None)
     assert calls["audit"] == {
         "mode": "paper",
         "tagged_count": 2,
         "operator": "operator",
         "evidence": "legacy-ledger-review",
+        "attestation": "all",
+        "fill_ids": (),
     }
     assert json.loads(capsys.readouterr().out)["tagged_count"] == 2
     calls["tag_count"] = 1
     assert await live_cli._main_async(args) == 0
     assert json.loads(capsys.readouterr().out)["tagged_count"] == 0
+    rejected = live_cli.build_parser().parse_args(
+        [
+            "tag-fill-provenance",
+            "--mode",
+            "paper",
+            "--operator",
+            "operator",
+            "--evidence",
+            "replaced paper-era rows",
+            "--all",
+            "--confirm",
+            "--database-url",
+            "postgres://test",
+        ]
+    )
+    assert await live_cli._main_async(rejected) == 1
+    assert calls["tag_count"] == 1
+    assert "placeholder" in json.loads(capsys.readouterr().out)["error"]
 
 
 @pytest.mark.asyncio

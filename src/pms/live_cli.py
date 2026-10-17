@@ -47,6 +47,8 @@ from pms.storage.fill_store import FillStore
 from pms.storage.live_emergency_audit import (
     EmergencyRestartMode,
     LiveEmergencyAuditWriter,
+    _require_operator_id,
+    _require_operator_text,
 )
 from pms.storage.live_reconciliation import (
     LiveOrderReconciliationRecord,
@@ -137,6 +139,22 @@ def build_parser() -> argparse.ArgumentParser:
     provenance.add_argument("--mode", required=True, choices=("paper", "live"))
     provenance.add_argument("--operator", required=True)
     provenance.add_argument("--evidence", required=True)
+    provenance.add_argument(
+        "--fill-id",
+        action="append",
+        dest="fill_ids",
+        help="Explicit legacy fill id to tag; repeat for each fill.",
+    )
+    provenance.add_argument(
+        "--all",
+        action="store_true",
+        help="Tag every untagged fill (requires --confirm).",
+    )
+    provenance.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Attest that the requested bulk provenance scope was reviewed.",
+    )
     provenance.add_argument("--database-url")
     reconcile_live_order = subparsers.add_parser(
         "reconcile-live-order",
@@ -339,10 +357,19 @@ async def _main_async(args: argparse.Namespace) -> int:
         return 0 if updated else 1
     if args.command == "tag-fill-provenance":
         try:
-            operator = normalize_submission_unknown_reconciled_by(
-                cast(str, args.operator)
+            operator = _require_operator_id(cast(str, args.operator), "operator")
+            evidence = _require_operator_text(cast(str, args.evidence), "evidence")
+            explicit_fill_ids = tuple(
+                fill_id.strip()
+                for fill_id in (args.fill_ids or [])
+                if fill_id.strip()
             )
-            evidence = _normalize_fee_reconcile_evidence(cast(str, args.evidence))
+            if bool(explicit_fill_ids) == bool(args.all):
+                raise ValueError("provide --fill-id or --all, but not both")
+            if args.all and not args.confirm:
+                raise ValueError("--all requires --confirm")
+            if explicit_fill_ids and args.confirm:
+                raise ValueError("--confirm is only valid with --all")
         except (TypeError, ValueError) as exc:
             print(json.dumps({"updated": False, "error": str(exc)}, sort_keys=True))
             return 1
@@ -362,15 +389,38 @@ async def _main_async(args: argparse.Namespace) -> int:
                 mode=cast(str, args.mode),
                 operator=operator,
                 evidence=evidence,
+                fill_ids=explicit_fill_ids or None,
             )
-            await LiveEmergencyAuditWriter(
-                Path(settings.live_emergency_audit_path)
-            ).append_provenance_tag(
-                mode=cast(str, args.mode),
-                tagged_count=tagged_count,
-                operator=operator,
-                evidence=evidence,
-            )
+            try:
+                await LiveEmergencyAuditWriter(
+                    Path(settings.live_emergency_audit_path)
+                ).append_provenance_tag(
+                    mode=cast(str, args.mode),
+                    tagged_count=tagged_count,
+                    operator=operator,
+                    evidence=evidence,
+                    attestation="all" if args.all else "explicit",
+                    fill_ids=explicit_fill_ids,
+                )
+                marked = await FillStore(pool).mark_provenance_tag_audited()
+                if marked != tagged_count:
+                    raise RuntimeError(
+                        "provenance audit marker count did not match tagged fills"
+                    )
+            except Exception as provenance_error:  # noqa: BLE001
+                print(
+                    json.dumps(
+                        {
+                            "updated": True,
+                            "audit_persisted": False,
+                            "mode": args.mode,
+                            "tagged_count": tagged_count,
+                            "error": str(provenance_error),
+                        },
+                        sort_keys=True,
+                    )
+                )
+                return 1
         except Exception as exc:  # noqa: BLE001
             print(json.dumps({"updated": False, "error": str(exc)}, sort_keys=True))
             return 1
@@ -383,6 +433,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                     "mode": args.mode,
                     "tagged_count": tagged_count,
                     "operator": operator,
+                    "audit_persisted": True,
                 },
                 sort_keys=True,
             )
@@ -395,6 +446,8 @@ async def _main_async(args: argparse.Namespace) -> int:
                 cast(str, args.reconciled_by)
             )
             evidence = _normalize_fee_reconcile_evidence(cast(str, args.evidence))
+            reconciled_by = _require_operator_id(reconciled_by, "reconciled_by")
+            evidence = _require_operator_text(evidence, "evidence")
             fees = None if args.fees is None else float(args.fees)
             if fees is not None and (not math.isfinite(fees) or fees < 0.0):
                 raise ValueError("fees must be finite and non-negative")

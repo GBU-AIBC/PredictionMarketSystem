@@ -3419,6 +3419,8 @@ class Runner:
         if self.config.mode == RunMode.LIVE:
             unresolved_telemetry: list[str] = []
             for trade in trades:
+                if trade.provenance_only:
+                    continue
                 missing: list[str] = []
                 if trade.fees is None:
                     missing.append("fee")
@@ -3484,7 +3486,7 @@ class Runner:
                     * Decimal(str(closing))
                     - Decimal(str(trade.fees or 0.0))
                 )
-                if include_risk_telemetry:
+                if include_risk_telemetry and not trade.provenance_only:
                     risk_manager.record_trade_result(
                         RiskTradeResult(
                             pnl=float(pnl),

@@ -283,6 +283,7 @@ class FillStore:
                 FROM fills
                 LEFT JOIN fill_payloads ON fill_payloads.fill_id = fills.fill_id
                 WHERE fill_payloads.payload IS NULL
+                   OR payload->>'provenance_tag_audit_pending' = 'true'
                    OR NOT EXISTS (
                        SELECT 1
                        FROM jsonb_array_elements_text(
@@ -305,6 +306,7 @@ class FillStore:
         mode: str,
         operator: str,
         evidence: str,
+        fill_ids: Sequence[str] | None = None,
     ) -> int:
         normalized_mode = mode.strip().lower()
         if normalized_mode not in {"paper", "live"}:
@@ -314,24 +316,58 @@ class FillStore:
         async with self._pool().acquire() as connection:
             await _ensure_fill_payloads_table(connection)
             async with connection.transaction():
-                rows = await connection.fetch(
-                    """
-                    SELECT fill_id, payload
-                    FROM fill_payloads
-                    WHERE NOT EXISTS (
-                        SELECT 1
-                        FROM jsonb_array_elements_text(
-                            COALESCE(payload->'anomaly_flags', '[]'::jsonb)
-                        ) AS flag
-                        WHERE flag IN (
-                            'run_mode=backtest', 'run_mode=paper', 'run_mode=live'
-                        )
+                if fill_ids is not None:
+                    rows = await connection.fetch(
+                        """
+                        SELECT fills.fill_id, fill_payloads.payload
+                        FROM fills
+                        LEFT JOIN fill_payloads
+                            ON fill_payloads.fill_id = fills.fill_id
+                        WHERE fills.fill_id = ANY($1::text[])
+                          AND (
+                              fill_payloads.payload IS NULL
+                              OR fill_payloads.payload->>'provenance_tag_audit_pending' = 'true'
+                              OR NOT EXISTS (
+                                  SELECT 1
+                                  FROM jsonb_array_elements_text(
+                                      COALESCE(fill_payloads.payload->'anomaly_flags', '[]'::jsonb)
+                                  ) AS flag
+                                  WHERE flag IN (
+                                      'run_mode=backtest', 'run_mode=paper', 'run_mode=live'
+                                  )
+                              )
+                          )
+                        FOR UPDATE OF fills
+                        """,
+                        list(fill_ids),
                     )
-                    FOR UPDATE
-                    """
-                )
+                else:
+                    rows = await connection.fetch(
+                        """
+                        SELECT fills.fill_id, fill_payloads.payload
+                        FROM fills
+                        LEFT JOIN fill_payloads
+                            ON fill_payloads.fill_id = fills.fill_id
+                        WHERE fill_payloads.payload IS NULL
+                           OR fill_payloads.payload->>'provenance_tag_audit_pending' = 'true'
+                           OR NOT EXISTS (
+                               SELECT 1
+                               FROM jsonb_array_elements_text(
+                                   COALESCE(fill_payloads.payload->'anomaly_flags', '[]'::jsonb)
+                               ) AS flag
+                               WHERE flag IN (
+                                   'run_mode=backtest', 'run_mode=paper', 'run_mode=live'
+                               )
+                           )
+                        FOR UPDATE OF fills
+                        """
+                    )
                 for row in rows:
-                    payload = _json_object(row["payload"])
+                    payload = (
+                        _json_object(row["payload"])
+                        if row["payload"] is not None
+                        else {"anomaly_flags": []}
+                    )
                     flags = [
                         flag
                         for flag in _string_list(payload.get("anomaly_flags"))
@@ -342,11 +378,30 @@ class FillStore:
                     payload["provenance_tagged_by"] = operator.strip()
                     payload["provenance_tag_evidence"] = evidence.strip()
                     payload["provenance_tagged_at"] = datetime.now(tz=UTC).isoformat()
+                    payload["provenance_tag_audit_pending"] = True
                     await connection.execute(
-                        "UPDATE fill_payloads SET payload = $2::jsonb WHERE fill_id = $1",
+                        """
+                        INSERT INTO fill_payloads (fill_id, payload)
+                        VALUES ($1, $2::jsonb)
+                        ON CONFLICT (fill_id) DO UPDATE
+                        SET payload = EXCLUDED.payload
+                        """,
                         row["fill_id"],
                         json.dumps(payload),
                     )
+        return len(rows)
+
+    async def mark_provenance_tag_audited(self) -> int:
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            rows = await connection.fetch(
+                """
+                UPDATE fill_payloads
+                SET payload = payload - 'provenance_tag_audit_pending'
+                WHERE payload->>'provenance_tag_audit_pending' = 'true'
+                RETURNING fill_id
+                """
+            )
         return len(rows)
 
     async def read_positions(self) -> list[Position]:
@@ -389,10 +444,13 @@ class FillStore:
                     fills.strategy_version_id,
                     fill_payloads.payload,
                     fill_payloads.payload->>'token_id' AS token_id,
-                    fill_payloads.payload->>'venue' AS venue,
-                    fill_payloads.payload->>'side' AS side,
+                    COALESCE(fill_payloads.payload->>'venue', 'polymarket') AS venue,
+                    COALESCE(fill_payloads.payload->>'side', 'BUY') AS side,
                     fill_payloads.payload->>'risk_group_id' AS risk_group_id,
-                    (fill_payloads.payload->>'fill_price')::double precision
+                    COALESCE(
+                        (fill_payloads.payload->>'fill_price')::double precision,
+                        fills.fill_notional_usdc / NULLIF(fills.fill_quantity, 0)
+                    )
                         AS fill_price,
                     COALESCE(
                         clob_marks.best_bid,
@@ -633,6 +691,7 @@ class StoredTradeRow:
     risk_group_id: str | None = None
     run_mode: str | None = None
     fee_reconcile_audit_pending: bool = False
+    provenance_only: bool = False
 
 
 class _PositionAccumulator:
@@ -934,22 +993,47 @@ def _trade_from_row(row: asyncpg.Record) -> StoredTradeRow:
     fill_id = str(row["fill_id"])
     try:
         payload = _json_object(row["payload"])
+        fill_quantity = float(row["fill_quantity"])
+        fill_notional = float(row["fill_notional_usdc"])
+        provenance_only = not any(
+            key in payload
+            for key in (
+                "trade_id",
+                "decision_id",
+                "token_id",
+                "venue",
+                "side",
+                "fill_price",
+                "executed_at",
+                "status",
+                "fees",
+                "fee_bps",
+            )
+        )
         return StoredTradeRow(
-            trade_id=cast(str, payload["trade_id"]),
+            trade_id=cast(str, payload.get("trade_id", fill_id)),
             fill_id=cast(str, row["fill_id"]),
             order_id=cast(str, row["order_id"]),
-            decision_id=cast(str, payload["decision_id"]),
+            decision_id=cast(str, payload.get("decision_id", row["order_id"])),
             market_id=cast(str, row["market_id"]),
             question=cast(str, row["question"]),
             token_id=cast(str | None, payload.get("token_id")),
-            venue=cast(Venue, payload["venue"]),
-            side=cast(str, payload["side"]),
-            fill_price=cast(float, payload["fill_price"]),
-            fill_notional_usdc=cast(float, row["fill_notional_usdc"]),
-            fill_quantity=cast(float, row["fill_quantity"]),
-            executed_at=datetime.fromisoformat(cast(str, payload["executed_at"])),
+            venue=cast(Venue, payload.get("venue", "polymarket")),
+            side=cast(str, payload.get("side", "BUY")),
+            fill_price=cast(
+                float,
+                payload.get(
+                    "fill_price",
+                    fill_notional / fill_quantity if fill_quantity else 0.0,
+                ),
+            ),
+            fill_notional_usdc=fill_notional,
+            fill_quantity=fill_quantity,
+            executed_at=datetime.fromisoformat(
+                cast(str, payload.get("executed_at", row["ts"].isoformat()))
+            ),
             filled_at=cast(datetime, row["ts"]),
-            status=cast(str, payload["status"]),
+            status=cast(str, payload.get("status", "filled")),
             strategy_id=cast(str, row["strategy_id"]),
             strategy_version_id=cast(str, row["strategy_version_id"]),
             fee_bps=cast(int | None, payload.get("fee_bps")),
@@ -960,6 +1044,7 @@ def _trade_from_row(row: asyncpg.Record) -> StoredTradeRow:
             fee_reconcile_audit_pending=bool(
                 payload.get("fee_reconcile_audit_pending", False)
             ),
+            provenance_only=provenance_only,
         )
     except (RuntimeError, json.JSONDecodeError, TypeError, ValueError, KeyError) as error:
         raise RuntimeError(
