@@ -424,6 +424,51 @@ Changing mode through `POST /config` requires a stopped runner. Changing to
 `live` is guarded by the same candidate LIVE validation and credentialed
 preflight artifact check as startup.
 
+## MCP proxy for Claude Code and Codex
+
+The optional `agent` extra installs the official MCP Python SDK and exposes a
+stdio server that forwards a curated, scoped tool set to the typed PMS HTTP
+API. At startup it fetches `/openapi.json`, derives each tool schema from every
+mapped operation, and fails closed when an operation is missing or drifts; the
+Wave 2B contribution tools are feature-detected from that document. The proxy has no trading logic and
+cannot start LIVE, switch mode, accept a live decision, clear a halt, or
+resolve an incident.
+
+```bash
+uv sync --extra agent
+export PMS_AGENT_API_BASE_URL=http://127.0.0.1:8000
+export PMS_AGENT_TOKEN='<configured agent token>'
+uv run pms-mcp
+```
+
+Claude Code can launch it from `.mcp.json` (keep the token in the process
+environment rather than checking it into the file):
+
+```json
+{
+  "mcpServers": {
+    "pms": {
+      "command": "uv",
+      "args": ["--directory", "/path/to/prediction-market-system", "run", "--extra", "agent", "pms-mcp"],
+      "env": {
+        "PMS_AGENT_API_BASE_URL": "http://127.0.0.1:8000"
+      }
+    }
+  }
+}
+```
+
+For Codex, add the same command as a local MCP server in its MCP settings and
+set `PMS_AGENT_API_BASE_URL` and `PMS_AGENT_TOKEN` in the environment used by
+Codex.
+
+CI should exercise the optional SDK path explicitly:
+
+```bash
+uv sync --extra agent
+uv run pytest -q tests/unit/test_agent_mcp.py
+```
+
 ## Development
 
 ```bash
