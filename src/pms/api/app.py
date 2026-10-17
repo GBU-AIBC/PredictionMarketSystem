@@ -391,9 +391,20 @@ def create_app(
                 PostgresMarketSubscriptionStore(active_runner.pg_pool),
                 token_id=token_id,
                 request_metadata=_request_metadata(request),
+                max_subscription_asset_ids=(
+                    active_runner.config.sensor.max_subscription_asset_ids
+                ),
+                protected_asset_ids=tuple(
+                    position.token_id
+                    for position in active_runner.portfolio.open_positions
+                    if position.token_id is not None
+                ),
             )
         except UnknownSubscriptionTokenError as exc:
             raise HTTPException(status_code=404, detail="Token not found") from exc
+        request_reselection = getattr(active_runner, "_request_reselection", None)
+        if callable(request_reselection):
+            await request_reselection()
         return payload.model_dump(mode="json")
 
     @app.delete(
@@ -408,6 +419,7 @@ def create_app(
             token_id=token_id,
             request_metadata=_request_metadata(request),
         )
+        await active_runner._request_reselection()
         return payload.model_dump(mode="json")
 
     @app.get("/positions", dependencies=[Depends(require_api_token)])

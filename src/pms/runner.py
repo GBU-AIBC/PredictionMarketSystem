@@ -58,6 +58,7 @@ from pms.controller.factor_snapshot import PostgresFactorSnapshotReader
 from pms.controller.outcome_tokens import MarketDataOutcomeTokenResolver
 from pms.controller.sizers.kelly import KellySizer
 from pms.core.enums import OrderStatus, RunMode, Side, TimeInForce
+from pms.core.exceptions import SensorDataQualityError
 from pms.core.interfaces import (
     DiscoveryPollCompleteSensor,
     IController,
@@ -220,6 +221,7 @@ WORKER_TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
     asyncpg.PostgresError,
     OSError,
     TimeoutError,
+    SensorDataQualityError,
 )
 WORKER_MAX_RESTARTS = 5
 WORKER_RESTART_WINDOW_S = 600.0
@@ -435,6 +437,8 @@ class Runner:
     )
     _reselection_task: asyncio.Task[None] | None = field(init=False, default=None)
     _reselection_lock: asyncio.Lock = field(init=False)
+    _market_selection_lock: asyncio.Lock = field(init=False)
+    _reselection_generation: int = field(init=False, default=0)
     _reselection_requested: asyncio.Event = field(init=False)
     _strategy_change_callbacks_registered: bool = field(init=False, default=False)
     _active_sensors: tuple[ISensor, ...] = field(init=False, default=())
@@ -494,6 +498,7 @@ class Runner:
         self._stop_event = asyncio.Event()
         self._controller_lifecycle_lock = asyncio.Lock()
         self._reselection_lock = asyncio.Lock()
+        self._market_selection_lock = asyncio.Lock()
         self._reselection_requested = asyncio.Event()
         self._position_exit_monitor = PositionExitMonitor(self.config.position_exit)
         self._category_prior_estimator = _category_prior_estimator_from_settings(
@@ -701,17 +706,10 @@ class Runner:
             self._active_sensors = self._build_sensors()
             self._wire_active_perception(self._active_sensors)
             await self._configure_controllers()
-            await self.sensor_stream.start(self._active_sensors)
-            for index, (sensor, sensor_task) in enumerate(
-                zip(self._active_sensors, self.sensor_stream.tasks, strict=True)
-            ):
-                # Watch-only: sensor _consume tasks carry their own reconnect
-                # loops, and restarting them would fight SensorStream's
-                # _active_consumers bookkeeping.
-                self._supervisor.observe(
-                    sensor_task,
-                    name=f"sensor:{index}:{type(sensor).__name__}",
-                )
+            await self.sensor_stream.start(
+                self._active_sensors,
+                task_factory=self._supervised_sensor_task,
+            )
             await self._evaluator_spool.start()
             self._controller_task = self._supervisor.spawn(
                 self._worker_spec(
@@ -1160,6 +1158,7 @@ class Runner:
         self._subscription_controller = None
         self._reselection_task = None
         self._reselection_requested.clear()
+        self._reselection_generation = 0
         if self.config.mode == RunMode.BACKTEST:
             return
         if self._pg_pool is None:
@@ -1177,8 +1176,20 @@ class Runner:
         if self._strategy_registry is None:
             msg = "Runner strategy registry is not initialized"
             raise RuntimeError(msg)
+        discovery_cycle_budget_s = self.config.sensor.discovery_max_pages * (
+            self.config.sensor.discovery_http_timeout_s
+            + self.config.sensor.discovery_http_pool_timeout_s
+            + 30.0
+        )
         self._market_selector = MarketSelector(
-            PostgresMarketDataStore(self._pg_pool),
+            PostgresMarketDataStore(
+                self._pg_pool,
+                market_freshness_s=max(
+                    3.0 * self.config.sensor.poll_interval_s,
+                    300.0,
+                    discovery_cycle_budget_s,
+                ),
+            ),
             self._strategy_registry,
             UnionMergePolicy(),
             PostgresMarketSubscriptionStore(self._pg_pool),
@@ -1187,6 +1198,23 @@ class Runner:
         self._register_strategy_change_callbacks()
         discovery_sensor.on_poll_complete = self._handle_discovery_poll_complete
         self._reselection_task = asyncio.create_task(self._periodic_reselection_loop())
+
+    def _supervised_sensor_task(
+        self,
+        index: int,
+        sensor: ISensor,
+    ) -> asyncio.Task[None]:
+        name = f"sensor:{index}:{type(sensor).__name__}"
+
+        async def consume_sensor() -> None:
+            await self.sensor_stream.consume(sensor)
+
+        return self._supervisor.spawn(
+            self._worker_spec(
+                name,
+                consume_sensor,
+            )
+        )
 
     def _register_strategy_change_callbacks(self) -> None:
         if self._strategy_change_callbacks_registered:
@@ -1248,7 +1276,7 @@ class Runner:
         return all(
             health.state in ALIVE_WORKER_STATES
             for name, health in snapshot.items()
-            if name in TRADING_REQUIRED_WORKERS
+            if name in TRADING_REQUIRED_WORKERS or name.startswith("sensor:")
         )
 
     def _build_factor_service(self) -> FactorService:
@@ -3037,12 +3065,26 @@ class Runner:
         if selector is None or subscription_controller is None:
             return
         async with self._reselection_lock:
+            self._reselection_generation += 1
+            generation = self._reselection_generation
+        # Serialize selector reads without holding the subscription lock; the
+        # DB pool may wait here, while the bounded websocket update below does
+        # not hold a pool-backed lock.
+        async with self._market_selection_lock:
             result = await selector.select()
+        protected_asset_ids = [
+            *_open_position_token_ids(self.portfolio),
+            *sorted(_selector_user_subscription_asset_ids(selector)),
+        ]
+        async with self._reselection_lock:
+            if generation != self._reselection_generation:
+                self._reselection_requested.set()
+                return
             await subscription_controller.update(
                 _cap_subscription_asset_ids(
                     list(result.asset_ids),
                     self.config,
-                    protected_asset_ids=_open_position_token_ids(self.portfolio),
+                    protected_asset_ids=protected_asset_ids,
                 )
             )
 
@@ -3315,12 +3357,21 @@ class Runner:
                 for asset_id in asset_ids
             }
         )
+        selector = self._market_selector
         async with self._reselection_lock:
+            self._reselection_generation += 1
             await subscription_controller.update(
                 _cap_subscription_asset_ids(
                     merged_asset_ids,
                     self.config,
-                    protected_asset_ids=_open_position_token_ids(self.portfolio),
+                    protected_asset_ids=[
+                        *_open_position_token_ids(self.portfolio),
+                        *(
+                            sorted(_selector_user_subscription_asset_ids(selector))
+                            if selector is not None
+                            else []
+                        ),
+                    ],
                 )
             )
 
@@ -3725,6 +3776,19 @@ def _find_subscription_sink(
     return None
 
 
+def _selector_user_subscription_asset_ids(
+    selector: MarketSelectorLike,
+) -> frozenset[str]:
+    value: object = getattr(
+        selector,
+        "last_user_subscription_asset_ids",
+        frozenset(),
+    )
+    if isinstance(value, frozenset):
+        return cast(frozenset[str], value)
+    return frozenset(cast(Sequence[str], value))
+
+
 def _matches_strategy_scope(
     asset_ids: frozenset[str] | None,
     signal: MarketSignal,
@@ -3820,12 +3884,14 @@ def _cap_subscription_asset_ids(
     limit = settings.sensor.max_subscription_asset_ids
     if limit is None or len(merged_asset_ids) <= limit:
         return merged_asset_ids
+    dropped_asset_ids = merged_asset_ids[limit:]
     logger.warning(
         "subscription asset set capped at %d of %d selected assets; "
-        "%d open-position assets protected",
+        "%d protected assets; dropped=%s",
         limit,
         len(merged_asset_ids),
         len(protected),
+        dropped_asset_ids,
     )
     return merged_asset_ids[:limit]
 

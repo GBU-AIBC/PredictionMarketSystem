@@ -138,6 +138,46 @@ async def test_read_eligible_markets_prioritizes_volume_and_liquidity_in_sql() -
 
 
 @pytest.mark.asyncio
+async def test_read_eligible_markets_excludes_closed_inactive_and_stale_rows() -> None:
+    connection = FakeConnection(fetch_results=[[]])
+    store = PostgresMarketDataStore(FakePool(connection))
+
+    await store.read_eligible_markets(
+        venue="polymarket",
+        max_horizon_days=31,
+        min_volume_usdc=100.0,
+    )
+
+    query, args = connection.fetch_calls[0]
+    assert "COALESCE(markets.closed, false) = false" in query
+    assert "COALESCE(markets.active, true) = true" in query
+    assert "markets.last_seen_at >=" in query
+    assert args[4] == pytest.approx(900.0)
+
+
+@pytest.mark.asyncio
+async def test_latest_book_summary_is_scoped_to_yes_token() -> None:
+    timestamp = datetime(2026, 4, 24, 12, 0, tzinfo=UTC)
+    connection = FakeConnection(
+        fetch_results=[
+            [
+                {"ts": timestamp, "side": "BUY", "price": 0.49, "size": 10.0},
+                {"ts": timestamp, "side": "SELL", "price": 0.51, "size": 10.0},
+            ]
+        ]
+    )
+    store = PostgresMarketDataStore(FakePool(connection))
+
+    summary = await store.get_latest_book_summary("market-yes")
+
+    assert summary is not None
+    assert summary.best_bid == pytest.approx(0.49)
+    query, args = connection.fetch_calls[0]
+    assert "tokens.outcome = 'YES'" in query
+    assert args == ("market-yes",)
+
+
+@pytest.mark.asyncio
 async def test_read_markets_returns_rows_total_and_filters_to_active_markets_in_sql() -> None:
     updated_at = datetime(2026, 4, 23, 9, 30, tzinfo=UTC)
     connection = FakeConnection(

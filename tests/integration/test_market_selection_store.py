@@ -37,6 +37,9 @@ def _market(
     best_bid: float | None = None,
     best_ask: float | None = None,
     spread_bps: int | None = None,
+    last_seen_at: datetime | None = None,
+    active: bool | None = None,
+    closed: bool | None = None,
 ) -> Market:
     return Market(
         condition_id=condition_id,
@@ -45,13 +48,15 @@ def _market(
         venue=venue,  # type: ignore[arg-type]
         resolves_at=resolves_at,
         created_at=created_at,
-        last_seen_at=created_at,
+        last_seen_at=last_seen_at or created_at,
         volume_24h=volume_24h,
         yes_price=yes_price,
         no_price=no_price,
         best_bid=best_bid,
         best_ask=best_ask,
         spread_bps=spread_bps,
+        active=active,
+        closed=closed,
     )
 
 
@@ -122,6 +127,25 @@ async def test_read_eligible_markets_filters_by_venue_and_horizon_and_keeps_null
         created_at=now,
         volume_24h=100.0,
     )
+    stale_closed = _market(
+        condition_id="market-stale-closed",
+        venue="polymarket",
+        resolves_at=now + timedelta(days=3),
+        created_at=now,
+        last_seen_at=now - timedelta(hours=1),
+        volume_24h=2_000.0,
+        closed=True,
+    )
+    stale_open = _market(
+        condition_id="market-stale-open",
+        venue="polymarket",
+        resolves_at=now + timedelta(days=3),
+        created_at=now,
+        last_seen_at=now - timedelta(hours=1),
+        volume_24h=2_000.0,
+        active=True,
+        closed=False,
+    )
 
     for market in (
         future_in_horizon,
@@ -130,6 +154,8 @@ async def test_read_eligible_markets_filters_by_venue_and_horizon_and_keeps_null
         no_resolves_at,
         other_venue,
         low_volume,
+        stale_closed,
+        stale_open,
     ):
         await store.write_market(market)
 

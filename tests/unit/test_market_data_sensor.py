@@ -643,8 +643,7 @@ async def test_market_data_sensor_ignores_book_payload_last_trade_without_token_
 
 
 @pytest.mark.asyncio
-async def test_market_data_sensor_update_subscription_warns_and_retries_on_slow_pool(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_market_data_sensor_update_subscription_does_not_probe_pool(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     store = _store_mock()
@@ -654,21 +653,11 @@ async def test_market_data_sensor_update_subscription_warns_and_retries_on_slow_
     fake_websocket = FakeWebSocket([])
     sensor._websocket = cast(Any, fake_websocket)
 
-    real_sleep = asyncio.sleep
-    sleeps: list[float] = []
-
-    async def fake_sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-        await real_sleep(0)
-
-    monkeypatch.setattr(sensor, "_sleep", fake_sleep)
-
     with caplog.at_level(logging.WARN):
         await sensor.update_subscription(["asset-a", "asset-b"])
 
-    assert store_mock.pool.attempts == 2
-    assert sleeps == [0.05]
-    assert "subscription update delayed: pool saturated" in caplog.text
+    assert store_mock.pool.attempts == 0
+    assert "pool saturated" not in caplog.text
     assert fake_websocket.sent_messages == [
         {
             "assets_ids": ["asset-a", "asset-b"],
@@ -701,6 +690,66 @@ async def test_market_data_sensor_dynamic_update_sends_subscribe_and_unsubscribe
 
 
 @pytest.mark.asyncio
+async def test_market_data_sensor_serializes_initial_and_dynamic_subscription_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingInitialWebSocket(FakeWebSocket):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.initial_send_started = asyncio.Event()
+            self.release_initial_send = asyncio.Event()
+            self.wait_for_close = asyncio.Event()
+
+        async def send(self, payload: str) -> None:
+            decoded = cast(dict[str, Any], json.loads(payload))
+            if not self.sent_messages:
+                self.initial_send_started.set()
+                await self.release_initial_send.wait()
+            self.sent_messages.append(decoded)
+
+        async def __anext__(self) -> str | bytes:
+            await self.wait_for_close.wait()
+            raise StopAsyncIteration
+
+    websocket = BlockingInitialWebSocket()
+    monkeypatch.setattr(
+        "pms.sensor.adapters.market_data.connect",
+        lambda url: FakeConnect(websocket),
+    )
+    sensor = MarketDataSensor(
+        store=_store_mock(),
+        ws_url="ws://market-data.example.test",
+        asset_ids=["asset-a"],
+    )
+    sensor._INITIAL_BACKOFF_S = 0.0
+    iterator = cast(Any, sensor.__aiter__())
+    consume_task = asyncio.create_task(anext(iterator))
+
+    await asyncio.wait_for(websocket.initial_send_started.wait(), timeout=0.5)
+    update_task = asyncio.create_task(sensor.update_subscription(["asset-b"]))
+    await asyncio.sleep(0)
+    assert not update_task.done()
+
+    websocket.release_initial_send.set()
+    await asyncio.wait_for(update_task, timeout=0.5)
+    assert websocket.sent_messages == [
+        {
+            "assets_ids": ["asset-a"],
+            "type": "market",
+            "initial_dump": True,
+            "level": 2,
+        },
+        {"assets_ids": ["asset-a"], "operation": "unsubscribe"},
+        {"assets_ids": ["asset-b"], "operation": "subscribe"},
+    ]
+    assert sensor._subscribed_asset_ids == frozenset({"asset-b"})
+
+    consume_task.cancel()
+    await asyncio.gather(consume_task, return_exceptions=True)
+    await sensor.aclose()
+
+
+@pytest.mark.asyncio
 async def test_market_data_sensor_accepts_subscription_update_when_socket_closes(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -721,31 +770,29 @@ async def test_market_data_sensor_accepts_subscription_update_when_socket_closes
 
 
 @pytest.mark.asyncio
-async def test_market_data_sensor_propagates_programming_errors(
+async def test_market_data_sensor_survives_persistence_type_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _store_mock()
     store_mock = cast(StoreMock, store)
-    store_mock.write_book_snapshot_mock.side_effect = TypeError("boom")
-    fake_websocket = FakeWebSocket(
-        [
-            json.dumps(
-                {
-                    "event_type": "book",
-                    "market": "m-broken",
-                    "asset_id": "asset-broken",
-                    "timestamp": "1757908892351",
-                    "hash": "book-broken",
-                    "bids": [{"price": "0.48", "size": "30"}],
-                    "asks": [{"price": "0.52", "size": "25"}],
-                    "last_trade_price": "0.50",
-                }
-            )
-        ]
+    store_mock.write_book_snapshot_mock.side_effect = [TypeError("boom"), 1]
+    payload = json.dumps(
+        {
+            "event_type": "book",
+            "market": "m-broken",
+            "asset_id": "asset-broken",
+            "timestamp": "1757908892351",
+            "hash": "book-broken",
+            "bids": [{"price": "0.48", "size": "30"}],
+            "asks": [{"price": "0.52", "size": "25"}],
+            "last_trade_price": "0.50",
+        }
     )
+    fake_websocket = FakeWebSocket([payload])
+    second_websocket = FakeWebSocket([payload.replace("book-broken", "book-recovered")])
     monkeypatch.setattr(
         "pms.sensor.adapters.market_data.connect",
-        lambda url: FakeConnect(fake_websocket),
+        ConnectSequence([fake_websocket, second_websocket]),
     )
     sensor = MarketDataSensor(
         store=store,
@@ -753,11 +800,221 @@ async def test_market_data_sensor_propagates_programming_errors(
         asset_ids=["asset-broken"],
     )
     sensor._heartbeat_interval_s = 1.0
+    sensor._INITIAL_BACKOFF_S = 0.0
     iterator = cast(Any, sensor.__aiter__())
 
-    with pytest.raises(TypeError, match="boom"):
+    signal = await asyncio.wait_for(anext(iterator), timeout=0.5)
+
+    await sensor.aclose()
+    assert signal.market_id == "m-broken"
+    assert store_mock.write_book_snapshot_mock.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_market_data_sensor_recovers_after_postgres_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncpg
+
+    store = _store_mock()
+    store_mock = cast(StoreMock, store)
+    store_mock.write_book_snapshot_mock.side_effect = [
+        asyncpg.CannotConnectNowError("database starting")
+    ] * 11 + [1]
+    payload = json.dumps(
+        {
+            "event_type": "book",
+            "market": "m-db-recovery",
+            "asset_id": "asset-db-recovery",
+            "timestamp": "1757908892351",
+            "hash": "book-db-recovery",
+            "bids": [{"price": "0.48", "size": "30"}],
+            "asks": [{"price": "0.52", "size": "25"}],
+        }
+    )
+    monkeypatch.setattr(
+        "pms.sensor.adapters.market_data.connect",
+        ConnectSequence([FakeWebSocket([payload]) for _ in range(12)]),
+    )
+    sensor = MarketDataSensor(
+        store=store,
+        ws_url="ws://market-data.example.test",
+        asset_ids=["asset-db-recovery"],
+    )
+    sensor._INITIAL_BACKOFF_S = 0.0
+    async def fake_sleep(seconds: float) -> None:
+        del seconds
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(sensor, "_sleep", fake_sleep)
+    iterator = cast(Any, sensor.__aiter__())
+
+    signal = await asyncio.wait_for(anext(iterator), timeout=0.5)
+
+    assert signal.market_id == "m-db-recovery"
+    assert sensor.consecutive_data_error_reconnects == 0
+    await sensor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_market_data_sensor_fails_after_repeated_persistence_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store_mock()
+    store_mock = cast(StoreMock, store)
+    store_mock.write_book_snapshot_mock.side_effect = TypeError("poison frame")
+    payload = json.dumps(
+        {
+            "event_type": "book",
+            "market": "m-poison",
+            "asset_id": "asset-poison",
+            "timestamp": "1757908892351",
+            "hash": "book-poison",
+            "bids": [{"price": "0.48", "size": "30"}],
+            "asks": [{"price": "0.52", "size": "25"}],
+        }
+    )
+    monkeypatch.setattr(
+        "pms.sensor.adapters.market_data.connect",
+        ConnectSequence([FakeWebSocket([payload]) for _ in range(5)]),
+    )
+    sensor = MarketDataSensor(
+        store=store,
+        ws_url="ws://market-data.example.test",
+        asset_ids=["asset-poison"],
+    )
+    sensor._INITIAL_BACKOFF_S = 0.0
+    iterator = cast(Any, sensor.__aiter__())
+
+    with pytest.raises(SensorDataQualityError, match="consecutive"):
         await asyncio.wait_for(anext(iterator), timeout=0.5)
 
+    assert sensor.consecutive_data_error_reconnects == 5
+    await sensor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_market_data_sensor_poison_after_good_frame_keeps_backoff_and_escalates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store_mock()
+    store_mock = cast(StoreMock, store)
+    store_mock.write_book_snapshot_mock.side_effect = [
+        value
+        for _ in range(5)
+        for value in (1, TypeError("poison frame"))
+    ]
+
+    def _book_payload(hash_value: str) -> str:
+        return json.dumps(
+            {
+                "event_type": "book",
+                "market": "m-poison-after-good",
+                "asset_id": "asset-poison-after-good",
+                "timestamp": "1757908892351",
+                "hash": hash_value,
+                "bids": [{"price": "0.48", "size": "30"}],
+                "asks": [{"price": "0.52", "size": "25"}],
+            }
+        )
+
+    monkeypatch.setattr(
+        "pms.sensor.adapters.market_data.connect",
+        ConnectSequence(
+            [
+                FakeWebSocket([_book_payload(f"good-{index}"), _book_payload(f"poison-{index}")])
+                for index in range(5)
+            ]
+        ),
+    )
+    sensor = MarketDataSensor(
+        store=store,
+        ws_url="ws://market-data.example.test",
+        asset_ids=["asset-poison-after-good"],
+    )
+    sensor._INITIAL_BACKOFF_S = 0.01
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(sensor, "_sleep", fake_sleep)
+    iterator = cast(Any, sensor.__aiter__())
+
+    for _ in range(5):
+        await asyncio.wait_for(anext(iterator), timeout=0.5)
+    with pytest.raises(SensorDataQualityError, match="consecutive"):
+        await asyncio.wait_for(anext(iterator), timeout=0.5)
+
+    assert sleeps == [0.01, 0.02, 0.04, 0.08]
+    assert sensor.consecutive_data_error_reconnects == 5
+    await sensor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_isolated_bad_frames_reset_after_healthy_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store_mock()
+    store_mock = cast(StoreMock, store)
+    store_mock.write_book_snapshot_mock.side_effect = [
+        value
+        for _ in range(5)
+        for value in (TypeError("isolated poison"), 1)
+    ]
+
+    def _book_payload(hash_value: str) -> str:
+        return json.dumps(
+            {
+                "event_type": "book",
+                "market": "m-isolated",
+                "asset_id": "asset-isolated",
+                "timestamp": "1757908892351",
+                "hash": hash_value,
+                "bids": [{"price": "0.48", "size": "30"}],
+                "asks": [{"price": "0.52", "size": "25"}],
+            }
+        )
+
+    responses: list[FakeWebSocket] = []
+    for index in range(5):
+        responses.extend(
+            [
+                FakeWebSocket([_book_payload(f"bad-{index}")]),
+                FakeWebSocket([_book_payload(f"good-{index}")]),
+            ]
+        )
+    monkeypatch.setattr(
+        "pms.sensor.adapters.market_data.connect",
+        ConnectSequence(responses),
+    )
+    sensor = MarketDataSensor(
+        store=store,
+        ws_url="ws://market-data.example.test",
+        asset_ids=["asset-isolated"],
+    )
+    sensor._INITIAL_BACKOFF_S = 0.0
+    sleep_calls = 0
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        del seconds
+        if sleep_calls == 10:
+            raise asyncio.CancelledError
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(sensor, "_sleep", fake_sleep)
+    iterator = cast(Any, sensor.__aiter__())
+
+    for _ in range(5):
+        signal = await asyncio.wait_for(anext(iterator), timeout=0.5)
+        assert signal.market_id == "m-isolated"
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(anext(iterator), timeout=0.5)
+    assert sensor.consecutive_data_error_reconnects == 0
     await sensor.aclose()
 
 
@@ -996,6 +1253,7 @@ async def test_market_data_sensor_reconnects_and_marks_next_snapshot_as_reconnec
         ws_url="ws://market-data.example.test",
         asset_ids=["asset-reconnect"],
     )
+    sensor._INITIAL_BACKOFF_S = 0.0
     iterator = cast(Any, sensor.__aiter__())
 
     await anext(iterator)
@@ -1265,6 +1523,7 @@ async def test_market_data_sensor_reconnects_when_pong_is_missing(
         ws_url="ws://market-data.example.test",
         asset_ids=["asset-pong"],
     )
+    sensor._INITIAL_BACKOFF_S = 0.0
     sensor._heartbeat_interval_s = 0.01
     sensor._pong_timeout_s = 0.02
     sensor._watchdog.timeout_s = 1.0
@@ -1320,6 +1579,7 @@ async def test_market_data_sensor_logs_heartbeat_connection_close_as_reconnect(
         ws_url="ws://market-data.example.test",
         asset_ids=["asset-heartbeat-close"],
     )
+    sensor._INITIAL_BACKOFF_S = 0.0
     sensor._heartbeat_interval_s = 0.01
     sensor._pong_timeout_s = 0.02
     sensor._watchdog.timeout_s = 1.0
@@ -1583,7 +1843,9 @@ async def test_market_data_sensor_reconnect_backoff_caps_and_resets_after_succes
     await iterator.aclose()
     await sensor.aclose()
 
-    assert sleeps[:4] == [0.01, 0.02, 0.02, 0.01]
+    # The first successful connection closes cleanly; the fourth sleep is the
+    # bounded delay after that clean close, before the next transient error.
+    assert sleeps[:5] == [0.01, 0.02, 0.02, 0.01, 0.01]
 
 
 @pytest.mark.asyncio

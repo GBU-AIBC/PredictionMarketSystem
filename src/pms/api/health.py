@@ -71,6 +71,11 @@ def _worker_readiness(
         return "ready", {"required": {}, "dead": []}
     snapshot = runner.worker_health_snapshot()
     required = [name for name in READINESS_REQUIRED_WORKERS if name in snapshot]
+    required.extend(
+        name
+        for name in snapshot
+        if name.startswith("sensor:") and name not in required
+    )
     if not required:
         return "not_started", {"required": {}, "dead": []}
     states = {name: snapshot[name].state for name in required}

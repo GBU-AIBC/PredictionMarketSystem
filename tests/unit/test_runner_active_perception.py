@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import pytest
 from pydantic import SecretStr
+import pms.runner as runner_module
 
 from pms.config import (
     ControllerSettings,
@@ -128,6 +129,7 @@ class RecordingSelector:
     calls: int = 0
     call_started: asyncio.Event = field(default_factory=asyncio.Event)
     call_release: asyncio.Event = field(default_factory=asyncio.Event)
+    last_user_subscription_asset_ids: frozenset[str] = frozenset()
 
     async def select(self) -> Any:
         self.calls += 1
@@ -517,6 +519,74 @@ async def test_runner_active_perception_boot_order_and_first_poll_subscription_u
     await runner.stop()
 
 
+@pytest.mark.asyncio
+async def test_runner_market_selection_freshness_has_safety_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Discovery:
+        on_poll_complete: Callable[[], Any] | None = None
+
+        def __aiter__(self) -> AsyncIterator[MarketSignal]:
+            return self._iterate()
+
+        async def _iterate(self) -> AsyncIterator[MarketSignal]:
+            await asyncio.Event().wait()
+            yield _signal()
+
+    class Data:
+        def __aiter__(self) -> AsyncIterator[MarketSignal]:
+            return self._iterate()
+
+        async def _iterate(self) -> AsyncIterator[MarketSignal]:
+            await asyncio.Event().wait()
+            yield _signal()
+
+        async def update_subscription(self, asset_ids: list[str]) -> None:
+            del asset_ids
+
+    class Registry:
+        def register_change_callback(self, callback: Any) -> None:
+            del callback
+
+        def unregister_change_callback(self, callback: Any) -> None:
+            del callback
+
+    captured: dict[str, Any] = {}
+
+    class Selector:
+        def __init__(self, store: Any, *args: Any) -> None:
+            del args
+            captured["store"] = store
+
+    runner = Runner(
+        config=PMSSettings(
+            mode=RunMode.PAPER,
+            auto_migrate_default_v2=False,
+            sensor=SensorSettings(poll_interval_s=5.0),
+        )
+    )
+    runner.bind_pg_pool(cast(Any, object()))
+    runner._strategy_registry = cast(Any, Registry())  # noqa: SLF001
+    monkeypatch.setattr(runner, "_register_strategy_change_callbacks", lambda: None)
+    monkeypatch.setattr(runner_module, "MarketSelector", Selector)
+
+    runner._wire_active_perception((Discovery(), Data()))  # noqa: SLF001
+    assert captured["store"]._market_freshness_s == pytest.approx(300.0)  # noqa: SLF001
+
+    task = runner._reselection_task  # noqa: SLF001
+    if task is not None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    runner.config.sensor.discovery_max_pages = 30
+    runner._wire_active_perception((Discovery(), Data()))  # noqa: SLF001
+    assert captured["store"]._market_freshness_s == pytest.approx(1500.0)  # noqa: SLF001
+    task = runner._reselection_task  # noqa: SLF001
+    if task is not None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 def test_default_active_strategy_uses_operational_market_selection_horizon() -> None:
     strategy = _default_active_strategy(_settings(RunMode.PAPER))
 
@@ -627,8 +697,10 @@ async def test_runner_active_perception_reselection_is_serialized(
     await asyncio.wait_for(first, timeout=2.0)
     await asyncio.wait_for(second, timeout=2.0)
 
-    assert selector.calls == 2
-    assert subscription_controller.calls == 2
+    assert selector.calls >= 2
+    # Generation fencing prevents a stale result from re-subscribing assets;
+    # the re-requested selection may publish a later update.
+    assert subscription_controller.calls >= 1
 
     discovery.poll_released.set()
     await runner.stop()
@@ -850,6 +922,85 @@ async def test_refresh_subscription_updates_wait_for_reselection_lock() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reselect_does_not_hold_lock_during_selection_io() -> None:
+    class Selector:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.lock_was_held = True
+            self.last_user_subscription_asset_ids: frozenset[str] = frozenset()
+
+        async def select(self) -> Any:
+            self.lock_was_held = runner._reselection_lock.locked()  # noqa: SLF001
+            self.started.set()
+            await self.release.wait()
+            return SimpleNamespace(asset_ids=["selected-token"])
+
+    @dataclass
+    class SubscriptionController:
+        updates: list[list[str]] = field(default_factory=list)
+
+        async def update(self, asset_ids: list[str]) -> bool:
+            self.updates.append(list(asset_ids))
+            return True
+
+    runner = _runner(RunMode.PAPER)
+    selector = Selector()
+    subscription_controller = SubscriptionController()
+    runner._market_selector = cast(Any, selector)  # noqa: SLF001
+    runner._subscription_controller = cast(Any, subscription_controller)  # noqa: SLF001
+
+    task = asyncio.create_task(runner._reselect())  # noqa: SLF001
+    await asyncio.wait_for(selector.started.wait(), timeout=1.0)
+    assert selector.lock_was_held is False
+    selector.release.set()
+    await asyncio.wait_for(task, timeout=1.0)
+    assert subscription_controller.updates == [["selected-token"]]
+
+
+@pytest.mark.asyncio
+async def test_reselect_discards_result_superseded_by_controller_refresh() -> None:
+    class Selector:
+        last_user_subscription_asset_ids: frozenset[str] = frozenset()
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def select(self) -> Any:
+            self.started.set()
+            await self.release.wait()
+            return SimpleNamespace(asset_ids=["stale-selection"])
+
+    @dataclass
+    class SubscriptionController:
+        updates: list[list[str]] = field(default_factory=list)
+
+        async def update(self, asset_ids: list[str]) -> bool:
+            self.updates.append(list(asset_ids))
+            return True
+
+    runner = _runner(RunMode.PAPER)
+    selector = Selector()
+    subscription_controller = SubscriptionController()
+    runner._market_selector = cast(Any, selector)  # noqa: SLF001
+    runner._subscription_controller = cast(Any, subscription_controller)  # noqa: SLF001
+    runner._controller_runtimes = {  # noqa: SLF001
+        "alpha": cast(Any, SimpleNamespace(asset_ids=frozenset({"fresh-refresh"})))
+    }
+
+    reselect_task = asyncio.create_task(runner._reselect())  # noqa: SLF001
+    await asyncio.wait_for(selector.started.wait(), timeout=1.0)
+    await runner._refresh_subscription_assets_locked()  # noqa: SLF001
+    assert subscription_controller.updates == [["fresh-refresh"]]
+
+    selector.release.set()
+    await asyncio.wait_for(reselect_task, timeout=1.0)
+    assert subscription_controller.updates == [["fresh-refresh"]]
+    assert runner._reselection_requested.is_set()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_refresh_subscription_caps_asset_ids() -> None:
     events: list[list[str]] = []
     approval_path, audit_path = make_private_live_paths(
@@ -924,6 +1075,41 @@ async def test_refresh_subscription_caps_asset_ids() -> None:
     await runner._refresh_subscription_assets_locked()  # noqa: SLF001
 
     assert events == [["asset-a", "asset-b"]]
+
+
+@pytest.mark.asyncio
+async def test_refresh_subscription_protects_user_pins_under_cap() -> None:
+    events: list[list[str]] = []
+
+    @dataclass
+    class RecordingSubscriptionController:
+        async def update(self, asset_ids: list[str]) -> bool:
+            events.append(list(asset_ids))
+            return True
+
+    runner = Runner(
+        config=PMSSettings(
+            mode=RunMode.PAPER,
+            auto_migrate_default_v2=False,
+            sensor=SensorSettings(max_subscription_asset_ids=2),
+        ),
+        historical_data_path=FIXTURE_PATH,
+    )
+    runner._subscription_controller = cast(Any, RecordingSubscriptionController())  # noqa: SLF001
+    runner._market_selector = cast(  # noqa: SLF001
+        Any,
+        SimpleNamespace(last_user_subscription_asset_ids=frozenset({"user-pin"})),
+    )
+    runner._controller_runtimes = {  # noqa: SLF001
+        "alpha": cast(
+            Any,
+            SimpleNamespace(asset_ids=frozenset({"strategy-a", "strategy-b", "user-pin"})),
+        )
+    }
+
+    await runner._refresh_subscription_assets_locked()  # noqa: SLF001
+
+    assert events == [["user-pin", "strategy-a"]]
 
 
 @pytest.mark.asyncio

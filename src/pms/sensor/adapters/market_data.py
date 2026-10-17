@@ -56,13 +56,12 @@ class MarketDataSensor:
     # silently drops the subscription.
     _INITIAL_BACKOFF_S = 1.0
     _DEFAULT_MAX_RECONNECT_INTERVAL_S = 60.0
-    _POOL_SATURATION_S = 0.1
-    _POOL_RETRY_BACKOFF_S = 0.05
     _HEARTBEAT_INTERVAL_S = 10.0
     _PONG_TIMEOUT_S = 15.0
     _WATCHDOG_TIMEOUT_S = 120.0
     _CLOSE_TIMEOUT_S = 1.0
     _DEFAULT_MAX_MESSAGE_SIZE_BYTES = 8 * 1024 * 1024
+    _MAX_CONSECUTIVE_DATA_ERROR_RECONNECTS = 5
 
     def __init__(
         self,
@@ -93,6 +92,7 @@ class MarketDataSensor:
             maxlen=_MALFORMED_RATE_WINDOW_SIZE
         )
         self._malformed_rate_threshold = _MALFORMED_RATE_THRESHOLD_DEFAULT
+        self._consecutive_data_error_reconnects = 0
         self._last_malformed_warning_at_s = -_MALFORMED_WARNING_RATE_LIMIT_S
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._watchdog = SensorWatchdog(
@@ -135,6 +135,10 @@ class MarketDataSensor:
     def malformed_rate_threshold(self, value: float) -> None:
         self._malformed_rate_threshold = value
 
+    @property
+    def consecutive_data_error_reconnects(self) -> int:
+        return self._consecutive_data_error_reconnects
+
     def __aiter__(self) -> AsyncIterator[MarketSignal]:
         return self._iterate()
 
@@ -146,32 +150,45 @@ class MarketDataSensor:
                 connection_book_source: BookSource = (
                     "reconnect" if self._connected_once else "subscribe"
                 )
+                connection_had_data = False
+                connection_had_data_error = False
                 try:
                     async with self._connect() as websocket:
                         self._reset_book_state()
-                        self._websocket = websocket
                         self._connection_book_source = connection_book_source
-                        self._pending_reconnect_assets = set(self._asset_ids)
                         heartbeat_task = asyncio.create_task(
                             self._heartbeat_loop(websocket)
                         )
                         self._heartbeat_task = heartbeat_task
                         try:
-                            await self._send_subscription()
-                            self._subscribed_asset_ids = frozenset(self._asset_ids)
+                            # Initial subscribe and dynamic updates share this
+                            # lock. Assigning the socket and subscribed state
+                            # under the same lock prevents an update from
+                            # observing an empty state between the handshake
+                            # and the initial subscribe.
+                            async with self._send_lock:
+                                self._websocket = websocket
+                                self._pending_reconnect_assets = set(self._asset_ids)
+                                await self._send_subscription_locked(websocket)
+                                self._subscribed_asset_ids = frozenset(
+                                    self._asset_ids
+                                )
                             self._connected_once = True
-                            backoff = self._INITIAL_BACKOFF_S
                             async for raw_message in websocket:
-                                for signal in await self._handle_raw_message(raw_message):
+                                signals = await self._handle_raw_message(raw_message)
+                                connection_had_data = True
+                                for signal in signals:
                                     yield signal
                         finally:
                             heartbeat_task.cancel()
                             with suppress(asyncio.CancelledError):
                                 await heartbeat_task
                             self._heartbeat_task = None
-                            self._websocket = None
+                            async with self._send_lock:
+                                if self._websocket is websocket:
+                                    self._websocket = None
+                                self._subscribed_asset_ids = frozenset()
                             self._connection_book_source = None
-                            self._subscribed_asset_ids = frozenset()
                             self._pending_reconnect_assets = set()
                             self._reset_book_state()
                 except asyncio.CancelledError:
@@ -182,47 +199,100 @@ class MarketDataSensor:
                     OSError,
                     TimeoutError,
                     InvalidHandshake,
+                    asyncpg.InterfaceError,
                     asyncpg.PostgresError,
+                    SensorDataQualityError,
+                    ValueError,
+                    TypeError,
                 ) as error:
-                    _log_reconnectable_error(error)
+                    is_data_error = isinstance(
+                        error,
+                        (
+                            SensorDataQualityError,
+                            ValueError,
+                            TypeError,
+                            asyncpg.DataError,
+                            asyncpg.IntegrityConstraintViolationError,
+                        ),
+                    )
+                    connection_had_data_error = is_data_error
+                    if is_data_error:
+                        self._consecutive_data_error_reconnects += 1
+                        if (
+                            self._consecutive_data_error_reconnects
+                            >= self._MAX_CONSECUTIVE_DATA_ERROR_RECONNECTS
+                        ):
+                            raise SensorDataQualityError(
+                                "market data sensor exceeded consecutive "
+                                "data-error reconnect limit"
+                            ) from error
+                    if isinstance(error, SensorDataQualityError):
+                        self._malformed_message_window.clear()
+                        logger.warning(
+                            "market data sensor quality threshold exceeded; reconnecting: %s",
+                            error,
+                        )
+                    elif isinstance(error, (ValueError, TypeError)):
+                        logger.warning(
+                            "market data sensor data/persistence error; reconnecting: %s",
+                            error,
+                        )
+                    else:
+                        _log_reconnectable_error(error)
+                    if connection_had_data and not connection_had_data_error:
+                        self._consecutive_data_error_reconnects = 0
+                        backoff = self._INITIAL_BACKOFF_S
                     await self._sleep(backoff)
-                    backoff = min(backoff * 2.0, self._max_reconnect_interval_s)
+                    if not connection_had_data or connection_had_data_error:
+                        backoff = min(backoff * 2.0, self._max_reconnect_interval_s)
+                else:
+                    # A normal websocket iterator completion is a clean
+                    # server close. It still needs bounded backoff to avoid a
+                    # tight reconnect loop. Successful data resets backoff;
+                    # a close before data keeps the current backoff.
+                    if connection_had_data:
+                        backoff = self._INITIAL_BACKOFF_S
+                        self._consecutive_data_error_reconnects = 0
+                    await self._sleep(backoff)
+                    if not connection_had_data:
+                        backoff = min(backoff * 2.0, self._max_reconnect_interval_s)
         finally:
             self._heartbeat_task = None
             await self._watchdog.stop()
-            self._websocket = None
+            async with self._send_lock:
+                self._websocket = None
+                self._subscribed_asset_ids = frozenset()
             self._connection_book_source = None
-            self._subscribed_asset_ids = frozenset()
             self._pending_reconnect_assets = set()
             self._reset_book_state()
 
     async def update_subscription(self, asset_ids: list[str]) -> None:
         next_asset_ids = list(dict.fromkeys(asset_ids))
-        self._asset_ids = next_asset_ids
-        if self._websocket is None:
-            return
-
-        latency = await self._probe_pool_latency()
-        if latency > self._POOL_SATURATION_S:
-            logger.warning("subscription update delayed: pool saturated")
-            await self._sleep(self._POOL_RETRY_BACKOFF_S)
-            await self._probe_pool_latency()
-
+        websocket: Any = None
         try:
-            await self._send_subscription_update(
-                previous_asset_ids=self._subscribed_asset_ids,
-                next_asset_ids=next_asset_ids,
-            )
+            async with self._send_lock:
+                self._asset_ids = next_asset_ids
+                websocket = self._websocket
+                if websocket is None:
+                    return
+                await self._send_subscription_update_locked(
+                    websocket=websocket,
+                    previous_asset_ids=self._subscribed_asset_ids,
+                    next_asset_ids=next_asset_ids,
+                )
+                self._subscribed_asset_ids = frozenset(next_asset_ids)
         except (ConnectionClosed, ConnectionError, OSError, TimeoutError) as error:
             _log_reconnectable_error(error)
-            with suppress(Exception):
-                await self._websocket.close()
-            self._websocket = None
-            self._connection_book_source = None
-            self._subscribed_asset_ids = frozenset()
-            self._pending_reconnect_assets = set()
+            if websocket is not None:
+                with suppress(Exception):
+                    await websocket.close()
+                async with self._send_lock:
+                    if self._websocket is websocket:
+                        self._websocket = None
+                        self._connection_book_source = None
+                        self._subscribed_asset_ids = frozenset()
+                        self._pending_reconnect_assets = set()
             return
-        self._subscribed_asset_ids = frozenset(next_asset_ids)
 
     async def aclose(self) -> None:
         heartbeat_task = self._heartbeat_task
@@ -232,9 +302,10 @@ class MarketDataSensor:
             with suppress(asyncio.CancelledError):
                 await heartbeat_task
 
-        websocket = self._websocket
-        self._websocket = None
-        self._subscribed_asset_ids = frozenset()
+        async with self._send_lock:
+            websocket = self._websocket
+            self._websocket = None
+            self._subscribed_asset_ids = frozenset()
         if websocket is not None:
             await websocket.close()
         await self._watchdog.stop()
@@ -459,12 +530,8 @@ class MarketDataSensor:
             self._market_signal_metadata[market_id] = normalized
         return normalized
 
-    async def _send_subscription(self) -> None:
-        websocket = self._websocket
-        if websocket is None:
-            return
-        async with self._send_lock:
-            await websocket.send(json.dumps(_subscription_payload(self._asset_ids)))
+    async def _send_subscription_locked(self, websocket: Any) -> None:
+        await websocket.send(json.dumps(_subscription_payload(self._asset_ids)))
 
     def _connect(self) -> Any:
         connect_kwargs: tuple[dict[str, Any], ...] = (
@@ -487,15 +554,13 @@ class MarketDataSensor:
                     raise
         return connect(self.ws_url)
 
-    async def _send_subscription_update(
+    async def _send_subscription_update_locked(
         self,
         *,
+        websocket: Any,
         previous_asset_ids: frozenset[str],
         next_asset_ids: list[str],
     ) -> None:
-        websocket = self._websocket
-        if websocket is None:
-            return
         next_asset_set = frozenset(next_asset_ids)
         removed_asset_ids = sorted(previous_asset_ids - next_asset_set)
         added_asset_ids = [
@@ -503,33 +568,26 @@ class MarketDataSensor:
             for asset_id in next_asset_ids
             if asset_id not in previous_asset_ids
         ]
-        async with self._send_lock:
-            if removed_asset_ids:
-                await websocket.send(
-                    json.dumps(
-                        _subscription_update_payload(
-                            removed_asset_ids,
-                            operation="unsubscribe",
-                        )
+        if removed_asset_ids:
+            await websocket.send(
+                json.dumps(
+                    _subscription_update_payload(
+                        removed_asset_ids,
+                        operation="unsubscribe",
                     )
                 )
-                for asset_id in removed_asset_ids:
-                    self._books.pop(asset_id, None)
-            if added_asset_ids:
-                await websocket.send(
-                    json.dumps(
-                        _subscription_update_payload(
-                            added_asset_ids,
-                            operation="subscribe",
-                        )
+            )
+            for asset_id in removed_asset_ids:
+                self._books.pop(asset_id, None)
+        if added_asset_ids:
+            await websocket.send(
+                json.dumps(
+                    _subscription_update_payload(
+                        added_asset_ids,
+                        operation="subscribe",
                     )
                 )
-
-    async def _probe_pool_latency(self) -> float:
-        started = time.perf_counter()
-        async with self.store.pool.acquire():
-            pass
-        return time.perf_counter() - started
+            )
 
     async def _sleep(self, seconds: float) -> None:
         await asyncio.sleep(seconds)

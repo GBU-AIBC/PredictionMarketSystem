@@ -442,6 +442,31 @@ async def test_readiness_fails_closed_on_dead_required_worker(
 
 
 @pytest.mark.asyncio
+async def test_readiness_fails_closed_on_dead_sensor_worker() -> None:
+    runner = _runner()
+    try:
+        await runner.start()
+        sensor_task = runner.sensor_stream.tasks[0]
+        sensor_task.cancel()
+        await asyncio.gather(sensor_task, return_exceptions=True)
+
+        code, payload = readiness_payload(
+            runner,
+            halt_subscriber_task=None,
+            eod_scheduler_task=None,
+        )
+
+        assert code == 503
+        assert payload["checks"]["workers"] == "not_ready"
+        assert any(
+            name.startswith("sensor:")
+            for name in payload["workers"]["dead"]
+        )
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.asyncio
 async def test_readiness_workers_check_not_started_before_runner_start() -> None:
     runner = _runner()
     code, payload = readiness_payload(

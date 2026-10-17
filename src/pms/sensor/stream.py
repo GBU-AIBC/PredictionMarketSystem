@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import cast
 
 from pms.core.interfaces import ISensor
@@ -60,16 +60,28 @@ class SensorStream:
         self._subscriptions.append(subscription)
         return subscription
 
-    async def start(self, sensors: Iterable[ISensor]) -> None:
+    async def start(
+        self,
+        sensors: Iterable[ISensor],
+        *,
+        task_factory: Callable[[int, ISensor], asyncio.Task[None]] | None = None,
+    ) -> None:
         if self._tasks:
             msg = "SensorStream is already started"
             raise RuntimeError(msg)
         sensor_list = tuple(sensors)
         self._started = True
         self._active_consumers = len(sensor_list)
-        self._tasks = tuple(
-            asyncio.create_task(self._consume(sensor)) for sensor in sensor_list
-        )
+        tasks: list[asyncio.Task[None]] = []
+        for index, sensor in enumerate(sensor_list):
+            task = (
+                asyncio.create_task(self._consume(sensor))
+                if task_factory is None
+                else task_factory(index, sensor)
+            )
+            task.add_done_callback(self._consumer_done)
+            tasks.append(task)
+        self._tasks = tuple(tasks)
         if self._active_consumers == 0:
             self._close_subscriptions()
 
@@ -90,16 +102,20 @@ class SensorStream:
             self._subscriptions = []
 
     async def _consume(self, sensor: ISensor) -> None:
-        try:
-            async for signal in sensor:
-                await self.queue.put(signal)
-                for subscription in tuple(self._subscriptions):
-                    await subscription.push(signal)
-        finally:
-            if self._active_consumers > 0:
-                self._active_consumers -= 1
-            if self._active_consumers == 0:
-                self._close_subscriptions()
+        async for signal in sensor:
+            await self.queue.put(signal)
+            for subscription in tuple(self._subscriptions):
+                await subscription.push(signal)
+
+    async def consume(self, sensor: ISensor) -> None:
+        """Consume one sensor; callers may supervise this coroutine."""
+        await self._consume(sensor)
+
+    def _consumer_done(self, _task: asyncio.Task[None]) -> None:
+        if self._active_consumers > 0:
+            self._active_consumers -= 1
+        if self._active_consumers == 0:
+            self._close_subscriptions()
 
     def _close_subscriptions(self) -> None:
         for subscription in self._subscriptions:

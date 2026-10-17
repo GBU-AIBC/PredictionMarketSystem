@@ -214,7 +214,8 @@ async def test_runner_start_closes_pool_when_startup_fails_after_acquire(
     async def fake_create_pool(*, dsn: str, min_size: int, max_size: int) -> FakePool:
         return fake_pool
 
-    async def fake_sensor_start(sensors: Any) -> None:
+    async def fake_sensor_start(sensors: Any, **kwargs: Any) -> None:
+        del sensors, kwargs
         raise RuntimeError("sensor start failed")
 
     monkeypatch.setattr("pms.runner.asyncpg.create_pool", fake_create_pool)
