@@ -389,7 +389,11 @@ def test_eval_feedback_defaults_require_a_sample_window() -> None:
 
 
 def test_strategy_version_hash_includes_effective_llm_identity() -> None:
-    config = StrategyConfig(strategy_id="w1c", factor_composition=(), metadata=())
+    config = StrategyConfig(
+        strategy_id="w1c",
+        factor_composition=(),
+        metadata=(("economics_version", "v1"), ("fee_rate", "0.01")),
+    )
     risk = RiskParams(
         max_position_notional_usdc=100.0,
         max_daily_drawdown_pct=2.5,
@@ -410,6 +414,27 @@ def test_strategy_version_hash_includes_effective_llm_identity() -> None:
         market_selection,
         llm_identity=("anthropic", "claude-sonnet-4-6", "v1"),
     )
+    assert compute_strategy_version_id(
+        config,
+        risk,
+        eval_spec,
+        forecaster,
+        market_selection,
+        llm_identity=("anthropic", "claude-sonnet-4-6", "v1"),
+    ) == first
+    economics_change = StrategyConfig(
+        strategy_id="w1c",
+        factor_composition=(),
+        metadata=(("economics_version", "v1"), ("fee_rate", "0.02")),
+    )
+    assert compute_strategy_version_id(
+        economics_change,
+        risk,
+        eval_spec,
+        forecaster,
+        market_selection,
+        llm_identity=("anthropic", "claude-sonnet-4-6", "v1"),
+    ) != first
     second = compute_strategy_version_id(
         config,
         risk,
