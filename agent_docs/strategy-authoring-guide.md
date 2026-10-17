@@ -263,6 +263,7 @@ import sys
 import asyncpg
 
 from pms.factors.definitions import REGISTERED
+from pms.controller.factor_snapshot import RAW_FACTOR_ROLES
 from pms.storage.strategy_registry import PostgresStrategyRegistry
 from pms.strategies.aggregate import Strategy
 from pms.strategies.imbalance_with_prior import (
@@ -270,16 +271,6 @@ from pms.strategies.imbalance_with_prior import (
 )
 from pms.strategies.projections import FactorCompositionStep, StrategyVersion
 
-_RAW_FACTOR_ROLES = frozenset(
-    {
-        "weighted",
-        "precedence_rank",
-        "threshold_edge",
-        "posterior_prior",
-        "posterior_success",
-        "posterior_failure",
-    }
-)
 _REGISTERED_FACTOR_IDS = frozenset(
     factor_cls.factor_id for factor_cls in REGISTERED
 )
@@ -305,7 +296,7 @@ def _raw_factor_steps(strategy: Strategy) -> tuple[FactorCompositionStep, ...]:
     return tuple(
         step
         for step in strategy.config.factor_composition
-        if step.role in _RAW_FACTOR_ROLES
+        if step.role in RAW_FACTOR_ROLES
         and step.factor_id in _REGISTERED_FACTOR_IDS
     )
 
@@ -377,7 +368,7 @@ psql "$DATABASE_URL" -c "SELECT factor_id, role, weight, threshold FROM strategy
 ```
 
 The third query should list only the **raw** factors filtered by
-`_RAW_FACTOR_ROLES` in the install script — `rules` is a forecaster
+`RAW_FACTOR_ROLES` in the install script — `rules` is a forecaster
 binding, not a raw factor, so it correctly does not appear in
 `strategy_factors`.
 
@@ -797,7 +788,7 @@ invariants most likely to bite during strategy authoring.
 
 | Pitfall | What goes wrong | The rule that says don't |
 |---|---|---|
-| Putting a composite expression in `factor_composition` (e.g. `factor_id="0.3*imbalance + 0.7*prior"`) | `_RAW_FACTOR_ROLES` filter drops it from `strategy_factors`, runtime treats it as missing | Invariant 4 |
+| Putting a composite expression in `factor_composition` (e.g. `factor_id="0.3*imbalance + 0.7*prior"`) | `RAW_FACTOR_ROLES` filter drops it from `strategy_factors`, runtime treats it as missing | Invariant 4 |
 | Editing a `strategy_versions.config_json` row in-place after install | Historical eval rows tagged with the old hash become incomparable; `mean(brier)` silently averages across versions | Invariant 3 |
 | Strategy code importing from `pms.sensor` or `pms.actuator` | Import-linter rejects the PR | Invariant 5 |
 | Plugin strategy writing to `markets` / `book_snapshots` / `factor_values` | Schema is grep-checked; PR rejected | Invariant 8 |
