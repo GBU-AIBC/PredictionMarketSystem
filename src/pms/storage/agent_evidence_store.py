@@ -140,6 +140,35 @@ class AgentEvidenceStore:
         now: datetime | None = None,
         allow_backfill: bool = False,
     ) -> AgentEvidence:
+        # A retry must remain idempotent after the submit-time freshness window
+        # closes.  Verify the canonical identity first, then return the
+        # immutable row before applying current-time age/expiry checks.
+        try:
+            canonical_hash = canonical_content_hash(
+                market_id=market_id,
+                source=source,
+                model=model,
+                url=url,
+                summary=summary,
+                payload=payload,
+                captured_at=captured_at,
+                expires_at=expires_at,
+            )
+        except (TypeError, ValueError):
+            canonical_hash = ""
+        if canonical_hash == content_hash:
+            async with self.pool.acquire() as connection:
+                existing_row = await connection.fetchrow(
+                    """
+                    SELECT evidence_id, market_id, source, model, url, summary, payload,
+                           content_hash, captured_at, expires_at, submitted_by_token_id, created_at
+                    FROM agent_evidence
+                    WHERE content_hash = $1
+                    """,
+                    content_hash,
+                )
+            if existing_row is not None:
+                return evidence_from_row(existing_row)
         validate_evidence_input(
             market_id=market_id,
             source=source,

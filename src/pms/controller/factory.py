@@ -16,6 +16,7 @@ from pms.controller.factor_snapshot import (
     NullFactorSnapshotReader,
 )
 from pms.controller.forecasters.llm import (
+    EvidenceReader,
     LLMForecaster,
     durable_spend_ledger_path,
     durable_record_replay_path,
@@ -54,6 +55,7 @@ class ControllerPipelineFactory:
         default_factory=NullOutcomeTokenResolver
     )
     direct_book_reader: DirectBookSnapshotReader | None = None
+    evidence_reader: EvidenceReader | None = None
 
     def build_many(
         self,
@@ -99,6 +101,9 @@ class ControllerPipelineFactory:
                 factor_composition=strategy.config.factor_composition,
                 strategy_id=strategy.strategy_id,
                 strategy_version_id=strategy.strategy_version_id,
+                evidence_reader=(
+                    self.evidence_reader if self.settings.mode != RunMode.LIVE else None
+                ),
             )
             for name, raw_params in strategy.forecaster.forecasters
         )
@@ -114,6 +119,7 @@ def _build_forecaster(
     factor_composition: tuple[FactorCompositionStep, ...],
     strategy_id: str,
     strategy_version_id: str,
+    evidence_reader: EvidenceReader | None = None,
 ) -> IForecaster:
     params = dict(raw_params)
     if name == "rules":
@@ -176,7 +182,11 @@ def _build_forecaster(
         # the optional SDK/credentials may not exist in research environments.
         if replay_mode != "replay":
             validate_llm_runtime_dependencies(llm_config)
-        return LLMForecaster(config=llm_config, record_replay_mode=replay_mode)
+        return LLMForecaster(
+            config=llm_config,
+            record_replay_mode=replay_mode,
+            evidence_reader=evidence_reader,
+        )
     if name == "flb":
         if raw_params:
             msg = (

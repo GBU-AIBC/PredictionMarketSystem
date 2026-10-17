@@ -171,7 +171,9 @@ def build_paper_agent_probability_strategy() -> Strategy:
             min_order_size_usdc=1.0,
         ),
         eval_spec=EvalSpec(metrics=("brier", "pnl", "fill_rate")),
-        forecaster=ForecasterSpec(forecasters=(("rules", ()),)),
+        forecaster=ForecasterSpec(
+            forecasters=(("rules", ()), ("llm", ())),
+        ),
         market_selection=MarketSelectionSpec(
             venue="polymarket",
             resolution_time_max_horizon_days=31,

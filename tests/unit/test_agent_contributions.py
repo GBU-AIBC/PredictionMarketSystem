@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from dataclasses import replace
+import json
 from pathlib import Path
 from typing import Any, cast
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -21,6 +24,7 @@ from pms.core.models import MarketSignal
 from pms.core.enums import MarketStatus, RunMode
 from pms.factors.composition import _rule_delta
 from pms.storage.agent_evidence_store import (
+    AgentEvidence,
     canonical_content_hash,
     validate_evidence_input,
 )
@@ -90,6 +94,99 @@ def test_agent_factor_catalog_and_probability_validation() -> None:
 
 def test_probability_catalog_entries_use_market_relative_rule_delta() -> None:
     assert _rule_delta("agent_probability", 0.8, market_price=0.5) == pytest.approx(0.3)
+
+
+@pytest.mark.asyncio
+async def test_llm_prompt_includes_point_in_time_agent_evidence() -> None:
+    signal = _signal()
+    evidence = AgentEvidence(
+        evidence_id="evidence-1",
+        market_id=signal.market_id,
+        source="agent-source",
+        model="agent-model",
+        url="https://example.test/evidence",
+        summary="A point-in-time summary",
+        payload={},
+        content_hash="a" * 64,
+        captured_at=signal.timestamp - timedelta(seconds=1),
+        expires_at=signal.timestamp + timedelta(minutes=5),
+        submitted_by_token_id="token",
+        created_at=signal.timestamp - timedelta(seconds=1),
+    )
+
+    class Reader:
+        async def read_evidence(
+            self,
+            market_id: str,
+            *,
+            as_of: datetime,
+            limit: int = 8,
+        ) -> tuple[AgentEvidence, ...]:
+            assert market_id == signal.market_id
+            assert as_of == signal.timestamp
+            assert limit == 8
+            return (evidence,)
+
+    class Messages:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def create(self, **kwargs: Any) -> object:
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                content='{"prob_estimate": 0.8, "confidence": 0.5, "rationale": "ok"}'
+            )
+
+    messages = Messages()
+    client = SimpleNamespace(messages=messages)
+    forecaster = LLMForecaster(
+        config=LLMSettings(
+            enabled=True,
+            provider="anthropic",
+            api_key="test",
+            model="claude-test",
+        ),
+        client=client,
+        evidence_reader=Reader(),
+    )
+    result = await forecaster.apredict(signal)
+    assert result is not None
+    prompt = messages.calls[0]["messages"][0]["content"]
+    assert "A point-in-time summary" in prompt
+    assert "agent-source" in prompt
+    assert "evidence-1" in prompt
+    assert "a" * 64 in prompt
+
+
+def test_paper_ttl_cache_hits_are_recorded_for_each_replay_input(tmp_path: Path) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def create(**kwargs: Any) -> object:
+        calls.append(kwargs)
+        return SimpleNamespace(
+            content='{"prob_estimate": 0.8, "confidence": 0.5, "rationale": "ok"}'
+        )
+
+    signal = _signal()
+    second_signal = replace(signal, fetched_at=signal.timestamp + timedelta(seconds=1))
+    cache_path = tmp_path / "record.json"
+    forecaster = LLMForecaster(
+        config=LLMSettings(
+            enabled=True,
+            provider="anthropic",
+            api_key="test",
+            model="claude-test",
+            record_replay_path=str(cache_path),
+            cache_ttl_s=30.0,
+        ),
+        client=SimpleNamespace(messages=SimpleNamespace(create=create)),
+        record_replay_mode="record",
+    )
+    assert forecaster.predict(signal) is not None
+    assert forecaster.predict(second_signal) is not None
+    assert len(calls) == 1
+    entries = json.loads(cache_path.read_text(encoding="utf-8"))["entries"]
+    assert len(entries) == 2
 
 
 def _signal() -> MarketSignal:
@@ -232,6 +329,35 @@ def test_replay_record_refuses_to_overwrite_corrupt_cache(tmp_path: Path) -> Non
             {"response": "{}", "recorded_at": "now"},
         )
     assert cache_path.read_text(encoding="utf-8") == "{truncated"
+
+
+def test_paper_recording_error_keeps_paid_forecast(monkeypatch: pytest.MonkeyPatch) -> None:
+    def create(**kwargs: Any) -> object:
+        del kwargs
+        return SimpleNamespace(
+            content='{"prob_estimate": 0.8, "confidence": 0.5, "rationale": "ok"}'
+        )
+
+    forecaster = LLMForecaster(
+        config=LLMSettings(
+            enabled=True,
+            provider="anthropic",
+            api_key="test",
+            model="claude-test",
+            record_replay_path="/tmp/paper-record-test.json",
+        ),
+        client=SimpleNamespace(messages=SimpleNamespace(create=create)),
+        record_replay_mode="record",
+    )
+
+    def fail_write(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise LLMReplayCacheCorruptError("corrupt")
+
+    monkeypatch.setattr(forecaster, "_replay_write", fail_write)
+    result = forecaster.predict(_signal())
+    assert result is not None
+    assert forecaster.last_failure_reason == "replay_record_failed"
 
 
 @pytest.mark.asyncio

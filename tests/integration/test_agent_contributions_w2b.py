@@ -15,6 +15,7 @@ from pms.api.routes.agent_factors import router as factor_router
 from pms.config import DatabaseSettings, LLMSettings, PMSSettings
 from pms.controller.factor_snapshot import PostgresFactorSnapshotReader
 from pms.controller.factory import ControllerPipelineFactory
+from pms.controller.forecasters.llm import LLMForecaster
 from pms.core.enums import RunMode
 from pms.core.models import MarketSignal, Portfolio
 from pms.factors.catalog import seed_factor_catalog
@@ -24,6 +25,7 @@ from pms.storage.agent_evidence_store import (
 )
 from pms.runner import Runner
 from pms.strategies.intents import StrategyContext
+from pms.strategies.agent_evidence import AgentEvidenceObservationSource
 from pms.strategies.paper_multifactor import build_paper_agent_probability_strategy
 
 
@@ -276,3 +278,123 @@ async def test_agent_factor_paper_decision_changes_and_live_refuses(
     live_settings = settings.model_copy(update={"mode": RunMode.LIVE})
     with pytest.raises(ValueError, match="agent-owned factors"):
         ControllerPipelineFactory(settings=live_settings, factor_reader=reader).build(active)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_posted_evidence_changes_paper_llm_prompt_but_not_before_as_of(
+    pg_pool: asyncpg.Pool,
+) -> None:
+    market_id = "w2b-prompt-market"
+    await _seed_market(pg_pool, market_id)
+    now = datetime.now(tz=UTC)
+    as_of = now - timedelta(seconds=2)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_api(pg_pool)),
+        base_url="http://test",
+    ) as client:
+        summary = "known-before-as-of"
+        captured_at = now - timedelta(seconds=1)
+        payload = {"summary": summary}
+        expires_at = now + timedelta(minutes=5)
+        content_hash = canonical_content_hash(
+            market_id=market_id,
+            source="prompt-agent",
+            model="prompt-model",
+            url="https://example.test/prompt",
+            summary=summary,
+            payload=payload,
+            captured_at=captured_at,
+            expires_at=expires_at,
+        )
+        response = await client.post(
+            "/evidence",
+            json={
+                "market_id": market_id,
+                "source": "prompt-agent",
+                "model": "prompt-model",
+                "url": "https://example.test/prompt",
+                "summary": summary,
+                "payload": payload,
+                "content_hash": content_hash,
+                "captured_at": captured_at.isoformat(),
+                "expires_at": expires_at.isoformat(),
+            },
+        )
+        assert response.status_code == 201, response.text
+        as_of = datetime.now(tz=UTC) - timedelta(milliseconds=200)
+        async with pg_pool.acquire() as connection:
+            await connection.execute(
+                "UPDATE agent_evidence SET created_at = $1 WHERE evidence_id = $2",
+                as_of - timedelta(seconds=1),
+                response.json()["evidence_id"],
+            )
+        summary = "captured-after-as-of"
+        captured_at = as_of + timedelta(milliseconds=100)
+        payload = {"summary": summary}
+        content_hash = canonical_content_hash(
+            market_id=market_id,
+            source="prompt-agent",
+            model="prompt-model",
+            url="https://example.test/prompt",
+            summary=summary,
+            payload=payload,
+            captured_at=captured_at,
+            expires_at=expires_at,
+        )
+        response = await client.post(
+            "/evidence",
+            json={
+                "market_id": market_id,
+                "source": "prompt-agent",
+                "model": "prompt-model",
+                "url": "https://example.test/prompt",
+                "summary": summary,
+                "payload": payload,
+                "content_hash": content_hash,
+                "captured_at": captured_at.isoformat(),
+                "expires_at": expires_at.isoformat(),
+            },
+        )
+        assert response.status_code == 201, response.text
+
+    class Messages:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                content='{"prob_estimate": 0.8, "confidence": 0.5, "rationale": "evidence"}'
+            )
+
+    messages = Messages()
+    signal = MarketSignal(
+        market_id=market_id,
+        token_id="prompt-token",
+        venue="polymarket",
+        title="Prompt evidence",
+        yes_price=0.5,
+        volume_24h=1000.0,
+        resolves_at=None,
+        orderbook={},
+        external_signal={},
+        fetched_at=as_of,
+        market_status="open",
+    )
+    forecaster = LLMForecaster(
+        config=LLMSettings(
+            enabled=True,
+            provider="anthropic",
+            api_key="test",
+            model="claude-test",
+            cache_ttl_s=30.0,
+        ),
+        client=SimpleNamespace(messages=messages),
+        evidence_reader=AgentEvidenceObservationSource(
+            AgentEvidenceStore(pg_pool)
+        ),
+    )
+    assert await forecaster.apredict(signal) is not None
+    first_prompt = str(messages.calls[0]["messages"])
+    assert "known-before-as-of" in first_prompt
+    assert "captured-after-as-of" not in first_prompt

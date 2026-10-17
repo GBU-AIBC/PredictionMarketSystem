@@ -1581,6 +1581,9 @@ class Runner:
                 factor_reader=PostgresFactorSnapshotReader(self._pg_pool),
                 outcome_token_resolver=MarketDataOutcomeTokenResolver(market_data_store),
                 direct_book_reader=direct_book_reader,
+                evidence_reader=AgentEvidenceObservationSource(
+                    AgentEvidenceStore(self._pg_pool)
+                ),
             )
         if isinstance(self.eval_store, EvalStore):
             self.eval_store.bind_pool(self._pg_pool)
