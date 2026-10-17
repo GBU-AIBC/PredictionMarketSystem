@@ -41,6 +41,11 @@ _ESTIMATED_CALL_COST_USDC = Decimal("0.002")
 _KNOWN_MODEL_PRICES: dict[str, tuple[Decimal, Decimal]] = {
     "claude-sonnet-4-6": (Decimal("3"), Decimal("15")),
     "claude-3-5-sonnet": (Decimal("3"), Decimal("15")),
+    # Test providers still exercise the full budgeting path.  Giving them an
+    # explicit price keeps those tests honest while unknown production models
+    # fail closed before a paid request is made.
+    "claude-test": (Decimal("3"), Decimal("15")),
+    "openai-test": (Decimal("3"), Decimal("15")),
 }
 
 
@@ -148,6 +153,16 @@ class LLMForecaster:
         if self.config is None or not self.config.enabled:
             return None
         self.last_failure_reason = None
+        # Resolve pricing before loading a client or reserving budget.  A
+        # model without both token rates is unsafe to call because the result
+        # cannot be accounted for after the provider has charged us.
+        try:
+            _model_prices(self.config)
+        except LLMProviderUnavailableError:
+            self.last_failure_reason = "budget_exhausted"
+            increment_metric(LLM_BUDGET_EXHAUSTED_TOTAL_METRIC)
+            self._publish_budget_metrics()
+            return None
         cache_key = _cache_key(signal)
         if self._negative_cache_get(cache_key):
             self.last_failure_reason = "parse_failed"

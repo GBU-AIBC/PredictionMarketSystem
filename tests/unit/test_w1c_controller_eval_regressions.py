@@ -125,10 +125,14 @@ def test_llm_unknown_model_price_fails_closed_when_usage_is_reported() -> None:
         usage=SimpleNamespace(input_tokens=10, output_tokens=10),
         choices=[SimpleNamespace(message=SimpleNamespace(content='{"prob_estimate":0.6,"confidence":0.5,"rationale":"x"}'))],
     )
+    calls: list[dict[str, object]] = []
+
+    def create(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return response
+
     client = SimpleNamespace(
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(create=lambda **_kwargs: response)
-        )
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
     )
     forecaster = LLMForecaster(
         config=LLMSettings(
@@ -142,6 +146,7 @@ def test_llm_unknown_model_price_fails_closed_when_usage_is_reported() -> None:
     )
     assert forecaster.predict(_signal({"category": "politics"})) is None
     assert forecaster.last_failure_reason == "budget_exhausted"
+    assert calls == []
 
 
 def test_kelly_sizes_on_cost_adjusted_entry_price() -> None:
@@ -199,6 +204,12 @@ def test_eval_minimum_sample_settings_are_instance_specific() -> None:
     assert configured.min_win_rate_samples == 25
 
 
+def test_eval_feedback_defaults_require_a_sample_window() -> None:
+    defaults = EvalSpec(metrics=("slippage", "win_rate"))
+    assert defaults.min_slippage_samples == 20
+    assert defaults.min_win_rate_samples == 20
+
+
 def test_replay_resolution_label_accepts_closed_settlement_prices() -> None:
     assert _market_resolution_label(
         {"closed": True, "yes_price": 1.0, "no_price": 0.0}
@@ -225,7 +236,7 @@ async def test_terminal_partial_fill_is_evaluated_once() -> None:
     decision = _decision()
     now = datetime(2026, 1, 1, tzinfo=UTC)
 
-    def fill(fill_id: str) -> FillRecord:
+    def fill(fill_id: str, notional: float, quantity: float) -> FillRecord:
         return FillRecord(
             trade_id=fill_id,
             order_id="w1c-order",
@@ -235,8 +246,8 @@ async def test_terminal_partial_fill_is_evaluated_once() -> None:
             venue="polymarket",
             side="BUY",
             fill_price=0.4,
-            fill_notional_usdc=4.0,
-            fill_quantity=10.0,
+            fill_notional_usdc=notional,
+            fill_quantity=quantity,
             executed_at=now,
             filled_at=now,
             status="partial",
@@ -249,7 +260,8 @@ async def test_terminal_partial_fill_is_evaluated_once() -> None:
 
     store = InMemoryEvalStore()
     spool = EvalSpool(store=cast(EvalStore, store), scorer=Scorer())
-    assert await spool.process(fill("fill-partial"), decision)
-    assert not await spool.process(fill("fill-partial"), decision)
-    assert not await spool.process(fill("fill-terminal"), decision)
+    assert await spool.process(fill("fill-partial-1", 4.0, 10.0), decision)
+    assert await spool.process(fill("fill-partial-2", 7.0, 17.5), decision)
+    assert not await spool.process(fill("fill-partial-2", 7.0, 17.5), decision)
     assert len(await store.all()) == 1
+    assert (await store.all())[0].pnl == pytest.approx(10.5)

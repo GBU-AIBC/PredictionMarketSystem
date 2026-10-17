@@ -5,7 +5,6 @@ from hashlib import sha256
 from pathlib import Path
 from typing import cast
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from pms.artifact_path_safety import (
     require_path_outside_working_tree,
@@ -148,13 +147,13 @@ def _build_forecaster(
             updates["max_tokens"] = int(cast(str, updates["max_tokens"]))
         llm_payload = {**settings.llm.model_dump(), **updates}
         if llm_payload.get("spend_ledger_path") is None:
-            identity = "|".join(
-                str(llm_payload.get(key, ""))
-                for key in ("provider", "model", "api_key")
-            )
-            digest = sha256(identity.encode()).hexdigest()[:24]
+            # Keep the restart-safe ledger scoped to the configured database,
+            # rather than placing a process/environment-shared file in HOME.
+            # API keys are deliberately excluded from this identity.
+            database_digest = sha256(settings.database.dsn.encode()).hexdigest()[:24]
+            ledger_dir = Path(settings.live_emergency_audit_path).expanduser().parent
             llm_payload["spend_ledger_path"] = str(
-                Path.home() / ".cache" / "pms" / f"llm-spend-{digest}.json"
+                ledger_dir / f"llm-spend-{database_digest}.json"
             )
         llm_config = LLMSettings.model_validate(llm_payload)
         validate_llm_runtime_dependencies(llm_config)
