@@ -300,6 +300,11 @@ def test_llm_cache_key_ignores_orderbook_size_changes() -> None:
     assert _cache_key(first) == _cache_key(second)
 
 
+def test_llm_prompt_bounds_large_point_in_time_evidence() -> None:
+    prompt = _prompt(_signal({"category": "x", "fair_value": "z" * 100_000}))
+    assert len(prompt) < 12_000
+
+
 def test_default_controller_pipeline_derives_restart_safe_spend_ledger(
     tmp_path: Path,
 ) -> None:

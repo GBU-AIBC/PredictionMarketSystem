@@ -7,6 +7,7 @@ import math
 import os
 import threading
 import time
+from math import ceil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -185,7 +186,7 @@ class LLMForecaster:
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached
-        estimated_cost = self._estimated_call_cost_usdc()
+        estimated_cost = self._estimated_call_cost_usdc(signal)
         if not self._reserve_budget(estimated_cost):
             self.last_failure_reason = "budget_exhausted"
             increment_metric(LLM_BUDGET_EXHAUSTED_TOTAL_METRIC)
@@ -435,14 +436,17 @@ class LLMForecaster:
                 return False
             return True
 
-    def _estimated_call_cost_usdc(self) -> Decimal:
+    def _estimated_call_cost_usdc(self, signal: MarketSignal | None = None) -> Decimal:
         assert self.config is not None
         input_price, output = _model_prices(self.config)
+        input_tokens = 2_000
+        if signal is not None:
+            input_tokens = max(input_tokens, ceil(len(_prompt(signal)) / 4))
         return max(
             _ESTIMATED_CALL_COST_USDC,
             (
                 output * Decimal(self.config.max_tokens)
-                + input_price * Decimal(2_000)
+                + input_price * Decimal(input_tokens)
             ) / Decimal(1_000_000),
         )
 
@@ -661,12 +665,14 @@ def _point_in_time_external_signal(signal: Mapping[str, object]) -> dict[str, ob
         if isinstance(value, Mapping):
             return {
                 str(key): scrub(item)
-                for key, item in value.items()
+                for key, item in list(value.items())[:50]
                 if str(key) not in _NON_POINT_IN_TIME_KEYS
                 and (not top_level or str(key) in _POINT_IN_TIME_KEYS)
             }
         if isinstance(value, list):
-            return [scrub(item) for item in value]
+            return [scrub(item) for item in value[:20]]
+        if isinstance(value, str):
+            return value[:2_048]
         return value
 
     return cast(dict[str, object], scrub(signal, top_level=True))
@@ -711,7 +717,7 @@ def _top_five(levels: object) -> object:
 
 
 def _safe_prompt_title(title: str) -> str:
-    return title.replace("```", "\\u0060\\u0060\\u0060")
+    return title.replace("```", "\\u0060\\u0060\\u0060")[:2_048]
 
 
 def _prompt_payload_json(
@@ -722,10 +728,15 @@ def _prompt_payload_json(
 ) -> str:
     # Keep one structured payload. External fields use readable JSON spacing;
     # orderbook levels stay compact to bound prompt size.
+    external_json = json.dumps(external_signal, sort_keys=True, default=str)
+    if len(external_json) > 6_000:
+        external_json = json.dumps(
+            {"truncated_external_signal": external_json[:6_000]},
+            sort_keys=True,
+        )
     return "{" + ",".join(
         (
-            '"external_signal":'
-            + json.dumps(external_signal, sort_keys=True, default=str),
+            '"external_signal":' + external_json,
             '"market_id":' + json.dumps(signal.market_id),
             '"orderbook":'
             + json.dumps(orderbook, sort_keys=True, separators=(",", ":")),
