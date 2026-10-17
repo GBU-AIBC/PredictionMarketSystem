@@ -96,7 +96,7 @@ class ToolSpec:
     query_params: tuple[str, ...] = ()
     path_params: tuple[str, ...] = ()
     body_fields: tuple[str, ...] = ()
-    requires_routes: bool = False
+    feature_detected: bool = False
 
 
 TOOL_SPECS: tuple[ToolSpec, ...] = (
@@ -109,8 +109,8 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("list_signals", "GET", "/signals", "read", query_params=("limit",)),
     ToolSpec("get_factor_catalog", "GET", "/factors/catalog", "read"),
     ToolSpec("get_factor_series", "GET", "/factors", "read", query_params=("factor_id", "market_id", "param", "since", "limit")),
-    ToolSpec("submit_evidence", "POST", "/evidence", "paper_operate|research", body_fields=("market_id", "source", "model", "url", "summary", "payload", "content_hash", "captured_at", "expires_at", "evidence_id"), requires_routes=True),
-    ToolSpec("submit_agent_factor", "POST", "/factors/{factor_id}/observations", "paper_operate|research", path_params=("factor_id",), body_fields=("market_id", "param", "value", "ts", "model", "prompt_hash", "evidence_ids"), requires_routes=True),
+    ToolSpec("submit_evidence", "POST", "/evidence", "paper_operate|research", body_fields=("market_id", "source", "model", "url", "summary", "payload", "content_hash", "captured_at", "expires_at", "evidence_id"), feature_detected=True),
+    ToolSpec("submit_agent_factor", "POST", "/factors/{factor_id}/observations", "paper_operate|research", path_params=("factor_id",), body_fields=("market_id", "param", "value", "ts", "model", "prompt_hash", "evidence_ids"), feature_detected=True),
     ToolSpec("run_backtest", "POST", "/research/backtest", "research", body_fields=("sweep_yaml",)),
     ToolSpec("get_research_report", "GET", "/evaluation/reports/{report_id}", "read", path_params=("report_id",)),
     ToolSpec("explain_decision", "GET", "/decisions/{decision_id}/explain", "read", path_params=("decision_id",)),
@@ -173,7 +173,7 @@ class PMSMCPClient:
             raw_path = paths.get(spec.path)
             operation = raw_path.get(spec.method.lower()) if isinstance(raw_path, Mapping) else None
             if not isinstance(operation, Mapping):
-                if spec.requires_routes:
+                if spec.feature_detected:
                     continue
                 raise MCPStartupError("missing_operation", f"required MCP operation is missing: {spec.method} {spec.path}")
             active.append(_operation_from_openapi(spec, operation, openapi))

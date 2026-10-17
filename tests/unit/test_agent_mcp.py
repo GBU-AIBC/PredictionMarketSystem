@@ -28,48 +28,6 @@ def _app_openapi() -> dict[str, Any]:
     return app.openapi()
 
 
-def _add_2b_routes(document: dict[str, Any]) -> None:
-    evidence_fields = {
-        "market_id": {"type": "string"},
-        "source": {"type": "string"},
-        "model": {"type": "string"},
-        "url": {"type": "string"},
-        "summary": {"type": "string"},
-        "payload": {"type": "object"},
-        "content_hash": {"type": "string"},
-        "captured_at": {"type": "string", "format": "date-time"},
-        "expires_at": {"anyOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]},
-        "evidence_id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-    }
-    factor_fields = {
-        "market_id": {"type": "string"},
-        "param": {"type": "string", "default": ""},
-        "value": {},
-        "ts": {"type": "string", "format": "date-time"},
-        "model": {"type": "string"},
-        "prompt_hash": {"type": "string"},
-        "evidence_ids": {"type": "array", "items": {"type": "string"}, "default": []},
-    }
-
-    def operation(fields: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "parameters": [],
-            "requestBody": {
-                "required": True,
-                "content": {"application/json": {"schema": {"type": "object", "properties": fields, "required": list(fields)}}},
-            },
-            "responses": {"201": {"content": {"application/json": {"schema": {"type": "object"}}}}},
-        }
-
-    document["paths"]["/evidence"] = {"post": operation(evidence_fields)}
-    document["paths"]["/factors/{factor_id}/observations"] = {
-        "post": {
-            **operation(factor_fields),
-            "parameters": [{"name": "factor_id", "in": "path", "required": True, "schema": {"type": "string"}}],
-        }
-    }
-
-
 def _client(handler: Any, *, token: str = "agent-secret", timeout: float = 1.0) -> tuple[PMSMCPClient, httpx.AsyncClient]:
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://test")
     return PMSMCPClient(MCPConfig("http://test", token, timeout), http_client=http_client, timeout=timeout), http_client
@@ -78,26 +36,27 @@ def _client(handler: Any, *, token: str = "agent-secret", timeout: float = 1.0) 
 @pytest.mark.asyncio
 async def test_openapi_drives_active_tool_schemas_and_feature_detects_2b() -> None:
     pytest.importorskip("mcp")
-    without_2b = _app_openapi()
+    real_openapi = _app_openapi()
     client, transport_client = _client(lambda request: httpx.Response(200, json={"ok": True}))
     try:
+        server = await create_server(client, openapi=real_openapi)
+        names = {tool.name for tool in await server.list_tools()}
+        assert {spec.name for spec in TOOL_SPECS} == names
+
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        for spec in TOOL_SPECS:
+            operation = real_openapi["paths"][spec.path][spec.method.lower()]
+            assert tools[spec.name].inputSchema == _input_schema(spec, operation, real_openapi)
+            assert tools[spec.name].outputSchema is not None
+
+        without_2b = deepcopy(real_openapi)
+        without_2b["paths"].pop("/evidence")
+        without_2b["paths"].pop("/factors/{factor_id}/observations")
         server = await create_server(client, openapi=without_2b)
         names = {tool.name for tool in await server.list_tools()}
         assert "submit_evidence" not in names
         assert "submit_agent_factor" not in names
         assert len(names) == 13
-
-        with_2b = deepcopy(without_2b)
-        _add_2b_routes(with_2b)
-        server = await create_server(client, openapi=with_2b)
-        tools = {tool.name: tool for tool in await server.list_tools()}
-        assert {name for name in tools if name.startswith("submit_")} == {"submit_evidence", "submit_agent_factor"}
-        for spec in TOOL_SPECS:
-            if spec.name not in tools:
-                continue
-            operation = with_2b["paths"][spec.path][spec.method.lower()]
-            assert tools[spec.name].inputSchema == _input_schema(spec, operation, with_2b)
-            assert tools[spec.name].outputSchema is not None
     finally:
         await transport_client.aclose()
 
