@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import httpx
 import pytest
+import asyncpg
 
 from pms.api.app import create_app
 from pms.api.research_routes import (
@@ -276,6 +277,29 @@ async def test_create_backtest_run_returns_503_when_pg_pool_unset() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_backtest_run_returns_422_for_malformed_yaml_or_json() -> None:
+    runner = Runner()
+    runner.bind_pg_pool(cast(asyncpg.Pool, object()))
+    app = create_app(runner, auto_start=False)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        yaml_response = await client.post(
+            "/research/backtest",
+            content="base_spec: [",
+            headers={"content-type": "text/plain"},
+        )
+        json_response = await client.post(
+            "/research/backtest",
+            content='{"sweep_yaml":',
+            headers={"content-type": "application/json"},
+        )
+    assert yaml_response.status_code == 422
+    assert json_response.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_get_backtest_run_returns_503_when_pg_pool_unset() -> None:
     runner = Runner()
     app = create_app(runner, auto_start=False)
@@ -285,6 +309,27 @@ async def test_get_backtest_run_returns_503_when_pg_pool_unset() -> None:
     ) as client:
         response = await client.get("/research/backtest/any-id")
     assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/research/backtest/not-a-uuid",
+        "/research/backtest/not-a-uuid/strategies",
+        "/research/backtest/not-a-uuid/compare",
+    ],
+)
+async def test_research_run_routes_return_422_for_invalid_run_id(path: str) -> None:
+    runner = Runner()
+    runner.bind_pg_pool(cast(asyncpg.Pool, object()))
+    app = create_app(runner, auto_start=False)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(path) if path.endswith("strategies") else await client.post(path, json={}) if path.endswith("compare") else await client.get(path)
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio

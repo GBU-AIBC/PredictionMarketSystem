@@ -513,6 +513,13 @@ class HaltClearRequest(BaseModel):
     cleared_by: str
 
 
+def _validate_backtest_run_id(run_id: str) -> None:
+    try:
+        UUID(run_id)
+    except (AttributeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="run_id must be a valid UUID") from exc
+
+
 def create_app(
     runner: Runner | None = None,
     *,
@@ -1282,7 +1289,7 @@ def create_app(
                 sweep_yaml = raw.decode("utf-8")
             return await enqueue_backtest_runs(active_runner.pg_pool, sweep_yaml)
         except (KeyError, TypeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/research/backtest", response_model=list[ResearchRunResponse], response_model_exclude_unset=True, tags=["research"], dependencies=[Depends(require_scope("research"))])
     async def get_backtest_runs(limit: int = Query(default=25, ge=1, le=100)) -> list[dict[str, Any]]:
@@ -1294,6 +1301,7 @@ def create_app(
     async def get_backtest_run(run_id: str) -> dict[str, Any]:
         if active_runner.pg_pool is None:
             raise HTTPException(status_code=503, detail="Runner PostgreSQL pool is not initialized")
+        _validate_backtest_run_id(run_id)
         payload = await fetch_backtest_run(active_runner.pg_pool, run_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="Backtest run not found")
@@ -1309,6 +1317,7 @@ def create_app(
     async def get_backtest_strategy_runs(run_id: str) -> list[dict[str, Any]]:
         if active_runner.pg_pool is None:
             raise HTTPException(status_code=503, detail="Runner PostgreSQL pool is not initialized")
+        _validate_backtest_run_id(run_id)
         return await list_backtest_strategy_runs(active_runner.pg_pool, run_id)
 
     @app.post(
@@ -1329,6 +1338,7 @@ def create_app(
     async def compare_backtest_run(run_id: str, request: Request) -> dict[str, Any]:
         if active_runner.pg_pool is None:
             raise HTTPException(status_code=503, detail="Runner PostgreSQL pool is not initialized")
+        _validate_backtest_run_id(run_id)
         try:
             raw_payload = await request.json()
             payload = ComparisonRequest.model_validate(raw_payload).model_dump(mode="json")
@@ -1340,7 +1350,7 @@ def create_app(
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (KeyError, TypeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post(
         "/feedback/{feedback_id}/resolve",
@@ -1562,7 +1572,15 @@ def create_app(
                 "available": False,
                 "reason": "decision_trace_unavailable",
             }
-        return {**evidence, "decision_id": decision_id, "available": True}
+        return {
+            **evidence,
+            "decision_id": decision_id,
+            "available": True,
+            "forecasts": trace.get("forecasts"),
+            "gates": trace.get("gates"),
+            "sizing": trace.get("sizing"),
+            "risk": trace.get("risk"),
+        }
 
     @app.post("/decisions/{decision_id}/risk-check", response_model=RiskCheckResponse, tags=["decision"], dependencies=[Depends(require_scope("read"))])
     async def decision_risk_check(decision_id: str) -> dict[str, Any]:
