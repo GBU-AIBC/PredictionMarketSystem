@@ -503,10 +503,6 @@ class PMSSettings(BaseSettings):
         token_ids = [item.token_id for item in self.api_tokens]
         if len(set(token_ids)) != len(token_ids):
             raise ValueError("API token IDs must be unique")
-        for item in self.api_tokens:
-            # A configured value is an env-var name, never a bearer secret.
-            if item.secret.startswith("Bearer ") or item.secret.startswith("sk-"):
-                raise ValueError("api_tokens.secret must be an environment variable name")
         return self
 
     @classmethod

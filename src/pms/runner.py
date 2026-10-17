@@ -1882,6 +1882,41 @@ class Runner:
                                 )
                             ),
                         )
+                        risk_manager = getattr(self.actuator_executor, "risk", None)
+                        risk_check = getattr(risk_manager, "check", None)
+                        risk_preview = (
+                            risk_check(decision, self.portfolio)
+                            if callable(risk_check)
+                            else None
+                        )
+                        decision_evidence["decision_trace"] = {
+                            "forecasts": {
+                                "model_id": decision.model_id,
+                                "prob_estimate": decision.prob_estimate,
+                                "expected_edge": decision.expected_edge,
+                            },
+                            "gates": {
+                                "status": "emitted",
+                                "factor_snapshot_hash": factor_snapshot_hash,
+                            },
+                            "sizing": {
+                                "notional_usdc": decision.notional_usdc,
+                                "limit_price": decision.limit_price,
+                                "max_slippage_bps": decision.max_slippage_bps,
+                            },
+                            "risk": {
+                                "approved": (
+                                    None
+                                    if risk_preview is None
+                                    else risk_preview.approved
+                                ),
+                                "reason": (
+                                    "unavailable"
+                                    if risk_preview is None
+                                    else risk_preview.reason
+                                ),
+                            },
+                        }
                         await self.decision_store.insert(
                             decision,
                             factor_snapshot_hash=factor_snapshot_hash,

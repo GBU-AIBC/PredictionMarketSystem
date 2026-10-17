@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
 import logging
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pms.core.enums import Venue
 from pms.core.exceptions import KalshiStubError  # noqa: F401
@@ -23,6 +25,35 @@ logger = logging.getLogger(__name__)
 
 class UserSubscriptionStore(Protocol):
     async def read_user_subscriptions(self) -> set[str]: ...
+
+
+SelectionReasonCode = Literal[
+    "selected",
+    "user_pin",
+    "cap",
+    "unresolved_market",
+    "venue",
+    "resolution_horizon",
+    "volume",
+    "accepting_orders",
+    "liquidity",
+    "yes_price_min",
+    "yes_price_max",
+    "spread",
+    "depth",
+    "not_selected",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class SelectionExplanation:
+    market_id: str
+    available: bool
+    reasons: tuple[SelectionReasonCode, ...]
+    strategy_ids: tuple[str, ...] = ()
+    token_ids: tuple[str, ...] = ()
+    pinned_token_ids: tuple[str, ...] = ()
+    capped: bool = False
 
 
 class MarketSelector:
@@ -108,6 +139,108 @@ class MarketSelector:
                 )
             )
         return selections
+
+    async def explain(
+        self,
+        market_id: str,
+        *,
+        max_subscription_asset_ids: int | None = None,
+    ) -> SelectionExplanation:
+        read_market = getattr(self._store, "read_market", None)
+        if not callable(read_market):
+            return SelectionExplanation(market_id, False, ("unresolved_market",))
+        market = await read_market(market_id)
+        if market is None:
+            return SelectionExplanation(market_id, True, ("unresolved_market",))
+        strategy_ids: list[str] = []
+        token_ids: list[str] = []
+        reasons: list[SelectionReasonCode] = []
+        specs = await self._registry.list_market_selections()
+        for strategy_id, _version_id, spec in specs:
+            strategy_ids.append(strategy_id)
+            reason = await self._explain_for_spec(market, spec)
+            if reason is not None:
+                reasons.append(reason)
+                continue
+            eligible = await self._store.read_eligible_markets(
+                spec.venue,
+                spec.resolution_time_max_horizon_days,
+                spec.volume_min_usdc,
+            )
+            for candidate, tokens in eligible:
+                if candidate.condition_id == market_id:
+                    token_ids.extend(
+                        token.token_id
+                        for token in tokens
+                        if token.outcome in {"YES", "NO"}
+                    )
+                    break
+        pinned = tuple(sorted(await self._read_user_subscriptions()))
+        token_ids = list(dict.fromkeys(token_ids))
+        if pinned and any(token_id in pinned for token_id in token_ids):
+            reasons.append("user_pin")
+        if max_subscription_asset_ids is not None and token_ids:
+            capped = len(token_ids) > max_subscription_asset_ids
+            if capped:
+                reasons.append("cap")
+        else:
+            capped = False
+        if not reasons:
+            reasons.append("selected" if token_ids else "not_selected")
+        return SelectionExplanation(
+            market_id=market_id,
+            available=True,
+            reasons=tuple(dict.fromkeys(reasons)),
+            strategy_ids=tuple(strategy_ids),
+            token_ids=tuple(token_ids),
+            pinned_token_ids=tuple(token_id for token_id in pinned if token_id in token_ids),
+            capped=capped,
+        )
+
+    async def _explain_for_spec(
+        self,
+        market: Market,
+        spec: MarketSelectionSpec,
+    ) -> SelectionReasonCode | None:
+        market_venue = getattr(market.venue, "value", market.venue)
+        if normalize_venue(spec.venue, context="MarketSelector.explain") != market_venue:
+            return "venue"
+        if spec.resolution_time_max_horizon_days is not None:
+            if market.resolves_at is None:
+                return "resolution_horizon"
+            horizon = market.resolves_at - datetime.now(tz=UTC)
+            if horizon.total_seconds() > spec.resolution_time_max_horizon_days * 86400:
+                return "resolution_horizon"
+        if market.volume_24h is None or market.volume_24h < spec.volume_min_usdc:
+            return "volume"
+        if spec.accepting_orders and market.accepting_orders is False:
+            return "accepting_orders"
+        if spec.liquidity_min_usdc is not None and (
+            market.liquidity is None or market.liquidity < spec.liquidity_min_usdc
+        ):
+            return "liquidity"
+        if spec.yes_price_min is not None and (
+            market.yes_price is None or market.yes_price < spec.yes_price_min
+        ):
+            return "yes_price_min"
+        if spec.yes_price_max is not None and (
+            market.yes_price is None or market.yes_price > spec.yes_price_max
+        ):
+            return "yes_price_max"
+        if spec.spread_max_bps is None and spec.depth_min_usdc is None:
+            return None
+        summary = await self._store.get_latest_book_summary(market.condition_id)
+        if summary is None:
+            if not _market_passes_discovery_bootstrap_filters(market, spec):
+                if spec.spread_max_bps is not None:
+                    return "spread"
+                return "depth"
+            return None
+        if spec.spread_max_bps is not None and summary.spread_bps > spec.spread_max_bps:
+            return "spread"
+        if spec.depth_min_usdc is not None and summary.depth_usdc < spec.depth_min_usdc:
+            return "depth"
+        return None
 
     async def _filter_markets(
         self,

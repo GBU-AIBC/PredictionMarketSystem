@@ -22,7 +22,6 @@ SCOPES = frozenset({"read", "research", "paper_operate", "kill", "live_admin"})
 class AuthPrincipal:
     token_id: str
     scopes: frozenset[str]
-    legacy: bool = False
 
 
 def _redact_authorization_header(value: str | None) -> str | None:
@@ -89,7 +88,7 @@ def _principal_for_request(request: Request) -> AuthPrincipal | None:
         _raise_unauthorized(request)
 
     if settings.api_token and secrets.compare_digest(stripped_token, settings.api_token):
-        return AuthPrincipal("legacy", frozenset(SCOPES), legacy=True)
+        return AuthPrincipal("legacy", frozenset(SCOPES))
     for configured in settings.api_tokens:
         try:
             expected = configured.resolved_secret()
