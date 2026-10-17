@@ -260,7 +260,9 @@ def test_factor_definition_version_downgrade_rejects_duplicate_versions() -> Non
         assert downgrade.returncode != 0
         assert "coexisting definition versions" in downgrade.stderr
         current = _run_alembic(temp_database_url, "current")
-        assert "0024_factor_def_version_w1b" in current.stdout
+        # The failed guarded downgrade rolls back as one transaction, so the
+        # database stays at the Wave 1 merge head.
+        assert "0025_merge_wave1_heads" in current.stdout
         column = _run_psql(
             temp_database_url,
             "-At",
