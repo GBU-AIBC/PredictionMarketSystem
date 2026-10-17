@@ -59,8 +59,9 @@ class EvalSpec:
     slippage_threshold_bps: float = DEFAULT_SLIPPAGE_THRESHOLD_BPS
     min_win_rate: float = DEFAULT_MIN_WIN_RATE
     min_brier_samples: ClassVar[int] = 20
-    min_slippage_samples: ClassVar[int] = 1
-    min_win_rate_samples: ClassVar[int] = 1
+    # Feedback thresholds must not react to a single noisy fill by default.
+    min_slippage_samples: ClassVar[int] = 20
+    min_win_rate_samples: ClassVar[int] = 20
 
     def __init__(
         self,
@@ -70,8 +71,8 @@ class EvalSpec:
         min_win_rate: float = DEFAULT_MIN_WIN_RATE,
         *,
         min_brier_samples: int = 20,
-        min_slippage_samples: int = 1,
-        min_win_rate_samples: int = 1,
+        min_slippage_samples: int = 20,
+        min_win_rate_samples: int = 20,
     ) -> None:
         object.__setattr__(self, "metrics", metrics)
         object.__setattr__(self, "max_brier_score", max_brier_score)

@@ -123,7 +123,11 @@ def _default_strategy_config_json() -> str:
             max_daily_drawdown_pct=2.5,
             min_order_size_usdc=1.0,
         ),
-        EvalSpec(metrics=("brier", "pnl", "fill_rate")),
+        EvalSpec(
+            metrics=("brier", "pnl", "fill_rate"),
+            min_slippage_samples=1,
+            min_win_rate_samples=1,
+        ),
         ForecasterSpec(
             forecasters=(
                 ("rules", (("threshold", "0.55"),)),
@@ -165,7 +169,11 @@ def _strategy(*, drawdown_pct: float) -> Strategy:
             max_daily_drawdown_pct=drawdown_pct,
             min_order_size_usdc=1.0,
         ),
-        eval_spec=EvalSpec(metrics=("brier", "pnl", "fill_rate")),
+        eval_spec=EvalSpec(
+            metrics=("brier", "pnl", "fill_rate"),
+            min_slippage_samples=1,
+            min_win_rate_samples=1,
+        ),
         forecaster=ForecasterSpec(
             forecasters=(
                 ("rules", (("threshold", "0.55"),)),

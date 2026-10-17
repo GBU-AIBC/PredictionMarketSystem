@@ -3972,7 +3972,14 @@ def _default_active_strategy(settings: PMSSettings) -> ActiveStrategy:
         ),
         min_order_size_usdc=settings.risk.min_order_usdc,
     )
-    eval_spec = EvalSpec(metrics=("brier", "pnl", "fill_rate"))
+    # The built-in paper controller keeps its historical one-fill alert
+    # behavior; user-defined EvalSpec instances default to a guarded sample
+    # window.  Explicit strategy configs can opt into the same threshold.
+    eval_spec = EvalSpec(
+        metrics=("brier", "pnl", "fill_rate"),
+        min_slippage_samples=1,
+        min_win_rate_samples=1,
+    )
     forecaster = ForecasterSpec(
         forecasters=(
             ("rules", (("threshold", "0.55"),)),

@@ -58,8 +58,8 @@ def _payload_value(value: Any) -> Any:
         payload = asdict(value, dict_factory=_sorted_dict_factory)
         for key, default in (
             ("min_brier_samples", 20),
-            ("min_slippage_samples", 1),
-            ("min_win_rate_samples", 1),
+            ("min_slippage_samples", 20),
+            ("min_win_rate_samples", 20),
         ):
             configured = getattr(value, key, default)
             if configured != default:
