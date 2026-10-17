@@ -55,3 +55,13 @@ class TimeInForce(StrEnum):
     GTC = "GTC"
     IOC = "IOC"
     FOK = "FOK"
+
+
+class ReasonCode(StrEnum):
+    """Stable reason/status names shared by decision and execution paths."""
+
+    SUBMISSION_UNKNOWN = "submission_unknown"
+    OPERATOR_GATE_DENIED = "operator_gate_denied"
+    LIVE_DISABLED = "live_disabled"
+    STALE_FACTOR = "stale_factor"
+    NON_FINITE = "non_finite"

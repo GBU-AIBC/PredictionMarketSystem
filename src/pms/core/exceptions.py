@@ -11,3 +11,15 @@ class KalshiStubError(NotImplementedError):
 
 class SensorDataQualityError(RuntimeError):
     """Raised when sensor input quality degrades beyond the configured threshold."""
+
+
+class DomainValidationError(ValueError):
+    """Raised when a numeric value cannot satisfy a core domain contract."""
+
+
+class NonFiniteValueError(DomainValidationError):
+    """Raised when a numeric value is NaN or infinite."""
+
+
+class OutOfDomainValueError(DomainValidationError):
+    """Raised when a finite numeric value is outside its allowed domain."""
