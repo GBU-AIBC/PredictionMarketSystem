@@ -27,6 +27,7 @@ from pms.core.models import (
     Position,
     TradeDecision,
 )
+from pms.core.validation import normalize_resolved_outcome
 from pms.evaluation.metrics import StrategyVersionKey
 from pms.research.entities import PortfolioTarget, serialize_portfolio_target_json
 from pms.research.execution import BacktestExecutionSimulator
@@ -566,6 +567,17 @@ class BacktestRunner:
                 exec_config=claimed_run.exec_config,
             )
             accumulators.append(accumulator)
+        missing_labels = [
+            accumulator.strategy_id
+            for accumulator in accumulators
+            if accumulator.decision_count > 0
+            and accumulator.fills_with_resolution == 0
+        ]
+        if missing_labels:
+            raise ValueError(
+                "required resolution labels missing for strategy runs: "
+                + ", ".join(missing_labels)
+            )
         # atomic persist: either every strategy_runs row lands or none — prevents
         # partial success leaking into reports when a later strategy raises.
         await self._insert_strategy_runs_atomically(
@@ -593,6 +605,7 @@ class BacktestRunner:
         order_decisions: dict[str, TradeDecision] = {}
 
         async for signal in replay_engine.stream(spec, exec_config):
+            scoring_signal = _signal_with_replay_resolution(signal, replay_engine)
             slice_descriptors = _slice_descriptors(
                 signal=signal,
                 spec=spec,
@@ -618,7 +631,7 @@ class BacktestRunner:
                 fill = _fill_from_order(
                     advanced_state,
                     decision=decision_for_fill,
-                    signal=signal,
+                    signal=scoring_signal,
                     prior_filled_notional_usdc=prior_notional,
                     prior_filled_quantity=prior_quantity,
                     execution_model=spec.execution_model,
@@ -627,7 +640,7 @@ class BacktestRunner:
                     continue
                 portfolio = _portfolio_with_fill(portfolio, fill)
                 accumulator.record_fill(
-                    signal=signal,
+                    signal=scoring_signal,
                     decision=decision_for_fill,
                     fill=fill,
                 )
@@ -649,13 +662,13 @@ class BacktestRunner:
                 continue
             opportunity, decision = emission
             accumulator.record_decision(
-                signal=signal,
+                signal=scoring_signal,
                 opportunity=opportunity,
                 decision=decision,
             )
             for slice_descriptor in slice_descriptors:
                 accumulator.record_slice_decision(
-                    signal=signal,
+                    signal=scoring_signal,
                     opportunity=opportunity,
                     decision=decision,
                     slice_descriptor=slice_descriptor,
@@ -1230,10 +1243,23 @@ def _slug_fragment(value: str) -> str:
 
 
 def _resolved_outcome(signal: MarketSignal) -> float | None:
-    value = signal.external_signal.get("resolved_outcome")
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    return None
+    return normalize_resolved_outcome(signal.external_signal.get("resolved_outcome"))
+
+
+def _signal_with_replay_resolution(
+    signal: MarketSignal,
+    replay_engine: object,
+) -> MarketSignal:
+    resolver = getattr(replay_engine, "resolution_for", None)
+    if not callable(resolver):
+        return signal
+    resolved = normalize_resolved_outcome(resolver(signal.market_id))
+    if resolved is None:
+        return signal
+    return replace(
+        signal,
+        external_signal={**signal.external_signal, "resolved_outcome": resolved},
+    )
 
 
 def _pnl_delta(

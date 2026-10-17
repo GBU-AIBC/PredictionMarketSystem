@@ -523,6 +523,18 @@ def _strategy_from_config_json(raw_value: object) -> Strategy:
                 eval_spec_payload.get("min_win_rate", DEFAULT_MIN_WIN_RATE),
                 "eval_spec.min_win_rate",
             ),
+            min_brier_samples=_json_int(
+                eval_spec_payload.get("min_brier_samples", 20),
+                "eval_spec.min_brier_samples",
+            ),
+            min_slippage_samples=_json_int(
+                eval_spec_payload.get("min_slippage_samples", 1),
+                "eval_spec.min_slippage_samples",
+            ),
+            min_win_rate_samples=_json_int(
+                eval_spec_payload.get("min_win_rate_samples", 1),
+                "eval_spec.min_win_rate_samples",
+            ),
         ),
         forecaster=ForecasterSpec(
             forecasters=tuple(
@@ -879,3 +891,9 @@ def _json_float(value: object, field_name: str) -> float:
         msg = f"{field_name} must decode to a finite float"
         raise ValueError(msg)
     return decoded
+
+
+def _json_int(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return value

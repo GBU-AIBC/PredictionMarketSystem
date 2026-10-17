@@ -210,10 +210,14 @@ class LLMSettings(BaseModel):
     api_key: str | None = None
     base_url: str | None = None
     model: str = "claude-sonnet-4-6"
+    prompt_version: str = "v1"
     timeout_s: float = Field(default=5.0, gt=0)
     cache_ttl_s: float = Field(default=30.0, ge=0)
     max_tokens: int = Field(default=256, gt=0)
     max_daily_llm_cost_usdc: float | None = Field(default=5.0, gt=0)
+    max_retries: int = Field(default=0, ge=0, le=2)
+    input_price_usdc_per_million_tokens: float = Field(default=0.0, ge=0.0)
+    output_price_usdc_per_million_tokens: float = Field(default=0.0, ge=0.0)
 
     @model_validator(mode="after")
     def _validate_when_enabled(self) -> Self:

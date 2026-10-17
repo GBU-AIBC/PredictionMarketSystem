@@ -4,7 +4,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from math import isfinite
 from typing import Protocol, cast
@@ -58,6 +58,7 @@ class EvalSpool:
         default_factory=asyncio.Queue,
     )
     _task: asyncio.Task[None] | None = None
+    _fills_by_decision: dict[str, FillRecord] = field(default_factory=dict)
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -108,12 +109,18 @@ class EvalSpool:
                 decision_evidence,
             )
             return False
+        fill = self._aggregate_fill(fill)
+        if fill.status == "partial":
+            # Hold partial execution until the terminal fill arrives so the
+            # durable row is written once with the decision's full quantity.
+            return False
         scored_record = self.scorer.score(
             fill,
             decision,
             baseline_prob_estimates=_baseline_prob_estimates_from_evidence(
                 decision_evidence,
             ),
+            category=_category_from_evidence(decision_evidence),
         )
         # Persist before pushing: restart re-hydration reads the eval store,
         # so a record must never feed a calibrator unless it is also durable.
@@ -132,6 +139,38 @@ class EvalSpool:
         except Exception:  # noqa: BLE001
             logger.exception("feedback generation failed in evaluator spool")
         return inserted
+
+    def _aggregate_fill(self, fill: FillRecord) -> FillRecord:
+        """Coalesce partial fills so one decision is scored on total execution."""
+        prior = self._fills_by_decision.get(fill.decision_id)
+        if prior is None:
+            self._fills_by_decision[fill.decision_id] = fill
+            return fill
+        total_notional = prior.fill_notional_usdc + fill.fill_notional_usdc
+        total_quantity = prior.fill_quantity + fill.fill_quantity
+        if total_quantity <= 0.0:
+            return prior
+        weighted_price = (
+            prior.fill_price * prior.fill_quantity
+            + fill.fill_price * fill.fill_quantity
+        ) / total_quantity
+        fees = (prior.fees or 0.0) + (fill.fees or 0.0)
+        aggregated = replace(
+            fill,
+            fill_price=weighted_price,
+            fill_notional_usdc=total_notional,
+            fill_quantity=total_quantity,
+            fees=fees,
+            fee_bps=fill.fee_bps or prior.fee_bps,
+            status=(
+                fill.status
+                if fill.status == "matched" or prior.status != "matched"
+                else prior.status
+            ),
+            trade_id=f"{prior.trade_id},{fill.trade_id}",
+        )
+        self._fills_by_decision[fill.decision_id] = aggregated
+        return aggregated
 
     async def _run(self) -> None:
         while True:
@@ -219,6 +258,18 @@ def _baseline_prob_estimates_from_evidence(
         if probability is not None:
             baselines[baseline_source] = probability
     return baselines
+
+
+def _category_from_evidence(
+    decision_evidence: Mapping[str, object] | None,
+) -> str | None:
+    if decision_evidence is None:
+        return None
+    for key in ("category", "market_category"):
+        value = decision_evidence.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def _probability_or_none(value: object) -> float | None:

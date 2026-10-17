@@ -24,6 +24,7 @@ from pms.core.models import (
     Trade,
     Venue,
 )
+from pms.core.validation import normalize_resolved_outcome
 from pms.research.specs import BacktestExecutionConfig, BacktestSpec
 
 
@@ -51,6 +52,7 @@ class _MarketMetadata:
     title: str
     venue: Venue
     resolves_at: datetime | None
+    resolved_outcome: float | None = None
 
 
 @dataclass(slots=True)
@@ -154,6 +156,10 @@ class MarketUniverseReplayEngine:
             raise LookupError(msg)
         return _clone_signal(checkpoints[-1].signal)
 
+    def resolution_for(self, market_id: str) -> float | None:
+        metadata = self._market_metadata_cache.get(market_id)
+        return None if metadata is None else metadata.resolved_outcome
+
     async def _ensure_materialized(
         self,
         *,
@@ -251,7 +257,9 @@ class MarketUniverseReplayEngine:
             if explicit_market_ids:
                 rows = await connection.fetch(
                     """
-                    SELECT condition_id, question, venue, resolves_at
+                    SELECT condition_id, question, venue, resolves_at, closed,
+                           yes_price, no_price,
+                           (to_jsonb(markets)->>'resolved_outcome') AS resolved_outcome
                     FROM markets
                     WHERE condition_id = ANY($1::text[])
                       AND ($2::text IS NULL OR venue = $2)
@@ -263,7 +271,9 @@ class MarketUniverseReplayEngine:
             else:
                 rows = await connection.fetch(
                     """
-                    SELECT condition_id, question, venue, resolves_at
+                    SELECT condition_id, question, venue, resolves_at, closed,
+                           yes_price, no_price,
+                           (to_jsonb(markets)->>'resolved_outcome') AS resolved_outcome
                     FROM markets
                     WHERE ($1::text IS NULL OR venue = $1)
                     ORDER BY condition_id ASC
@@ -278,6 +288,7 @@ class MarketUniverseReplayEngine:
                 title=cast(str, row["question"]),
                 venue=cast(Venue, row["venue"]),
                 resolves_at=cast(datetime | None, row["resolves_at"]),
+                resolved_outcome=_market_resolution_label(row),
             )
             for row in rows
         }
@@ -394,6 +405,26 @@ def _load_jsonl_source(
     return filtered_metadata, events
 
 
+def _market_resolution_label(row: Any) -> float | None:
+    raw_label = row.get("resolved_outcome") if hasattr(row, "get") else None
+    label = normalize_resolved_outcome(raw_label)
+    if label is not None:
+        return label
+    closed = row.get("closed") if hasattr(row, "get") else None
+    if closed is not True:
+        return None
+    try:
+        yes_price = float(row.get("yes_price"))
+        no_price = float(row.get("no_price"))
+    except (TypeError, ValueError):
+        return None
+    if yes_price >= 0.999 and no_price <= 0.001:
+        return 1.0
+    if no_price >= 0.999 and yes_price <= 0.001:
+        return 0.0
+    return None
+
+
 def _parse_jsonl_events(path: Path) -> tuple[dict[str, _MarketMetadata], list[_ReplayEvent]]:
     market_metadata: dict[str, _MarketMetadata] = {}
     events: list[_ReplayEvent] = []
@@ -431,6 +462,7 @@ def _parse_jsonl_events(path: Path) -> tuple[dict[str, _MarketMetadata], list[_R
                 title=str(row.get("title") or market_id),
                 venue=cast(Venue, str(row.get("venue") or "polymarket")),
                 resolves_at=_optional_datetime(row.get("resolves_at")),
+                resolved_outcome=normalize_resolved_outcome(row.get("resolved_outcome")),
             ),
         )
 
@@ -678,6 +710,9 @@ def _market_signal(
     external_signal = {"raw_event_type": event_type}
     if extra is not None:
         external_signal.update(extra)
+    # Resolution labels are joined from the market metadata at replay load
+    # time. They are only evidence for post-run scoring; controller prompt
+    # construction strips this key and never uses it for forecasting.
     return MarketSignal(
         market_id=state.market_id,
         token_id=state.token_id,

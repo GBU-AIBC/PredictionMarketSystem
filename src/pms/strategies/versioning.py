@@ -54,6 +54,17 @@ def _payload_value(value: Any) -> Any:
         if payload.get("yes_price_max") is None:
             del payload["yes_price_max"]
         return _payload_value(payload)
+    if isinstance(value, EvalSpec):
+        payload = asdict(value, dict_factory=_sorted_dict_factory)
+        for key, default in (
+            ("min_brier_samples", 20),
+            ("min_slippage_samples", 1),
+            ("min_win_rate_samples", 1),
+        ):
+            configured = getattr(value, key, default)
+            if configured != default:
+                payload[key] = configured
+        return _payload_value(payload)
     if is_dataclass(value) and not isinstance(value, type):
         return _payload_value(asdict(value, dict_factory=_sorted_dict_factory))
     if isinstance(value, dict):

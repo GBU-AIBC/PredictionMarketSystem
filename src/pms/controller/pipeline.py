@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
+import inspect
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -319,6 +320,7 @@ class ControllerPipeline:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         probabilities: list[float] = []
+        confidence_weights: list[float] = []
         model_ids: list[str] = []
         rationales: list[str] = []
         runtime_probabilities: dict[str, float] = {}
@@ -331,14 +333,18 @@ class ControllerPipeline:
                 logger.warning("forecaster failed: %s", result)
                 continue
             if result is None:
+                if isinstance(forecaster, LLMForecaster):
+                    self._set_drop_diagnostic(
+                        signal,
+                        code="llm_budget_exhausted",
+                        message="LLM forecaster produced no usable forecast.",
+                        severity="info",
+                    )
                 continue
             model_id = _model_id(result, forecaster)
-            calibrated_probability = calibrator.calibrate(
-                float(result[0]),
-                model_id=model_id,
-            )
             model_ids.append(model_id)
-            probabilities.append(calibrated_probability)
+            probabilities.append(float(result[0]))
+            confidence_weights.append(max(0.0, min(1.0, float(result[1]))))
             if result[2]:
                 rationales.append(f"{model_id}:{result[2]}")
             runtime_factor_id = _runtime_factor_id(
@@ -348,7 +354,7 @@ class ControllerPipeline:
                 result,
                 model_id=model_id,
             ):
-                runtime_probabilities[runtime_factor_id] = calibrated_probability
+                runtime_probabilities[runtime_factor_id] = float(result[0])
 
         has_factor_composition = bool(
             self.strategy is not None and self.strategy.config.factor_composition
@@ -371,7 +377,7 @@ class ControllerPipeline:
             return None
 
         prob_estimate = (
-            sum(probabilities) / len(probabilities)
+            _weighted_probability(probabilities, confidence_weights)
             if probabilities
             else signal.yes_price
         )
@@ -442,10 +448,9 @@ class ControllerPipeline:
                     factor_values,
                 )
                 if (
-                    self.settings.mode != RunMode.LIVE
+                    self.settings.mode == RunMode.BACKTEST
                     and not branch_probabilities
                     and unresolved_missing_factors
-                    and "resolved_outcome" in signal.external_signal
                 ):
                     prob_estimate = 0.5
                 else:
@@ -798,10 +803,12 @@ class ControllerPipeline:
                 emitted_count=0,
             )
             return None
-        size = sizer.size(
+        size = _size_with_costs(
+            sizer,
             prob=decision_probability,
             market_price=decision_price,
             portfolio=active_portfolio,
+            cost_edge=decision_costs.total_edge if self.strategy is not None else 0.0,
         )
         market_exposure_usdc = _market_exposure_usdc(
             active_portfolio,
@@ -1187,11 +1194,28 @@ class ControllerPipeline:
     ) -> ForecastResult | None:
         async_predict = getattr(forecaster, "apredict", None)
         if callable(async_predict) and not _predict_method_overridden(forecaster):
-            return await cast(
-                Callable[[MarketSignal], Awaitable[ForecastResult | None]],
-                async_predict,
-            )(signal)
-        return await asyncio.to_thread(forecaster.predict, signal)
+            try:
+                return await asyncio.wait_for(
+                    cast(
+                        Callable[[MarketSignal], Awaitable[ForecastResult | None]],
+                        async_predict,
+                    )(signal),
+                    timeout=self.settings.llm.timeout_s,
+                )
+            except TimeoutError:
+                return None
+        timeout_s = self.settings.llm.timeout_s
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(forecaster.predict, signal),
+                timeout=timeout_s,
+            )
+        except TimeoutError:
+            logger.info(
+                "forecaster timed out; skipping late forecast",
+                extra={"forecaster": type(forecaster).__name__, "market_id": signal.market_id},
+            )
+            return None
 
 
 def _apply_pre_calibrators(
@@ -1210,27 +1234,59 @@ def _apply_pre_calibrators(
         resolved_sample_count=_resolved_sample_count(calibrator, model_ids),
         model_id=_decision_model_id(model_ids) or "unknown",
     )
-    current: float | None = raw_prob
-    for pre_calibrator in _pre_calibrators(spec):
-        if current is None:
-            return None
-        next_prob = pre_calibrator.calibrate(current, context=context)
-        if next_prob is None:
-            logger.info(
-                "calibration clamp rejected forecast for %s",
-                signal.market_id,
-                extra={
-                    "event": "clamp_rejection",
-                    "market_id": signal.market_id,
-                    "raw_prob": raw_prob,
-                    "calibrated_prob": current,
-                    "clamp_action": "reject",
-                    "resolved_sample_count": context.resolved_sample_count,
-                },
-            )
-            return None
-        current = next_prob
+    # Calibration is keyed by the decision-level ensemble and receives the
+    # same shrunk coordinate that reaches TradeDecision/EvalRecord.
+    current = LogitShrinkageCalibrator(spec).calibrate(raw_prob, context=context)
+    if current is None:
+        return None
+    current = calibrator.calibrate(current, model_id=context.model_id)
+    next_prob = ExtremeProbClamp(spec).calibrate(current, context=context)
+    if next_prob is None:
+        logger.info(
+            "calibration clamp rejected forecast for %s",
+            signal.market_id,
+            extra={
+                "event": "clamp_rejection",
+                "market_id": signal.market_id,
+                "raw_prob": raw_prob,
+                "calibrated_prob": current,
+                "clamp_action": "reject",
+                "resolved_sample_count": context.resolved_sample_count,
+            },
+        )
+        return None
+    current = next_prob
     return current
+
+
+def _weighted_probability(probabilities: Sequence[float], weights: Sequence[float]) -> float:
+    if not probabilities:
+        return 0.5
+    effective = [weight if weight > 0.0 else 0.1 for weight in weights]
+    total = sum(effective)
+    if total <= 0.0:
+        return sum(probabilities) / len(probabilities)
+    return sum(probability * weight for probability, weight in zip(probabilities, effective, strict=True)) / total
+
+
+def _size_with_costs(
+    sizer: ISizer,
+    *,
+    prob: float,
+    market_price: float,
+    portfolio: Portfolio,
+    cost_edge: float,
+) -> float:
+    parameters = inspect.signature(sizer.size).parameters
+    kwargs: dict[str, object] = {
+        "prob": prob,
+        "market_price": market_price,
+        "portfolio": portfolio,
+    }
+    if "cost_edge" in parameters:
+        kwargs["cost_edge"] = cost_edge
+    size_fn = cast(Callable[..., float], sizer.size)
+    return size_fn(**kwargs)
 
 
 def _pre_calibrators(spec: CalibrationSpec) -> tuple[IPreCalibrator, ...]:

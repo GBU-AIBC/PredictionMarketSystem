@@ -19,6 +19,7 @@ class Scorer:
         decision: TradeDecision,
         *,
         baseline_prob_estimates: Mapping[str, object] | None = None,
+        category: str | None = None,
     ) -> EvalRecord:
         if fill.resolved_outcome is None:
             raise ValueError("FillRecord.resolved_outcome is required for scoring")
@@ -59,7 +60,7 @@ class Scorer:
             fill_status=fill.status,
             recorded_at=datetime.now(tz=UTC),
             citations=[fill.trade_id],
-            category=model_id,
+            category=category or "unknown",
             model_id=model_id,
             pnl=_pnl(fill, decision),
             slippage_bps=_slippage_bps(fill, decision),

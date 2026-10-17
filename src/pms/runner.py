@@ -4557,6 +4557,9 @@ def _decision_evidence_from_signal(
         "decision_side": decision.side,
         "venue": signal.venue,
         "market_status": signal.market_status,
+        "category": _optional_text(
+            signal.external_signal.get("category")
+        ) or _optional_text(signal.external_signal.get("market_category")),
         "signal_fetched_at": signal.fetched_at.isoformat(),
         "yes_price": canonical_yes_price,
         "direct_token_price": signal.yes_price,

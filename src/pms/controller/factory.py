@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import cast
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -131,14 +132,21 @@ def _build_forecaster(
             prior_strength=2.0 if prior_strength is None else float(prior_strength),
         )
     if name == "llm":
-        if raw_params:
-            msg = (
-                "LLMForecaster does not yet accept per-strategy params: "
-                f"{raw_params!r}"
+        allowed = {"model", "provider", "prompt_version", "max_tokens"}
+        unknown = set(params) - allowed
+        if unknown:
+            raise ValueError(
+                "LLMForecaster does not yet accept per-strategy params "
+                f"{sorted(unknown)!r}"
             )
-            raise ValueError(msg)
-        validate_llm_runtime_dependencies(settings.llm)
-        return LLMForecaster(config=settings.llm)
+        updates: dict[str, object] = {
+            key: value for key, value in params.items() if key in allowed
+        }
+        if "max_tokens" in updates:
+            updates["max_tokens"] = int(cast(str, updates["max_tokens"]))
+        llm_config = settings.llm.model_copy(update=updates)
+        validate_llm_runtime_dependencies(llm_config)
+        return LLMForecaster(config=llm_config)
     if name == "flb":
         if raw_params:
             msg = (
