@@ -424,6 +424,42 @@ Changing mode through `POST /config` requires a stopped runner. Changing to
 `live` is guarded by the same candidate LIVE validation and credentialed
 preflight artifact check as startup.
 
+## MCP proxy for Claude Code and Codex
+
+The optional `agent` extra installs the official MCP Python SDK and exposes a
+stdio server that forwards a curated, scoped tool set to the typed PMS HTTP
+API. The proxy has no trading logic and cannot start LIVE, switch mode, accept
+a live decision, clear a halt, or resolve an incident.
+
+```bash
+uv sync --extra agent
+export PMS_AGENT_API_BASE_URL=http://127.0.0.1:8000
+export PMS_AGENT_TOKEN='<configured agent token>'
+uv run pms-mcp
+```
+
+Claude Code can launch it from `.mcp.json` (keep the token in the process
+environment rather than checking it into the file):
+
+```json
+{
+  "mcpServers": {
+    "pms": {
+      "command": "uv",
+      "args": ["run", "--extra", "agent", "pms-mcp"],
+      "env": {
+        "PMS_AGENT_API_BASE_URL": "http://127.0.0.1:8000"
+      }
+    }
+  }
+}
+```
+
+For Codex, add the same command as a local MCP server in its MCP settings and
+set `PMS_AGENT_API_BASE_URL` and `PMS_AGENT_TOKEN` in the environment used by
+Codex. `PMS_MCP_BASE_URL`/`PMS_MCP_TOKEN` are accepted aliases for integrations
+that already use those names.
+
 ## Development
 
 ```bash

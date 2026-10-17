@@ -23,6 +23,7 @@ dependencies = [
 pms-api = "pms.api.__main__:main"
 pms-live = "pms.live_cli:main"
 pms-research = "pms.research.cli:main"
+pms-mcp = "pms.agent_mcp.server:main"
 
 [project.optional-dependencies]
 # CP05/P0-1: Provider SDKs power the optional LLM forecaster. Install with
@@ -30,6 +31,9 @@ pms-research = "pms.research.cli:main"
 # rule-based/statistical controller path does not require them.
 llm = ["anthropic>=0.40.0", "openai>=1.50.0"]
 live = ["py-clob-client-v2>=1.0.0,<2.0.0"]
+agent = [
+    "mcp==1.26.0",
+]
 
 [dependency-groups]
 dev = [
@@ -78,7 +82,7 @@ namespace_packages = true
 explicit_package_bases = true
 
 [[tool.mypy.overrides]]
-module = ["asyncpg"]
+module = ["asyncpg", "mcp.*"]
 ignore_missing_imports = true
 
 [tool.importlinter]
@@ -157,4 +161,14 @@ forbidden_modules = [
     "pms.actuator.adapters",
     "pms.controller",
     "py_clob_client_v2",
+]
+
+[[tool.importlinter.contracts]]
+name = "MCP proxy only calls the typed HTTP API"
+type = "forbidden"
+source_modules = ["pms.agent_mcp"]
+forbidden_modules = [
+    "pms.sensor",
+    "pms.controller",
+    "pms.actuator",
 ]
