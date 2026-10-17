@@ -1922,20 +1922,19 @@ class Runner:
                             "strategy_id": decision.strategy_id,
                             "strategy_version_id": decision.strategy_version_id,
                             "forecasts": {
-                                "results": [
-                                    {
-                                        "model_id": decision.model_id,
-                                        "prob_estimate": decision.prob_estimate,
-                                        "expected_edge": decision.expected_edge,
-                                    }
-                                ],
+                                "results": list(
+                                    getattr(runtime.controller, "last_forecaster_results", ())
+                                ),
                                 "model_id": decision.model_id,
                                 "prob_estimate": decision.prob_estimate,
                                 "expected_edge": decision.expected_edge,
                             },
                             "gates": {
                                 "status": "passed",
-                                "pre_actuator": "passed",
+                                "outcomes": list(
+                                    getattr(runtime.controller, "last_gate_outcomes", ())
+                                )
+                                + [{"name": "pre_actuator", "passed": True, "reason": None}],
                                 "strict_factor_gates": self.config.controller.strict_factor_gates,
                                 "factor_snapshot_hash": factor_snapshot_hash,
                             },

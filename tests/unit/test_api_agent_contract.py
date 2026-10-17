@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -12,6 +14,7 @@ from fastapi.routing import APIRoute
 from pydantic import ValidationError
 
 from pms.api.app import ComparisonRequest, _mark_to_market_payload, create_app
+from pms.api.research_routes import _time_alignment_policy
 from pms.config import PMSSettings
 from pms.config import _require_live_api_control_plane_auth
 from pms.core.enums import RunMode, Side, TimeInForce, Venue
@@ -59,7 +62,10 @@ def _client(app: Any, *, raise_app_exceptions: bool = True) -> httpx.AsyncClient
 
 
 @pytest.mark.asyncio
-async def test_scoped_tokens_enforce_dynamic_mode_and_kill_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_scoped_tokens_enforce_dynamic_mode_and_kill_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     monkeypatch.setenv("AGENT_PAPER_SECRET", "paper-secret")
     monkeypatch.setenv("AGENT_KILL_SECRET", "kill-secret")
     settings = PMSSettings(
@@ -68,6 +74,7 @@ async def test_scoped_tokens_enforce_dynamic_mode_and_kill_contract(monkeypatch:
             {"token_id": "agent-paper", "secret": "AGENT_PAPER_SECRET", "scopes": ["paper_operate"]},
             {"token_id": "agent-kill", "secret": "AGENT_KILL_SECRET", "scopes": ["kill"]},
         ]),
+        live_request_audit_fallback_path=str(tmp_path / "fallback.jsonl"),
         auto_migrate_default_v2=False,
     )
     runner = Runner(config=settings)
@@ -142,8 +149,15 @@ async def test_live_routes_require_live_admin_even_for_unconfigured_secret(
 async def test_live_routes_require_a_token_in_open_mode(
     path: str,
     kwargs: dict[str, Any],
+    tmp_path: Path,
 ) -> None:
-    runner = Runner(config=PMSSettings(mode=RunMode.LIVE, auto_migrate_default_v2=False))
+    runner = Runner(
+        config=PMSSettings(
+            mode=RunMode.LIVE,
+            live_request_audit_fallback_path=str(tmp_path / "fallback.jsonl"),
+            auto_migrate_default_v2=False,
+        )
+    )
     app = create_app(runner, auto_start=False)
     async with _client(app, raise_app_exceptions=False) as client:
         missing = await client.post(path, **kwargs)
@@ -253,6 +267,11 @@ def test_research_policy_rejects_non_finite_offsets(offset: float) -> None:
         )
 
 
+def test_research_decoder_rejects_non_finite_policy_values() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        _time_alignment_policy({"generated_offset_s": float("nan")})
+
+
 def test_scoped_live_admin_token_satisfies_live_control_plane_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LIVE_ADMIN_SECRET", "live-admin-secret")
     settings = PMSSettings(
@@ -270,10 +289,18 @@ async def test_legacy_token_fallback_and_token_id_spoofing_are_closed() -> None:
     app = create_app(runner, auto_start=False)
     async with _client(app) as client:
         headers = {"Authorization": "Bearer legacy-secret"}
-        assert (await client.post("/config?token_id=attacker", headers=headers, json={"mode": "paper"})).status_code == 422
+        before = len(pool.rows)
+        query_spoof = await client.post(
+            "/config?token_id=attacker", headers=headers, json={"mode": "paper"}
+        )
+        assert query_spoof.status_code == 422
+        assert len(pool.rows) == before + 1
+        assert pool.rows[-1][0] == "legacy"
+        assert pool.rows[-1][3] == "/config"
+        assert int(cast(int, pool.rows[-1][4])) == 422
         assert (await client.post("/config", headers=headers, json={"mode": "paper", "token_id": "attacker"})).status_code == 422
         assert (await client.post("/config", headers=headers, json={"mode": "paper"})).status_code == 200
-    assert any(int(cast(int, row[4])) == 422 for row in pool.rows)
+    assert sum(int(cast(int, row[4])) == 422 for row in pool.rows) == 2
 
 
 def test_routes_have_explicit_auth_or_public_exception_and_typed_openapi() -> None:
@@ -400,6 +427,7 @@ def test_generated_authorization_matrix_covers_every_route_and_scope() -> None:
 @pytest.mark.asyncio
 async def test_behavioral_authorization_matrix_issues_requests_in_both_modes(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Exercise the auth runtime independently of dependency declarations.
 
@@ -471,7 +499,6 @@ async def test_behavioral_authorization_matrix_issues_requests_in_both_modes(
         ("live_admin", "live-secret", frozenset({"live_admin"})),
         ("legacy", "legacy-secret", frozenset({"read", "research", "paper_operate", "kill", "live_admin"})),
     )
-    methods = {"GET", "POST", "DELETE"}
     public = {"/health", "/readiness", "/share/{strategy_id}"}
     route_keys = {
         (method, route.path)
@@ -536,6 +563,8 @@ async def test_behavioral_authorization_matrix_issues_requests_in_both_modes(
                     {"token_id": "kill", "secret": "MATRIX_KILL_SECRET", "scopes": ["kill"]},
                     {"token_id": "live", "secret": "MATRIX_LIVE_SECRET", "scopes": ["live_admin"]},
                 ]),
+                live_emergency_audit_path=str(tmp_path / "emergency.jsonl"),
+                live_request_audit_fallback_path=str(tmp_path / "fallback.jsonl"),
                 auto_migrate_default_v2=False,
             )
             runner = Runner(config=settings)
@@ -806,6 +835,31 @@ async def test_request_audit_records_success_auth_errors_validation_and_handler_
         assert (await client.post("/config", headers={"Authorization": "Bearer read-only-secret"}, json={"mode": "paper"})).status_code == 403
     assert {int(cast(int, row[4])) for row in pool.rows} >= {200, 401, 422, 500}
     assert {int(cast(int, row[4])) for row in read_pool.rows} == {403}
+
+
+@pytest.mark.asyncio
+async def test_live_preflight_records_declared_scope_and_halt_clear_identity(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(mode=RunMode.LIVE, api_token="legacy-secret").model_copy(
+        update={"live_emergency_audit_path": str(tmp_path / "emergency.jsonl")}
+    )
+    runner = Runner(config=settings)
+    pool = _RecordingPool()
+    runner.bind_pg_pool(cast(Any, pool))
+    app = create_app(runner, auto_start=False)
+    async with _client(app, raise_app_exceptions=False) as client:
+        response = await client.post(
+            "/live/halt/clear",
+            headers={"Authorization": "Bearer legacy-secret"},
+            json={"cleared_by": "operator"},
+        )
+    assert response.status_code == 200
+    assert pool.rows[0][0:5] == ("legacy", "live_admin", "POST", "/live/halt/clear", 102)
+    assert pool.rows[-1][0:5] == ("legacy", "live_admin", "POST", "/live/halt/clear", 200)
+    events = [json.loads(line) for line in (tmp_path / "emergency.jsonl").read_text().splitlines()]
+    assert events[-1]["event"] == "risk_halt_clear"
+    assert events[-1]["token_id"] == "legacy"
 
 
 @pytest.mark.asyncio

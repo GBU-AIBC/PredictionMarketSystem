@@ -137,6 +137,28 @@ def _decision() -> TradeDecision:
 class _OpportunityAwareControllerDouble:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.last_forecaster_results = [
+            {
+                "name": "rules",
+                "model_id": "rules-v1",
+                "status": "accepted",
+                "probability": 0.31,
+                "confidence": 0.8,
+                "rationale": "rules evidence",
+            },
+            {
+                "name": "llm",
+                "model_id": "llm-v2",
+                "status": "accepted",
+                "probability": 0.77,
+                "confidence": 0.6,
+                "rationale": "llm evidence",
+            },
+        ]
+        self.last_gate_outcomes = [
+            {"name": "router", "passed": True, "reason": None},
+            {"name": "factor_gates", "passed": True, "reason": None},
+        ]
 
     async def on_signal(
         self,
@@ -235,6 +257,7 @@ class _RecordingSweepStore:
 @pytest.mark.asyncio
 async def test_controller_pipeline_persists_and_enqueues_decision() -> None:
     runner = _runner()
+    runner.actuator_executor.risk.record_api_error(401, trace_id="trace-cp07")
     controller = _OpportunityAwareControllerDouble()
     queue: asyncio.Queue[MarketSignal] = asyncio.Queue()
     runner._controller_runtimes["default"] = StrategyControllerRuntime(
@@ -274,6 +297,13 @@ async def test_controller_pipeline_persists_and_enqueues_decision() -> None:
         "bids": [{"price": 0.4, "size": 20.0}],
         "asks": [{"price": 0.42, "size": 25.0}],
     }
+    trace = cast(dict[str, Any], decision_store.decision_evidence["decision_trace"])
+    assert trace["strategy_id"] == "default"
+    assert trace["strategy_version_id"] == "default-v1"
+    assert trace["forecasts"]["results"] == controller.last_forecaster_results
+    assert trace["gates"]["outcomes"][:2] == controller.last_gate_outcomes
+    assert trace["risk"]["halted"] is True
+    assert trace["risk"]["halt_reason"] == "api_credential_failure"
     assert decision_store.transitions == [
         (
             "decision-cp07",

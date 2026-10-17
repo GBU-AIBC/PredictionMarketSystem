@@ -1375,6 +1375,7 @@ async def test_api_run_start_stop_cycle(tmp_path: Path) -> None:
                 max_total_exposure=10_000.0,
             ),
             controller=ControllerSettings(strict_factor_gates=False),
+            live_request_audit_fallback_path=str(tmp_path / "api-request-audit-fallback.jsonl"),
         ),
         historical_data_path=FIXTURE_PATH,
         eval_store=cast(EvalStore, InMemoryEvalStore()),
@@ -1410,12 +1411,13 @@ async def test_api_run_start_stop_cycle(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_api_run_stop_keeps_reporting_pool_bound() -> None:
+async def test_api_run_stop_keeps_reporting_pool_bound(tmp_path: Path) -> None:
     runner = Runner(
         config=PMSSettings(
             mode=RunMode.PAPER,
             auto_migrate_default_v2=False,
             api_token="live-api-token",
+            live_request_audit_fallback_path=str(tmp_path / "api-request-audit-fallback.jsonl"),
         ),
         eval_store=cast(EvalStore, InMemoryEvalStore()),
         feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
