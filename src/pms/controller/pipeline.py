@@ -25,7 +25,11 @@ from pms.controller.factor_snapshot import (
     NullFactorSnapshotReader,
     required_factor_keys,
 )
-from pms.controller.forecasters.llm import LLMForecaster, durable_spend_ledger_path
+from pms.controller.forecasters.llm import (
+    LLMForecaster,
+    LLMReplayCacheMissError,
+    durable_spend_ledger_path,
+)
 from pms.controller.forecasters.rules import RulesForecaster
 from pms.controller.forecasters.statistical import StatisticalForecaster
 from pms.controller.outcome_tokens import (
@@ -152,8 +156,14 @@ class ControllerPipeline:
     settings: PMSSettings = field(default_factory=PMSSettings)
     last_diagnostic: ControllerDiagnostic | None = field(init=False, default=None)
     last_execution_signal: MarketSignal | None = field(init=False, default=None)
-    last_forecaster_results: list[dict[str, object]] = field(init=False, default_factory=list)
-    last_gate_outcomes: list[dict[str, object]] = field(init=False, default_factory=list)
+    last_forecaster_results: list[dict[str, object]] = field(
+        init=False,
+        default_factory=list,
+    )
+    last_gate_outcomes: list[dict[str, object]] = field(
+        init=False,
+        default_factory=list,
+    )
     suppressed_zero_size: int = field(init=False, default=0)
     _last_decision_emitted_at: dict[tuple[str, str, str, str, str], datetime] = field(
         init=False,
@@ -298,7 +308,6 @@ class ControllerPipeline:
             return None
 
         self.last_gate_outcomes = [{"name": "router", "passed": True, "reason": None}]
-
         active_portfolio = portfolio or _default_portfolio()
         sizer = _required(self.sizer, "sizer")
         min_order_usdc = _effective_min_order_usdc(
@@ -351,12 +360,20 @@ class ControllerPipeline:
             zip(forecasters, results, strict=True)
         ):
             forecaster_name = (
-                forecaster_names[index] if index < len(forecaster_names) else type(forecaster).__name__
+                forecaster_names[index]
+                if index < len(forecaster_names)
+                else type(forecaster).__name__
             )
             if isinstance(result, BaseException):
                 self.last_forecaster_results.append(
-                    {"name": forecaster_name, "status": "error", "error_type": type(result).__name__}
+                    {
+                        "name": forecaster_name,
+                        "status": "error",
+                        "error_type": type(result).__name__,
+                    }
                 )
+                if isinstance(result, LLMReplayCacheMissError):
+                    raise result
                 logger.warning("forecaster failed: %s", result)
                 continue
             if result is None:
@@ -1287,9 +1304,21 @@ class ControllerPipeline:
         forecaster: IForecaster,
         signal: MarketSignal,
     ) -> ForecastResult | None:
+        replay_mode = (
+            isinstance(forecaster, LLMForecaster)
+            and forecaster.record_replay_mode == "replay"
+        )
         async_predict = getattr(forecaster, "apredict", None)
         if callable(async_predict) and not _predict_method_overridden(forecaster):
             try:
+                if isinstance(forecaster, LLMForecaster):
+                    pending_result = await asyncio.wait_for(
+                        forecaster.apredict(signal, defer_record=True),
+                        timeout=self.settings.llm.timeout_s,
+                    )
+                    if forecaster.record_replay_mode == "record":
+                        await forecaster.record_outcome(signal, pending_result)
+                    return pending_result
                 return await asyncio.wait_for(
                     cast(
                         Callable[[MarketSignal], Awaitable[ForecastResult | None]],
@@ -1297,15 +1326,41 @@ class ControllerPipeline:
                     )(signal),
                     timeout=self.settings.llm.timeout_s,
                 )
-            except TimeoutError:
+            except TimeoutError as exc:
+                if replay_mode:
+                    raise LLMReplayCacheMissError(
+                        "LLM replay timed out while reading the replay store"
+                    ) from exc
+                if isinstance(forecaster, LLMForecaster) and (
+                    forecaster.record_replay_mode == "record"
+                ):
+                    await forecaster.record_timeout(signal)
                 return None
+            except Exception:
+                if isinstance(forecaster, LLMForecaster) and (
+                    forecaster.record_replay_mode == "record"
+                ):
+                    await forecaster.record_outcome(
+                        signal,
+                        None,
+                        failure_reason=forecaster.last_failure_reason or "provider_error",
+                    )
+                raise
         timeout_s = self.settings.llm.timeout_s
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(forecaster.predict, signal),
                 timeout=timeout_s,
             )
-        except TimeoutError:
+        except TimeoutError as exc:
+            if replay_mode:
+                raise LLMReplayCacheMissError(
+                    "LLM replay timed out while reading the replay store"
+                ) from exc
+            if isinstance(forecaster, LLMForecaster) and (
+                forecaster.record_replay_mode == "record"
+            ):
+                await forecaster.record_timeout(signal)
             logger.info(
                 "forecaster timed out; skipping late forecast",
                 extra={"forecaster": type(forecaster).__name__, "market_id": signal.market_id},

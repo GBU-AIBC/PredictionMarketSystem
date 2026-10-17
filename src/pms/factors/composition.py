@@ -5,7 +5,7 @@ from math import isclose, isfinite
 from typing import Protocol
 
 from pms.core.validation import validate_finite
-from pms.factors.catalog import FACTOR_CATALOG_ROWS
+from pms.factors.catalog import FACTOR_CATALOG_ROWS, catalog_entry
 
 
 COMPOSITION_ROLES = frozenset(
@@ -323,11 +323,16 @@ def _rule_delta(
     *,
     market_price: float,
 ) -> float:
-    if factor_id == "metaculus_prior":
+    if _catalog_output_type(factor_id) == "probability":
         return factor_value - market_price
     if factor_id == "subset_pricing_violation":
         return -factor_value
     return factor_value
+
+
+def _catalog_output_type(factor_id: str) -> str | None:
+    entry = catalog_entry(factor_id)
+    return None if entry is None else entry.output_type
 
 
 def _first_runtime_probability(

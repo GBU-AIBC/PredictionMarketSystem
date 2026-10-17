@@ -130,10 +130,29 @@ Strategies compose raw factors; they do not create new ones inline
 | `orderbook_imbalance` | Signed `(bid_depth − ask_depth) / total_depth` |
 | `subset_pricing_violation` | Arbitrage-violating subset pricing |
 | `yes_count` | Per-market YES-side resolution sample count |
+| `agent_probability` | Paper-only probability submitted by an authenticated agent |
 
 For `imbalance_with_prior_v1` both required factors (`orderbook_imbalance`
 and `metaculus_prior`) already exist. Done. If you need a factor
 that does not exist, see §8 before continuing.
+
+### 3.1.1 Paper agent contribution example
+
+`build_paper_agent_probability_strategy()` in
+`src/pms/strategies/paper_multifactor.py` is the smallest installed example.
+It composes the required `agent_probability` rule delta (weight `1.0`,
+freshness SLA `300s`) with the optional `orderbook_imbalance` rule delta
+(weight `0.1`, the same SLA), and uses both the `rules` and `llm` forecasters.
+The LLM forecaster receives bounded, point-in-time agent evidence in PAPER and
+BACKTEST; evidence is omitted from LIVE prompts. The catalog row is owned by
+`agent:llm`, so observations are accepted only through the
+agent factor route and are read at the signal's point in time. Its metadata
+sets `live_allowed=false`; the controller loader also rejects any
+agent-owned factor in LIVE mode, so this flag is enforced at startup.
+Set `paper_soak_strategy_id=paper_agent_probability_v1` to install and activate
+this version through the normal Runner strategy registry; the Runner's
+`build_agent_evidence_source()` provides the point-in-time observation source
+against the same PostgreSQL store for plugin consumers.
 
 ### 3.2 Write `build_imbalance_with_prior_strategy()`
 
@@ -611,6 +630,11 @@ forecasters wired in `src/pms/controller/factory.py:98-135`:
 
 Multiple forecasters can run side-by-side; the `blend_weighted` role
 in `factor_composition` controls the weighted blend.
+
+PAPER LLM records use a shared PostgreSQL replay table; BACKTEST performs one
+indexed lookup per replay key. Rows are retained for each distinct prompt and
+may be pruned explicitly by recorded time during maintenance; no automatic
+pruning runs during paper or research forecasts.
 
 ### 5.4 `MarketSelectionSpec`
 

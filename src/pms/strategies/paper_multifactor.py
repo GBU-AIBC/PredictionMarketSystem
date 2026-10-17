@@ -12,6 +12,7 @@ from pms.strategies.projections import (
 )
 
 PAPER_MULTI_FACTOR_STRATEGY_ID = "paper_multi_factor_v1"
+PAPER_AGENT_PROBABILITY_STRATEGY_ID = "paper_agent_probability_v1"
 _FACTOR_FRESHNESS_S = 300.0
 _ORDERBOOK_IMBALANCE_MIN_ABS = 0.80
 _ORDERBOOK_IMBALANCE_EDGE_SCALE = 0.25
@@ -127,5 +128,55 @@ def build_paper_multi_factor_strategy() -> Strategy:
             extreme_clamp_low=0.08,
             extreme_clamp_high=0.92,
             min_resolved_for_extreme=20,
+        ),
+    )
+
+
+def build_paper_agent_probability_strategy() -> Strategy:
+    """Small paper-only composition used by the agent contribution path."""
+    return Strategy(
+        config=StrategyConfig(
+            strategy_id=PAPER_AGENT_PROBABILITY_STRATEGY_ID,
+            factor_composition=(
+                FactorCompositionStep(
+                    factor_id="agent_probability",
+                    role="rule_delta",
+                    param="",
+                    weight=1.0,
+                    threshold=None,
+                    required=True,
+                    freshness_sla_s=300.0,
+                ),
+                FactorCompositionStep(
+                    factor_id="orderbook_imbalance",
+                    role="rule_delta",
+                    param="",
+                    weight=0.1,
+                    threshold=None,
+                    required=False,
+                    freshness_sla_s=300.0,
+                    allow_neutral_fallback=True,
+                ),
+            ),
+            metadata=(
+                ("owner", "agent:llm"),
+                ("tier", "paper"),
+                ("purpose", "agent_probability_contribution_example"),
+                ("live_allowed", "false"),
+            ),
+        ),
+        risk=RiskParams(
+            max_position_notional_usdc=1.0,
+            max_daily_drawdown_pct=50.0,
+            min_order_size_usdc=1.0,
+        ),
+        eval_spec=EvalSpec(metrics=("brier", "pnl", "fill_rate")),
+        forecaster=ForecasterSpec(
+            forecasters=(("rules", ()), ("llm", ())),
+        ),
+        market_selection=MarketSelectionSpec(
+            venue="polymarket",
+            resolution_time_max_horizon_days=31,
+            volume_min_usdc=0.0,
         ),
     )

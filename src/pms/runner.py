@@ -107,7 +107,7 @@ from pms.evaluation.resolution import (
 from pms.evaluation.spool import EvalSpool
 from pms.event_stream import RuntimeEventBus
 from pms.execution.fees import market_fee_rate_from_metadata
-from pms.factors.catalog import ensure_factor_catalog
+from pms.factors.catalog import AGENT_FACTOR_IDS, ensure_factor_catalog
 from pms.factors.definitions import REGISTERED
 from pms.factors.service import FactorService
 from pms.live_preflight import (
@@ -143,6 +143,8 @@ from pms.storage.live_emergency_audit import (
 )
 from pms.storage.first_order_audit import JsonlFirstOrderAuditWriter
 from pms.storage.market_data_store import PostgresMarketDataStore
+from pms.storage.agent_evidence_store import AgentEvidenceStore
+from pms.storage.llm_replay_store import PostgresLLMReplayStore
 from pms.storage.market_resolution_store import MarketResolutionStore
 from pms.storage.market_subscription_store import PostgresMarketSubscriptionStore
 from pms.storage.opportunity_store import OpportunityStore
@@ -185,9 +187,12 @@ from pms.strategies.flb.projection import (
 )
 from pms.strategies.intents import StrategyContext
 from pms.strategies.paper_multifactor import (
+    PAPER_AGENT_PROBABILITY_STRATEGY_ID,
     PAPER_MULTI_FACTOR_STRATEGY_ID,
+    build_paper_agent_probability_strategy,
     build_paper_multi_factor_strategy,
 )
+from pms.strategies.agent_evidence import AgentEvidenceObservationSource
 from pms.strategies.projections import (
     ActiveStrategy,
     CalibrationSpec,
@@ -923,6 +928,18 @@ class Runner:
         while len(self.state.signals) < count:
             await asyncio.sleep(0.1)
 
+    def build_agent_evidence_source(
+        self,
+        market_ids: Sequence[str],
+    ) -> AgentEvidenceObservationSource:
+        """Build the production point-in-time evidence source for a strategy."""
+        if self._pg_pool is None:
+            raise RuntimeError("Runner PostgreSQL pool is required for agent evidence")
+        return AgentEvidenceObservationSource(
+            store=AgentEvidenceStore(self._pg_pool),
+            market_ids=tuple(market_ids),
+        )
+
     def build_flb_strategy_module(
         self,
         *,
@@ -1516,6 +1533,8 @@ class Runner:
             raise RuntimeError(msg)
         if self.config.paper_soak_strategy_id == PAPER_MULTI_FACTOR_STRATEGY_ID:
             strategy = build_paper_multi_factor_strategy()
+        elif self.config.paper_soak_strategy_id == PAPER_AGENT_PROBABILITY_STRATEGY_ID:
+            strategy = build_paper_agent_probability_strategy()
         elif self.config.paper_soak_strategy_id == H1_FLB_STRATEGY_ID:
             if self._flb_calibration_model is None:
                 msg = "h1_flb paper soak requires strategies.flb_calibration_path"
@@ -1563,6 +1582,10 @@ class Runner:
                 factor_reader=PostgresFactorSnapshotReader(self._pg_pool),
                 outcome_token_resolver=MarketDataOutcomeTokenResolver(market_data_store),
                 direct_book_reader=direct_book_reader,
+                evidence_reader=AgentEvidenceObservationSource(
+                    AgentEvidenceStore(self._pg_pool)
+                ),
+                replay_store=PostgresLLMReplayStore(self._pg_pool),
             )
         if isinstance(self.eval_store, EvalStore):
             self.eval_store.bind_pool(self._pg_pool)
@@ -5116,7 +5139,7 @@ def _raw_factor_steps(
         factor_id = getattr(step, "factor_id", None)
         if role not in RAW_FACTOR_ROLES:
             continue
-        if factor_id not in REGISTERED_FACTOR_IDS:
+        if factor_id not in REGISTERED_FACTOR_IDS and factor_id not in AGENT_FACTOR_IDS:
             continue
         raw_steps.append(step)
     return tuple(raw_steps)

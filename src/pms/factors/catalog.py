@@ -120,6 +120,15 @@ FACTOR_CATALOG_ROWS: tuple[FactorCatalogEntry, ...] = (
         owner="system",
     ),
     FactorCatalogEntry(
+        factor_id="agent_probability",
+        name="Agent Probability",
+        description="Externally submitted point-in-time probability from an agent.",
+        input_schema_hash="3e8b3b26e3d6a9f3f7db8eb5d651c7adf3a2d3cf9f6f21f4b5b11f4aa2a2c5ef",
+        output_type="probability",
+        direction="neutral",
+        owner="agent:llm",
+    ),
+    FactorCatalogEntry(
         factor_id="yes_count",
         name="Yes Count",
         description="Raw external yes_count observation count from the signal payload.",
@@ -138,6 +147,21 @@ FACTOR_CATALOG_ROWS: tuple[FactorCatalogEntry, ...] = (
         owner="system",
     ),
 )
+
+AGENT_FACTOR_IDS = frozenset(
+    entry.factor_id for entry in FACTOR_CATALOG_ROWS if entry.owner.startswith("agent:")
+)
+
+
+def catalog_entry(factor_id: str) -> FactorCatalogEntry | None:
+    return next(
+        (entry for entry in FACTOR_CATALOG_ROWS if entry.factor_id == factor_id),
+        None,
+    )
+
+
+def is_agent_factor(factor_id: str) -> bool:
+    return factor_id in AGENT_FACTOR_IDS
 
 
 class _AsyncAcquireContext(Protocol):
@@ -182,10 +206,15 @@ def validate_registered_factor_catalog() -> None:
     if missing_ids:
         msg = "registered factors missing from catalog: " + ", ".join(missing_ids)
         raise ValueError(msg)
+    # Agent-owned rows are external observations.  They intentionally have no
+    # FactorDefinition: adding one would make FactorService overwrite them.
     unregistered_ids = sorted(
         entry.factor_id
         for entry in FACTOR_CATALOG_ROWS
-        if entry.owner != "deferred" and entry.factor_id not in registered_ids
+        if (
+            entry.owner != "deferred" and not entry.owner.startswith("agent:")
+            and entry.factor_id not in registered_ids
+        )
     )
     if unregistered_ids:
         msg = "catalog factors missing from REGISTERED: " + ", ".join(unregistered_ids)
