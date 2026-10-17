@@ -323,7 +323,9 @@ async def test_real_replay_ioc_fill_scores_brier_and_pnl_from_market_resolution(
         market_id,
         resolved_outcome=1.0,
         source="test",
-        resolved_at=datetime(2026, 3, 1, tzinfo=UTC),
+        # Resolution arrives after every replay event; evaluation happens
+        # later at the runner's cut-off and can therefore score the fills.
+        resolved_at=datetime(2026, 3, 31, tzinfo=UTC),
     )
     run_id = str(uuid.uuid4())
     await _insert_runner_row(pg_pool, run_id=run_id, market_id=market_id)
@@ -382,6 +384,48 @@ async def test_real_replay_backtest_fails_when_resolution_label_is_removed(
         execution_simulator=BacktestExecutionSimulator(replay_engine=engine),
         strategy_loader=lambda _keys: _load_one_strategy(),
         controller_factory=_ReplayPipelineFactory(),
+    )
+    assert await runner.execute(run_id) is False
+    async with pg_pool.acquire() as connection:
+        row = await connection.fetchrow(
+            "SELECT status, failure_reason FROM backtest_runs WHERE run_id = $1::uuid",
+            run_id,
+        )
+    assert row is not None
+    assert row["status"] == "failed"
+    assert "required resolution labels" in row["failure_reason"]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_replay_resolution_after_evaluation_cutoff_is_reported_unscored(
+    pg_pool: asyncpg.Pool,
+) -> None:
+    market_id = "market-replay-resolution-after-cutoff"
+    token_id = "token-replay-resolution-after-cutoff"
+    await _seed_replay_rows(
+        PostgresMarketDataStore(pg_pool),
+        market_id=market_id,
+        token_id=token_id,
+    )
+    await MarketResolutionStore(pg_pool).upsert(
+        market_id,
+        resolved_outcome=1.0,
+        source="test",
+        resolved_at=datetime(2026, 3, 31, tzinfo=UTC),
+    )
+    run_id = str(uuid.uuid4())
+    await _insert_runner_row(pg_pool, run_id=run_id, market_id=market_id)
+    from pms.research.replay import MarketUniverseReplayEngine
+
+    engine = MarketUniverseReplayEngine(pool=pg_pool)
+    runner = BacktestRunner(
+        writable_pool=pg_pool,
+        readonly_pool=pg_pool,
+        replay_engine=engine,
+        execution_simulator=BacktestExecutionSimulator(replay_engine=engine),
+        strategy_loader=lambda _keys: _load_one_strategy(),
+        controller_factory=_ReplayPipelineFactory(),
+        evaluation_as_of=datetime(2026, 3, 20, tzinfo=UTC),
     )
     assert await runner.execute(run_id) is False
     async with pg_pool.acquire() as connection:

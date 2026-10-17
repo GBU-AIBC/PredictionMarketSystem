@@ -510,6 +510,7 @@ class BacktestRunner:
         default_factory=BacktestExecutionSimulator
     )
     strategy_loader: StrategyLoader | None = None
+    evaluation_as_of: datetime | None = None
     cancel_probe: CancelProbe | None = None
     host_provider: HostProvider = socket.gethostname
     pid_provider: PidProvider = os.getpid
@@ -559,6 +560,7 @@ class BacktestRunner:
             msg = "no_strategy_versions"
             raise ValueError(msg)
         strategies = await self._load_strategies(claimed_run.spec.strategy_versions)
+        evaluation_as_of = self.evaluation_as_of or datetime.now(tz=UTC)
         accumulators: list[_StrategyAccumulator] = []
         for index, strategy in enumerate(strategies):
             if index == 0:
@@ -569,6 +571,7 @@ class BacktestRunner:
                 strategy=strategy,
                 spec=claimed_run.spec,
                 exec_config=claimed_run.exec_config,
+                evaluation_as_of=evaluation_as_of,
             )
             accumulators.append(accumulator)
         missing_labels = [
@@ -596,6 +599,7 @@ class BacktestRunner:
         strategy: ActiveStrategy,
         spec: BacktestSpec,
         exec_config: BacktestExecutionConfig,
+        evaluation_as_of: datetime | None = None,
     ) -> _StrategyAccumulator:
         replay_engine = self._required_replay_engine()
         pipeline = self.controller_factory.build(strategy)
@@ -608,8 +612,13 @@ class BacktestRunner:
         observed_order_totals: dict[str, tuple[float, float]] = {}
         order_decisions: dict[str, TradeDecision] = {}
 
+        evaluation_cutoff = evaluation_as_of or datetime.now(tz=UTC)
         async for signal in replay_engine.stream(spec, exec_config):
-            scoring_signal = _signal_with_replay_resolution(signal, replay_engine)
+            scoring_signal = _signal_with_replay_resolution(
+                signal,
+                replay_engine,
+                evaluation_as_of=evaluation_cutoff,
+            )
             slice_descriptors = _slice_descriptors(
                 signal=signal,
                 spec=spec,
@@ -1253,12 +1262,15 @@ def _resolved_outcome(signal: MarketSignal) -> float | None:
 def _signal_with_replay_resolution(
     signal: MarketSignal,
     replay_engine: object,
+    *,
+    evaluation_as_of: datetime | None = None,
 ) -> MarketSignal:
     resolver = getattr(replay_engine, "resolution_for", None)
     if not callable(resolver):
         return signal
+    cutoff = evaluation_as_of or datetime.now(tz=UTC)
     try:
-        resolved_value = resolver(signal.market_id, as_of=signal.fetched_at)
+        resolved_value = resolver(signal.market_id, as_of=cutoff)
     except TypeError:
         # Keep compatibility with test/research replay adapters that expose
         # only the historical one-argument resolver contract.
