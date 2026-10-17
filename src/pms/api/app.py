@@ -474,7 +474,10 @@ def _scope_for_request(app: FastAPI, request: Request) -> str:
         if declared:
             return declared[0]
         any_declared = sorted(
-            name.removeprefix("require_any_scope_").replace("_", " ")
+            {
+                "require_any_scope_paper_operate_live_admin": "paper_operate,live_admin",
+                "require_any_scope_kill_paper_operate_live_admin": "kill,paper_operate,live_admin",
+            }.get(name, name.removeprefix("require_any_scope_"))
             for name in names
             if name.startswith("require_any_scope_")
         )
