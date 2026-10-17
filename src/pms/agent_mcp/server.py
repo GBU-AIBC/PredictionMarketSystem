@@ -6,7 +6,6 @@ import asyncio
 import inspect
 import math
 import os
-import re
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -483,5 +482,8 @@ def _truncate(value: str) -> str:
 def _redact(value: str, token: str) -> str:
     if not token:
         return value
-    pattern = re.compile(r"(?<![A-Za-z0-9])" + re.escape(token) + r"(?![A-Za-z0-9])")
-    return pattern.sub("[REDACTED]", value)
+    redacted = value.replace(token, "[REDACTED]")
+    encoded_token = quote(token, safe="")
+    if encoded_token != token:
+        redacted = redacted.replace(encoded_token, "[REDACTED]")
+    return redacted

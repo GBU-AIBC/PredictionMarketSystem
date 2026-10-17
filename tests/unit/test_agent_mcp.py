@@ -190,9 +190,15 @@ def test_path_parameters_reject_traversal_and_slashes() -> None:
     assert _path_segment("safe id") == "safe%20id"
 
 
-def test_short_token_redaction_is_boundary_aware() -> None:
+def test_token_redaction_covers_adjacent_and_url_encoded_tokens() -> None:
     assert _redact("Bearer tok", "tok") == "Bearer [REDACTED]"
-    assert _redact("token", "tok") == "token"
+    assert _redact("tokenabc", "tok") == "[REDACTED]enabc"
+    assert _redact("Bearer%20tok", "tok") == "Bearer%20[REDACTED]"
+    assert _redact("Bearer%20abc", "abc") == "Bearer%20[REDACTED]"
+    long_token = "long-secret/" + "x" * 64
+    assert _redact(f"Bearer%20{long_token.replace('/', '%2F')}suffix", long_token) == (
+        "Bearer%20[REDACTED]suffix"
+    )
 
 
 @pytest.mark.asyncio
