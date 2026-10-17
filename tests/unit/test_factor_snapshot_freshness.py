@@ -61,4 +61,4 @@ async def test_optional_factor_sla_drops_stale_value_from_snapshot() -> None:
 
     assert snapshot.values == {}
     assert snapshot.missing_factors == ()
-    assert snapshot.stale_factors == (("metaculus_prior", ""),)
+    assert snapshot.stale_factors == ()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
 
 from pms.factors.composition import (
     apply_composition,
@@ -99,11 +100,49 @@ def test_rule_delta_piecewise_floor_and_threshold_boundaries() -> None:
     ) == pytest.approx(0.50)
 
 
+def test_composition_threshold_tolerates_binary_float_rounding() -> None:
+    result = apply_composition(
+        (
+            _step("metaculus_prior", role="rule_delta", weight=1.0, threshold=0.1),
+        ),
+        {
+            ("metaculus_prior", ""): 0.6,
+            ("yes_price", ""): 0.5,
+        },
+    )
+
+    # 0.6 - 0.5 is represented just below 0.1 in binary float, but the
+    # computed edge is at the configured gate boundary.
+    assert result == pytest.approx(0.6)
+
+
 def test_validate_composition_rejects_unknown_role_and_factor() -> None:
     with pytest.raises(ValueError, match="unknown composition role"):
         validate_composition((_step("yes_price", role="typo", weight=1.0),))
     with pytest.raises(ValueError, match="unknown composition factor id"):
         validate_composition((_step("not_a_factor", role="weighted", weight=1.0),))
+
+
+def test_strategy_authoring_guide_example_matches_validator_and_semantics() -> None:
+    guide = Path("agent_docs/strategy-authoring-guide.md").read_text()
+    assert 'factor_id="orderbook_imbalance"' in guide
+    assert 'role="rule_delta"' in guide
+    assert 'factor_id="metaculus_prior"' in guide
+    composition = (
+        _step("orderbook_imbalance", role="rule_delta", weight=0.25, threshold=0.15),
+        _step("metaculus_prior", role="threshold_edge", weight=1.0, threshold=0.60),
+    )
+    validate_composition(composition)
+    # The guide describes precedence: each branch can provide a probability
+    # when the other branch is quiet.
+    assert apply_composition(
+        composition,
+        {("yes_price", ""): 0.5, ("metaculus_prior", ""): 0.7},
+    ) == pytest.approx(0.7)
+    assert apply_composition(
+        composition,
+        {("yes_price", ""): 0.5, ("orderbook_imbalance", ""): 0.5},
+    ) == pytest.approx(0.625)
 
 
 def test_apply_composition_renormalizes_present_weighted_inputs() -> None:

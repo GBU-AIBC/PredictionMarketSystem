@@ -265,8 +265,8 @@ async def test_factor_service_task_cancels_during_compute(
     await _seed_boot_prereqs(pg_pool)
     entered = asyncio.Event()
 
-    async def blocking_persist(pool: object, row: object) -> None:
-        del pool, row
+    async def blocking_persist(pool: object, row: object, *, definition_version: str = "1") -> None:
+        del pool, row, definition_version
         entered.set()
         await asyncio.Event().wait()
 
@@ -300,8 +300,8 @@ async def test_factor_service_stop_succeeds_after_compute_exception(
 ) -> None:
     await _seed_boot_prereqs(pg_pool)
 
-    async def exploding_persist(pool: object, row: object) -> None:
-        del pool, row
+    async def exploding_persist(pool: object, row: object, *, definition_version: str = "1") -> None:
+        del pool, row, definition_version
         raise RuntimeError("factor persist boom")
 
     monkeypatch.setattr("pms.factors.service.persist_factor_value", exploding_persist)
@@ -318,12 +318,12 @@ async def test_factor_service_stop_succeeds_after_compute_exception(
         task = runner.factor_service_task
         assert task is not None
 
-        async with asyncio.timeout(2.0):
-            while not task.done():
-                await asyncio.sleep(0.02)
-
-        assert isinstance(task.exception(), RuntimeError)
+        # Persistence failures are retried on the dirty market at the next
+        # cadence; stopping the runner must still cancel the worker cleanly.
+        await asyncio.sleep(0.12)
+        assert not task.done()
         await runner.stop()
+        assert task.done()
     finally:
         if runner.pg_pool is not None or runner.tasks:
             await runner.stop()

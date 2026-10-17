@@ -24,6 +24,11 @@ from pms.strategies.ripple.evaluator import (
 
 LIVE_RIPPLE_SOURCE = "live_factor_service"
 RIPPLE_ECONOMICS_VERSION = "ripple-economics-v1"
+RIPPLE_MAX_POSITION_NOTIONAL_USDC = 1.0
+RIPPLE_DEFAULT_PRIOR_STRENGTH = DEFAULT_PRIOR_STRENGTH
+RIPPLE_DEFAULT_MIN_EXPECTED_EDGE = DEFAULT_MIN_EXPECTED_EDGE
+RIPPLE_DEFAULT_MAX_SLIPPAGE_BPS = 50
+RIPPLE_DEFAULT_TIME_IN_FORCE = TimeInForce.GTC
 RIPPLE_FACTOR_REQUIREMENTS: tuple[FactorCompositionStep, ...] = (
     FactorCompositionStep(
         factor_id="metaculus_prior",

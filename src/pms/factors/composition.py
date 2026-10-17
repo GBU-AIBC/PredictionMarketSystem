@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from math import isfinite
+from math import isclose, isfinite
 from typing import Protocol
 
 from pms.core.validation import validate_finite
@@ -139,7 +139,7 @@ def _eligible_weighted_steps(
         threshold = threshold_gates.get((step.factor_id, step.param))
         if threshold is not None:
             value = factor_values.get((step.factor_id, step.param))
-            if value is None or abs(value) < threshold:
+            if value is None or _below_threshold(value, threshold):
                 continue
         eligible_steps.append(step)
     return tuple(eligible_steps)
@@ -235,7 +235,7 @@ def _apply_threshold_precedence(
 
         threshold = 0.0 if step.threshold is None else step.threshold
         if step.factor_id == "fair_value_spread":
-            if abs(edge) < threshold:
+            if _below_threshold(edge, threshold):
                 continue
             return _required_factor_value(factor_values, "yes_price", "") + edge
         if step.factor_id == "subset_pricing_violation":
@@ -248,7 +248,7 @@ def _apply_threshold_precedence(
                 "edge; scale it through a strategy rule_delta step"
             )
             raise ValueError(msg)
-        if abs(edge) < threshold:
+        if _below_threshold(edge, threshold):
             continue
         return edge
 
@@ -271,7 +271,9 @@ def _apply_rule_delta(
         if factor_value is None:
             continue
         delta = _rule_delta(step.factor_id, factor_value, market_price=yes_price)
-        if step.threshold is not None and abs(delta) < step.threshold:
+        if delta == 0.0:
+            continue
+        if step.threshold is not None and _below_threshold(delta, step.threshold):
             continue
         probability += step.weight * delta
         applied = True
@@ -407,3 +409,11 @@ def _bounded_probability(value: float) -> float:
     if not isfinite(value):
         raise ValueError("probability must be finite")
     return max(1e-6, min(1.0 - 1e-6, value))
+
+
+def _below_threshold(value: float, threshold: float) -> bool:
+    """Compare a gate with a tiny tolerance for binary-float boundaries."""
+
+    return abs(value) < threshold and not isclose(
+        abs(value), threshold, rel_tol=0.0, abs_tol=1e-12
+    )

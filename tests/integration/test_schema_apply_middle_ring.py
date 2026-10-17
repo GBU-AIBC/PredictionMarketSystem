@@ -32,6 +32,7 @@ EXPECTED_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("market_id", "text"),
         ("ts", "timestamp with time zone"),
         ("value", "double precision"),
+        ("definition_version", "text"),
     ],
 }
 

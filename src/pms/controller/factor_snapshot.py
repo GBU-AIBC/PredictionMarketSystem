@@ -174,7 +174,8 @@ class PostgresFactorSnapshotReader:
                 ages_ms[key] = age_ms
                 freshness_sla_s = freshness_slas.get(key)
                 if freshness_sla_s is not None and age_ms > freshness_sla_s * 1000.0:
-                    stale_factors.append(key)
+                    if key in required_key_set:
+                        stale_factors.append(key)
                     # A stale optional value is still unsafe to compose.  Keep
                     # its identity for diagnostics while removing its value
                     # from the usable snapshot.

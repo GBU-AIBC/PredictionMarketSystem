@@ -356,19 +356,9 @@ async def test_runner_calls_flb_module_without_live_capital() -> None:
     )
 
     assert reader.calls == [("market-flb-1", NOW)]
-    assert len(results) == 1
-    judgement = results[0].judgement
-    assert judgement is not None
-    assert judgement.approved is True
-
-    assert len(results[0].intents) == 1
-    intent = results[0].intents[0]
-    assert isinstance(intent, TradeIntent)
-    assert intent.outcome == "NO"
-    assert intent.token_id == "token-no"
-    assert intent.limit_price == pytest.approx(0.96)
-    assert intent.expected_edge == pytest.approx(0.02)
-    assert intent.notional_usdc <= 5.0
+    # H1's hashed economics include the 7% fee and 15 bps execution cost;
+    # the gross 2c edge is therefore correctly rejected.
+    assert results == ()
 
     assert runner.state.decisions == []
     assert runner._decision_queue.empty()  # noqa: SLF001
@@ -429,7 +419,17 @@ async def test_runner_wires_configured_flb_entry_costs(tmp_path: Path) -> None:
         market_reader=reader,
     )
 
-    assert results == ()
+    assert len(results) == 1
+    assert len(results[0].intents) == 1
+    module = runner.build_flb_strategy_module(
+        strategy_id="h1_flb",
+        strategy_version_id="h1-flb-v1",
+        market_ids=("market-flb-1",),
+        market_reader=reader,
+    )
+    assert isinstance(module.source, LiveFlbSource)
+    assert module.source.entry_execution_cost_bps == pytest.approx(15.0)
+    assert module.source.fee_rate == pytest.approx(0.07)
 
 
 def test_runner_flb_module_requires_explicit_markets_without_pg_pool() -> None:
@@ -460,12 +460,7 @@ async def test_postgres_flb_reader_uses_as_of_price_snapshot() -> None:
         as_of=NOW,
     )
 
-    assert len(results) == 1
-    intent = results[0].intents[0]
-    assert isinstance(intent, TradeIntent)
-    assert intent.outcome == "NO"
-    assert intent.expected_price == pytest.approx(0.97)
-    assert intent.limit_price == pytest.approx(0.95)
+    assert results == ()
     assert connection.fetchval_calls[0][1] == ("token-yes",)
     assert connection.fetchrow_calls[1][1] == ("market-flb-1", NOW)
     assert "ORDER BY match_rank ASC" in connection.fetchval_calls[0][0]

@@ -148,7 +148,15 @@ from pms.strategies.anchoring import (
     AnchoringLagStrategyModule,
     LiveAnchoringSource,
 )
-from pms.strategies.anchoring.source import AnchoringMarketSnapshotReader
+from pms.strategies.anchoring.source import (
+    ANCHORING_DEFAULT_MAX_SLIPPAGE_BPS,
+    ANCHORING_DEFAULT_MIN_CONFIDENCE,
+    ANCHORING_DEFAULT_MIN_DIVERGENCE,
+    ANCHORING_DEFAULT_MIN_EXPECTED_EDGE,
+    ANCHORING_DEFAULT_TIME_IN_FORCE,
+    ANCHORING_MAX_POSITION_NOTIONAL_USDC,
+    AnchoringMarketSnapshotReader,
+)
 from pms.strategies.flb import FlbAgent, FlbController, FlbStrategyModule
 from pms.strategies.flb.artifacts import (
     flb_calibration_provenance_path,
@@ -162,6 +170,12 @@ from pms.strategies.flb.source import (
     load_flb_calibration_csv,
 )
 from pms.strategies.flb.projection import (
+    H1_FLB_ENTRY_EXECUTION_COST_BPS,
+    H1_FLB_FAVORITE_THRESHOLD,
+    H1_FLB_LONGSHOT_THRESHOLD,
+    H1_FLB_MAX_SLIPPAGE_BPS,
+    H1_FLB_MIN_EXPECTED_EDGE,
+    H1_FLB_FEE_RATE,
     H1_FLB_STRATEGY_ID,
     build_h1_flb_strategy,
 )
@@ -188,6 +202,11 @@ from pms.strategies.ripple import (
     RippleStrategyModule,
 )
 from pms.strategies.ripple.source import (
+    RIPPLE_DEFAULT_MIN_EXPECTED_EDGE,
+    RIPPLE_DEFAULT_PRIOR_STRENGTH,
+    RIPPLE_DEFAULT_MAX_SLIPPAGE_BPS,
+    RIPPLE_DEFAULT_TIME_IN_FORCE,
+    RIPPLE_MAX_POSITION_NOTIONAL_USDC,
     RippleFactorSnapshotReader,
     RippleMarketSnapshotReader,
 )
@@ -925,15 +944,48 @@ class Runner:
             source=LiveFlbSource(
                 market_ids=tuple(market_ids),
                 market_reader=reader,
-                position_sizer=KellySizer(self.config.risk),
-                portfolio=self.portfolio,
-                max_slippage_bps=self.config.controller.max_slippage_bps,
-                entry_execution_cost_bps=(
-                    self.config.strategies.flb_entry_execution_cost_bps
+                position_sizer=KellySizer(
+                    self.config.risk.model_copy(
+                        update={"max_position_per_market": 1.0}
+                    )
+                    if strategy_id == H1_FLB_STRATEGY_ID
+                    else self.config.risk
                 ),
-                fee_rate=self.config.strategies.flb_fee_rate,
-                time_in_force=TimeInForce(
-                    self.config.controller.time_in_force.upper()
+                portfolio=self.portfolio,
+                max_slippage_bps=(
+                    H1_FLB_MAX_SLIPPAGE_BPS
+                    if strategy_id == H1_FLB_STRATEGY_ID
+                    else self.config.controller.max_slippage_bps
+                ),
+                entry_execution_cost_bps=(
+                    H1_FLB_ENTRY_EXECUTION_COST_BPS
+                    if strategy_id == H1_FLB_STRATEGY_ID
+                    else self.config.strategies.flb_entry_execution_cost_bps
+                ),
+                fee_rate=(
+                    H1_FLB_FEE_RATE
+                    if strategy_id == H1_FLB_STRATEGY_ID
+                    else self.config.strategies.flb_fee_rate
+                ),
+                longshot_yes_threshold=(
+                    H1_FLB_LONGSHOT_THRESHOLD
+                    if strategy_id == H1_FLB_STRATEGY_ID
+                    else 0.10
+                ),
+                favorite_yes_threshold=(
+                    H1_FLB_FAVORITE_THRESHOLD
+                    if strategy_id == H1_FLB_STRATEGY_ID
+                    else 0.90
+                ),
+                min_expected_edge=(
+                    H1_FLB_MIN_EXPECTED_EDGE
+                    if strategy_id == H1_FLB_STRATEGY_ID
+                    else 0.02
+                ),
+                time_in_force=(
+                    TimeInForce.GTC
+                    if strategy_id == H1_FLB_STRATEGY_ID
+                    else TimeInForce(self.config.controller.time_in_force.upper())
                 ),
                 calibration_model=self._flb_calibration_model,
             ),
@@ -1014,14 +1066,16 @@ class Runner:
                 factor_reader=resolved_factor_reader,
                 market_reader=resolved_market_reader,
                 position_sizer=KellySizer(
-                    risk=self.config.risk,
+                    risk=self.config.risk.model_copy(
+                        update={"max_position_per_market": RIPPLE_MAX_POSITION_NOTIONAL_USDC}
+                    ),
                     fraction=Decimal("0.25"),
                 ),
                 portfolio=self.portfolio,
-                max_slippage_bps=self.config.controller.max_slippage_bps,
-                time_in_force=TimeInForce(
-                    self.config.controller.time_in_force.upper()
-                ),
+                prior_strength=RIPPLE_DEFAULT_PRIOR_STRENGTH,
+                min_expected_edge=RIPPLE_DEFAULT_MIN_EXPECTED_EDGE,
+                max_slippage_bps=RIPPLE_DEFAULT_MAX_SLIPPAGE_BPS,
+                time_in_force=RIPPLE_DEFAULT_TIME_IN_FORCE,
             ),
             controller=RippleController(),
             agent=RippleAgent(),
@@ -1078,12 +1132,17 @@ class Runner:
             source=LiveAnchoringSource(
                 market_ids=tuple(market_ids),
                 market_reader=market_reader,
-                position_sizer=KellySizer(self.config.risk),
-                portfolio=self.portfolio,
-                max_slippage_bps=self.config.controller.max_slippage_bps,
-                time_in_force=TimeInForce(
-                    self.config.controller.time_in_force.upper()
+                position_sizer=KellySizer(
+                    self.config.risk.model_copy(
+                        update={"max_position_per_market": ANCHORING_MAX_POSITION_NOTIONAL_USDC}
+                    )
                 ),
+                portfolio=self.portfolio,
+                min_divergence=ANCHORING_DEFAULT_MIN_DIVERGENCE,
+                min_confidence=ANCHORING_DEFAULT_MIN_CONFIDENCE,
+                min_expected_edge=ANCHORING_DEFAULT_MIN_EXPECTED_EDGE,
+                max_slippage_bps=ANCHORING_DEFAULT_MAX_SLIPPAGE_BPS,
+                time_in_force=ANCHORING_DEFAULT_TIME_IN_FORCE,
             ),
             controller=AnchoringController(),
             agent=AnchoringAgent(),

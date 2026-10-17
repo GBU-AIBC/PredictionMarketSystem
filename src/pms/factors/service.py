@@ -59,7 +59,6 @@ class FactorService:
     cadence_s: float
     factors: tuple[type[FactorDefinition], ...]
     signal_stream: AsyncIterable[MarketSignal]
-    _latest_signals: dict[str, MarketSignal] = field(init=False, default_factory=dict)
     _signal_queue: asyncio.Queue[MarketSignal | None] = field(
         init=False,
         default_factory=asyncio.Queue,
@@ -70,6 +69,7 @@ class FactorService:
     )
     _stream_exhausted: bool = field(init=False, default=False)
     _known_market_ids: set[str] = field(init=False, default_factory=set)
+    _last_failed_market_ids: set[str] = field(init=False, default_factory=set)
 
     def __post_init__(self) -> None:
         if self.cadence_s <= 0.0:
@@ -86,11 +86,15 @@ class FactorService:
                 for signal in signals:
                     # Coalesce bursts for the same market and only recompute
                     # markets that received a new observation this tick.
-                    self._latest_signals[signal.market_id] = signal
                     dirty_signals[signal.market_id] = signal
                 if dirty_signals:
                     await self.compute_once(list(dirty_signals.values()))
-                    dirty_signals.clear()
+                    failed_market_ids = self._last_failed_market_ids
+                    dirty_signals = {
+                        market_id: signal
+                        for market_id, signal in dirty_signals.items()
+                        if market_id in failed_market_ids
+                    }
                 if self._stream_exhausted:
                     self._raise_stream_error(stream_task)
                     logger.warning("factor signal stream exhausted; factor service exiting")
@@ -109,6 +113,7 @@ class FactorService:
 
     async def compute_once(self, signals: list[MarketSignal]) -> int:
         persisted = 0
+        failed_market_ids: set[str] = set()
         for signal in signals:
             try:
                 await self._ensure_market_shell(signal)
@@ -117,6 +122,7 @@ class FactorService:
                     "market shell upsert failed market_id=%s; retrying next cadence",
                     signal.market_id,
                 )
+                failed_market_ids.add(signal.market_id)
                 continue
             for factor_cls in self.factors:
                 if _requires_open_yes_price(factor_cls) and not _has_open_yes_price(
@@ -132,6 +138,7 @@ class FactorService:
                         signal.market_id,
                         signal.timestamp.isoformat(),
                     )
+                    failed_market_ids.add(signal.market_id)
                     continue
                 if row is None:
                     continue
@@ -159,6 +166,7 @@ class FactorService:
                     continue
                 self._last_persisted_ts[dedupe_key] = row.ts
                 persisted += 1
+        self._last_failed_market_ids = failed_market_ids
         return persisted
 
     async def _persist_factor_value(
@@ -169,29 +177,24 @@ class FactorService:
         definition_version: str = "1",
     ) -> None:
         try:
-            if definition_version == "1":
-                await persist_factor_value(self.pool, row)
-            else:
-                await persist_factor_value(
-                    self.pool,
-                    row,
-                    definition_version=definition_version,
-                )
+            await persist_factor_value(
+                self.pool,
+                row,
+                definition_version=definition_version,
+            )
         except asyncpg.ForeignKeyViolationError as exc:
             if _is_constraint_violation(exc, "factor_values_factor_id_fkey"):
                 await ensure_factor_catalog(self.pool, factor_ids=(row.factor_id,))
             elif _is_constraint_violation(exc, "factor_values_market_id_fkey"):
+                self._known_market_ids.discard(signal.market_id)
                 await self._ensure_market_shell(signal)
             else:
                 raise
-            if definition_version == "1":
-                await persist_factor_value(self.pool, row)
-            else:
-                await persist_factor_value(
-                    self.pool,
-                    row,
-                    definition_version=definition_version,
-                )
+            await persist_factor_value(
+                self.pool,
+                row,
+                definition_version=definition_version,
+            )
 
     async def get_panel(
         self,

@@ -107,11 +107,12 @@ pointers are in §7.
 ## 3. Worked example — Channel A end-to-end
 
 The example used through §3.1–§3.11 is a hypothetical strategy
-called `imbalance_with_prior_v1`: take a position on the YES side
-when `orderbook_imbalance > 0.15` **and** `metaculus_prior > 0.6`,
-using the `rules` forecaster, with a 90-day horizon ceiling and a
-$2 max position. This is illustrative; substitute your own
-parameters.
+called `imbalance_with_prior_v1`: use `orderbook_imbalance` as a scaled
+rule delta and use `metaculus_prior > 0.6` as a probability edge, using
+the `rules` forecaster, with a 90-day horizon ceiling and a $2 max
+position. The two evidence branches are precedence-ranked, so either
+one can provide the probability when the other is quiet. This is
+illustrative; substitute your own parameters.
 
 ### 3.1 Check the raw factors you need already exist
 

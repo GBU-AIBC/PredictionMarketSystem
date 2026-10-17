@@ -359,6 +359,50 @@ async def test_live_ripple_source_reads_factor_snapshot_and_market_price() -> No
     )
 
 
+@pytest.mark.asyncio
+async def test_live_ripple_fails_closed_without_fresh_metaculus_prior() -> None:
+    source = LiveRippleSource(
+        market_ids=("market-ripple-1",),
+        factor_reader=_RecordingFactorReader(
+            _FakeFactorSnapshot(
+                values={
+                    ("yes_count", ""): 15.0,
+                    ("no_count", ""): 5.0,
+                },
+                missing_factors=(("metaculus_prior", ""),),
+                stale_factors=(("yes_count", ""),),
+            )
+        ),
+        market_reader=_StaticMarketReader(yes_price=0.50, best_ask=0.50),
+        position_sizer=_FixedSizer(2.0),
+        portfolio=_portfolio(),
+    )
+
+    assert await source.observe(_context()) == ()
+
+
+def test_ripple_evaluator_rejects_provenance_marked_stale_prior() -> None:
+    candidate = _live_candidate_with_metadata(
+        metadata={
+            "source": "live_factor_service",
+            "metaculus_prior": 0.7,
+            "prior_strength": 2.0,
+            "yes_count": 15.0,
+            "no_count": 5.0,
+            "limit_price": 0.5,
+            "factor_snapshot_hash": "stale-snapshot",
+            "missing_factors": (),
+            "stale_factors": ("metaculus_prior",),
+            "contradiction_refs": (),
+        },
+    )
+
+    assessment = RippleEvidenceEvaluator(min_confidence=0.6).assess(candidate)
+
+    assert assessment.approved is False
+    assert assessment.failure_reasons == ("low_confidence",)
+
+
 def test_live_ripple_requires_beta_binomial_count_factors() -> None:
     required_flags = {
         step.factor_id: step.required
@@ -412,7 +456,8 @@ def test_runner_builds_live_ripple_source_with_fractional_kelly_sizer() -> None:
 
     assert isinstance(module.source, LiveRippleSource)
     assert isinstance(module.source.position_sizer, KellySizer)
-    assert module.source.position_sizer.risk == risk
+    assert module.source.position_sizer.risk is not None
+    assert module.source.position_sizer.risk.max_position_per_market == pytest.approx(1.0)
     assert module.source.position_sizer.fraction == Decimal("0.25")
 
 

@@ -128,12 +128,12 @@ def _strategy_payload(
         "forecaster": _payload_value(forecaster),
         "market_selection": _payload_value(market_selection),
     }
-    # Defaults are behavior too: changing a CalibrationSpec default must
-    # produce a new immutable strategy version even when callers omit the
-    # optional projection argument.
-    payload["calibration"] = _payload_value(
-        CalibrationSpec() if calibration is None else calibration
-    )
+    # Preserve the pre-W1B wire/hash contract for the omitted default. Existing
+    # strategy rows intentionally omit calibration, and changing that hash
+    # would make every installed default version fail rehydration. Explicit
+    # non-default calibration remains part of the immutable version payload.
+    if calibration is not None and calibration != CalibrationSpec():
+        payload["calibration"] = _payload_value(calibration)
     return payload
 
 

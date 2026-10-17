@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime
 import logging
 from typing import Any, cast
@@ -11,7 +12,8 @@ import pytest
 from pms.core.enums import MarketStatus
 from pms.core.models import Market, MarketSignal
 from pms.factors.base import FactorDefinition, FactorValueRow
-from pms.factors.service import FactorService
+from pms.factors.definitions import FavoriteLongshotBias
+from pms.factors.service import FactorService, persist_factor_value
 from pms.sensor.stream import SensorStream
 
 
@@ -48,6 +50,19 @@ class SequenceSignalStream:
     async def _iterate(self) -> AsyncIterator[MarketSignal]:
         for signal in self._signals:
             yield signal
+
+
+class RepeatingSignalStream:
+    def __init__(self, signal: MarketSignal) -> None:
+        self.signal = signal
+
+    def __aiter__(self) -> AsyncIterator[MarketSignal]:
+        return self._iterate()
+
+    async def _iterate(self) -> AsyncIterator[MarketSignal]:
+        while True:
+            yield self.signal
+            await asyncio.sleep(0)
 
 
 class FakeStore:
@@ -126,13 +141,27 @@ class ExplodingFactor(FactorDefinition):
 
 
 @pytest.mark.asyncio
+async def test_persist_factor_value_rejects_non_finite_before_database_access() -> None:
+    row = FactorValueRow(
+        factor_id="persisted_factor",
+        param="",
+        market_id="factor-service-market",
+        ts=datetime(2026, 4, 18, tzinfo=UTC),
+        value=float("nan"),
+    )
+
+    with pytest.raises(ValueError, match="finite"):
+        await persist_factor_value(cast(Any, object()), row)
+
+
+@pytest.mark.asyncio
 async def test_factor_service_compute_once_persists_non_none_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     persisted: list[FactorValueRow] = []
 
-    async def fake_persist(pool: object, row: FactorValueRow) -> None:
-        del pool
+    async def fake_persist(pool: object, row: FactorValueRow, *, definition_version: str = "1") -> None:
+        del pool, definition_version
         persisted.append(row)
 
     monkeypatch.setattr("pms.factors.service.persist_factor_value", fake_persist)
@@ -161,14 +190,52 @@ async def test_factor_service_compute_once_persists_non_none_rows(
 
 
 @pytest.mark.asyncio
+async def test_factor_service_persists_neutral_row_after_tail_signal() -> None:
+    persisted: list[FactorValueRow] = []
+
+    async def fake_persist(
+        pool: object,
+        row: FactorValueRow,
+        *,
+        definition_version: str = "1",
+    ) -> None:
+        del pool, definition_version
+        persisted.append(row)
+
+    # The service writes rows rather than relying on a missing-row sentinel;
+    # the second signal must supersede the earlier tail value.
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("pms.factors.service.persist_factor_value", fake_persist)
+    try:
+        service = FactorService(
+            pool=cast(Any, object()),
+            store=cast(Any, FakeStore()),
+            cadence_s=0.1,
+            factors=(FavoriteLongshotBias,),
+            signal_stream=SequenceSignalStream([]),
+        )
+        tail = _signal(market_id="neutral-market", yes_price=0.05)
+        neutral = replace(
+            _signal(market_id="neutral-market", yes_price=0.50),
+            fetched_at=tail.fetched_at.replace(second=1),
+        )
+        await service.compute_once([tail])
+        await service.compute_once([neutral])
+    finally:
+        monkeypatch.undo()
+
+    assert [row.value for row in persisted] == [pytest.approx(-0.05), pytest.approx(0.0)]
+
+
+@pytest.mark.asyncio
 async def test_factor_service_compute_once_continues_after_factor_error(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     persisted: list[FactorValueRow] = []
 
-    async def fake_persist(pool: object, row: FactorValueRow) -> None:
-        del pool
+    async def fake_persist(pool: object, row: FactorValueRow, *, definition_version: str = "1") -> None:
+        del pool, definition_version
         persisted.append(row)
 
     monkeypatch.setattr("pms.factors.service.persist_factor_value", fake_persist)
@@ -195,8 +262,8 @@ async def test_factor_service_skips_yes_price_factors_for_sentinel_book_signals(
 ) -> None:
     persisted: list[FactorValueRow] = []
 
-    async def fake_persist(pool: object, row: FactorValueRow) -> None:
-        del pool
+    async def fake_persist(pool: object, row: FactorValueRow, *, definition_version: str = "1") -> None:
+        del pool, definition_version
         persisted.append(row)
 
     monkeypatch.setattr("pms.factors.service.persist_factor_value", fake_persist)
@@ -224,8 +291,8 @@ async def test_factor_service_run_exits_when_signal_stream_finishes(
 ) -> None:
     persisted: list[FactorValueRow] = []
 
-    async def fake_persist(pool: object, row: FactorValueRow) -> None:
-        del pool
+    async def fake_persist(pool: object, row: FactorValueRow, *, definition_version: str = "1") -> None:
+        del pool, definition_version
         persisted.append(row)
 
     monkeypatch.setattr("pms.factors.service.persist_factor_value", fake_persist)
@@ -248,8 +315,8 @@ async def test_factor_service_skips_repersisting_the_same_factor_timestamp(
 ) -> None:
     persisted: list[FactorValueRow] = []
 
-    async def fake_persist(pool: object, row: FactorValueRow) -> None:
-        del pool
+    async def fake_persist(pool: object, row: FactorValueRow, *, definition_version: str = "1") -> None:
+        del pool, definition_version
         persisted.append(row)
 
     monkeypatch.setattr("pms.factors.service.persist_factor_value", fake_persist)
@@ -341,9 +408,9 @@ async def test_compute_once_survives_transient_persist_failure(
     persisted: list[FactorValueRow] = []
     calls = 0
 
-    async def flaky_persist(pool: Any, row: FactorValueRow) -> None:
+    async def flaky_persist(pool: Any, row: FactorValueRow, *, definition_version: str = "1") -> None:
         nonlocal calls
-        del pool
+        del pool, definition_version
         calls += 1
         if calls == 1:
             raise asyncpg.PostgresError("transient db error")
@@ -366,3 +433,42 @@ async def test_compute_once_survives_transient_persist_failure(
     assert first == 0
     assert second == 1
     assert [row.market_id for row in persisted] == ["persist-retry-market"]
+
+
+@pytest.mark.asyncio
+async def test_factor_service_retries_failed_dirty_market_on_next_cadence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    persisted = asyncio.Event()
+
+    async def flaky_persist(
+        pool: Any,
+        row: FactorValueRow,
+        *,
+        definition_version: str = "1",
+    ) -> None:
+        nonlocal calls
+        del pool, row, definition_version
+        calls += 1
+        if calls > 1:
+            persisted.set()
+        if calls == 1:
+            raise RuntimeError("transient factor persistence failure")
+
+    monkeypatch.setattr("pms.factors.service.persist_factor_value", flaky_persist)
+    service = FactorService(
+        pool=cast(Any, object()),
+        store=cast(Any, FakeStore()),
+        cadence_s=0.001,
+        factors=(PersistedFactor,),
+        signal_stream=RepeatingSignalStream(_signal(market_id="retry-market")),
+    )
+    task = asyncio.create_task(service.run())
+    try:
+        await asyncio.wait_for(persisted.wait(), timeout=1.0)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert calls >= 2

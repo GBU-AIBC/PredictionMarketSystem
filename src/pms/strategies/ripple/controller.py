@@ -47,7 +47,6 @@ def _candidate_from_observation(observation: StrategyObservation) -> StrategyCan
     for field_name in (
         "economics_version",
         "min_expected_edge",
-        "max_slippage_bps",
         "entry_edge_threshold",
         "metaculus_prior",
         "no_count",
