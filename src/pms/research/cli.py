@@ -34,6 +34,7 @@ from pms.research.sweep import (
 )
 from pms.storage.schema_check import ensure_schema_current
 from pms.storage.market_resolution_store import MarketResolutionStore
+from pms.storage.llm_replay_store import PostgresLLMReplayStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +60,12 @@ class _ResolutionBackfillArgs:
     market_ids: tuple[str, ...]
     start: datetime | None
     end: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayPruneArgs:
+    database_url: str | None
+    before: datetime
 
 
 @dataclass(slots=True)
@@ -89,6 +96,9 @@ def build_parser() -> argparse.ArgumentParser:
     resolution_parser.add_argument("--market-id", action="append", default=[])
     resolution_parser.add_argument("--start")
     resolution_parser.add_argument("--end")
+    prune_parser = subparsers.add_parser("prune-llm-replay")
+    prune_parser.add_argument("--database-url")
+    prune_parser.add_argument("--before", required=True)
     return parser
 
 
@@ -132,6 +142,13 @@ def main() -> None:
         )
         raise SystemExit(asyncio.run(_run_resolution_backfill(args)))
 
+    if namespace.command == "prune-llm-replay":
+        prune_args = _ReplayPruneArgs(
+            database_url=_optional_string(namespace.database_url),
+            before=_parse_cli_datetime(namespace.before) or datetime.now(tz=UTC),
+        )
+        raise SystemExit(asyncio.run(_run_replay_prune(prune_args)))
+
     raise SystemExit(f"unknown command: {namespace.command}")
 
 
@@ -174,6 +191,16 @@ async def _run_sweep(args: _SweepArgs) -> int:
             )
 
         _print_json(response)
+        return 0
+    finally:
+        await pool.close()
+
+
+async def _run_replay_prune(args: _ReplayPruneArgs) -> int:
+    pool = await _create_pool(args.database_url)
+    try:
+        deleted = await PostgresLLMReplayStore(pool).prune_before(args.before)
+        print(f"deleted {deleted} llm replay rows before {args.before.isoformat()}")
         return 0
     finally:
         await pool.close()

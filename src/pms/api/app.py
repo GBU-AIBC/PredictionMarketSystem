@@ -38,6 +38,8 @@ from pms.api.routes.decisions import (
     get_decision as get_decision_item,
     list_decisions as list_decisions_items,
 )
+from pms.api.routes.agent_evidence import router as agent_evidence_router
+from pms.api.routes.agent_factors import router as agent_factors_router
 from pms.api.routes.decay import get_strategy_decay_status as get_strategy_decay_status_item
 from pms.api.routes.events import encode_sse_event
 from pms.api.research_routes import (
@@ -595,6 +597,8 @@ def create_app(
     app = FastAPI(title="PMS API", lifespan=lifespan)
     app.state.runner = active_runner
     app.state.settings = active_runner.config
+    app.include_router(agent_evidence_router)
+    app.include_router(agent_factors_router)
 
     @app.middleware("http")
     async def request_audit(request: Request, call_next: Any) -> Any:

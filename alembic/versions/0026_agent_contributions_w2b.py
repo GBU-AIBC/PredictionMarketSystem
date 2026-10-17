@@ -69,6 +69,7 @@ def upgrade() -> None:
             model TEXT NOT NULL,
             prompt_hash TEXT NOT NULL,
             input_hash TEXT NOT NULL,
+            prompt TEXT NOT NULL,
             response JSONB NOT NULL,
             recorded_at TIMESTAMPTZ NOT NULL,
             run_mode TEXT NOT NULL

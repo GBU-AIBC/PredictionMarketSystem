@@ -105,6 +105,7 @@ class LLMReplayStore(Protocol):
         model: str,
         prompt_hash: str,
         input_hash: str,
+        prompt: str,
         response: Mapping[str, object],
         recorded_at: datetime,
         run_mode: str,
@@ -328,10 +329,42 @@ class LLMForecaster:
         )
         if self.record_replay_mode == "replay":
             return await self._replay_from_store(replay_key)
-        result = await asyncio.to_thread(self.predict, signal, evidence=evidence)
+        try:
+            result = await asyncio.to_thread(self.predict, signal, evidence=evidence)
+        except Exception:
+            if self.record_replay_mode == "record":
+                self.last_failure_reason = self.last_failure_reason or "provider_error"
+                await self._record_store_result(replay_key, None, prompt=prompt)
+            raise
         if self.record_replay_mode == "record":
-            await self._record_store_result(replay_key, result)
+            await self._record_store_result(replay_key, result, prompt=prompt)
         return result
+
+    async def record_timeout(self, signal: MarketSignal) -> None:
+        """Persist PAPER timeout outcome after the controller deadline expires."""
+        if self.config is None or self.record_replay_mode != "record":
+            return
+        evidence: Sequence[AgentEvidence] = ()
+        if self.evidence_reader is not None:
+            try:
+                evidence = await self.evidence_reader.read_evidence(
+                    signal.market_id,
+                    as_of=signal.timestamp,
+                    limit=8,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("LLM evidence read failed while recording timeout")
+        prompt = _prompt(signal, evidence=evidence)
+        key = _replay_key(
+            self.config,
+            signal,
+            prompt,
+            evidence=evidence,
+            strategy_id=self.strategy_id,
+            strategy_version_id=self.strategy_version_id,
+        )
+        self.last_failure_reason = "timeout"
+        await self._record_store_result(key, None, prompt=prompt)
 
     async def _replay_from_store(
         self,
@@ -369,6 +402,8 @@ class LLMForecaster:
         self,
         key: tuple[str, str, str],
         result: LLMForecastResult | None,
+        *,
+        prompt: str,
     ) -> None:
         if self.replay_store is None or self.config is None:
             return
@@ -391,12 +426,12 @@ class LLMForecaster:
                 model=self.config.model,
                 prompt_hash=key[1],
                 input_hash=key[2],
+                prompt=prompt,
                 response=response,
                 recorded_at=datetime.now(tz=UTC),
                 run_mode="paper",
             )
         except Exception as error:  # noqa: BLE001
-            self.last_failure_reason = "replay_record_failed"
             logger.error("LLM replay recording failed; keeping paid forecast: %s", error)
 
     async def forecast(self, signal: MarketSignal) -> float:

@@ -8,11 +8,13 @@ import re
 from typing import Any
 
 import asyncpg
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from pms.core.validation import validate_finite, validate_probability
 from pms.factors.catalog import FactorCatalogEntry, catalog_entry
+from pms.api.auth import require_any_scope, require_scope
+from pms.api.routes.agent_common import reject_live_agent_write
 from pms.api.routes.agent_common import pool_from_request, token_id_from_request
 
 
@@ -271,7 +273,15 @@ async def get_agent_factor_provenance(
     )
 
 
-@router.post("/factors/{factor_id}/observations", response_model=AgentFactorObservationResponse, status_code=201)
+@router.post(
+    "/factors/{factor_id}/observations",
+    response_model=AgentFactorObservationResponse,
+    status_code=201,
+    dependencies=[
+        Depends(require_any_scope("paper_operate", "research")),
+        Depends(reject_live_agent_write),
+    ],
+)
 async def post_agent_factor(
     factor_id: str,
     request: Request,
@@ -291,6 +301,7 @@ async def post_agent_factor(
     "/factors/{factor_id}/observations/provenance",
     response_model=AgentFactorProvenanceResponse,
     response_model_exclude_none=True,
+    dependencies=[Depends(require_scope("read"))],
 )
 async def get_agent_factor_provenance_route(
     factor_id: str,

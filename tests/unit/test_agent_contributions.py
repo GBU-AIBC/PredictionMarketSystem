@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from dataclasses import replace
+import time
 from typing import Any, Mapping, cast
 from types import SimpleNamespace
 
@@ -202,12 +203,15 @@ class MemoryReplayStore:
         model: str,
         prompt_hash: str,
         input_hash: str,
+        prompt: str,
         response: Mapping[str, object],
         recorded_at: datetime,
         run_mode: str,
     ) -> None:
         del model, prompt_hash, input_hash, recorded_at, run_mode
-        self.rows.setdefault(replay_key, dict(response))
+        row = dict(response)
+        row["prompt"] = prompt
+        self.rows.setdefault(replay_key, row)
 
 
 def _openai_client(content: str) -> object:
@@ -477,3 +481,73 @@ async def test_controller_research_replay_timeout_is_fatal() -> None:
             ),
             _signal(),
         )
+
+
+@pytest.mark.asyncio
+async def test_paper_timeout_records_no_forecast_for_replay() -> None:
+    store = MemoryReplayStore()
+
+    def slow_provider(**kwargs: object) -> object:
+        del kwargs
+        time.sleep(0.1)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"prob_estimate":0.8,"confidence":0.5,"rationale":"late"}'
+                    )
+                )
+            ]
+        )
+
+    forecaster = LLMForecaster(
+        config=LLMSettings(
+            enabled=True,
+            provider="openai",
+            api_key="test",
+            model="openai-test",
+        ),
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=slow_provider))
+        ),
+        record_replay_mode="record",
+        replay_store=cast(Any, store),
+    )
+    pipeline = ControllerPipeline(
+        settings=PMSSettings(llm=LLMSettings(timeout_s=0.001)),
+    )
+    assert await pipeline._predict_forecaster(forecaster, _signal()) is None
+    assert len(store.rows) == 1
+    replay = LLMForecaster(
+        config=forecaster.config,
+        record_replay_mode="replay",
+        replay_store=cast(Any, store),
+    )
+    assert await replay.apredict(_signal()) is None
+
+
+@pytest.mark.asyncio
+async def test_paper_provider_error_records_no_forecast_for_replay() -> None:
+    store = MemoryReplayStore()
+
+    def failing_provider(**kwargs: object) -> object:
+        del kwargs
+        raise RuntimeError("provider unavailable")
+
+    forecaster = LLMForecaster(
+        config=LLMSettings(enabled=True, provider="openai", api_key="test", model="openai-test"),
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=failing_provider))
+        ),
+        record_replay_mode="record",
+        replay_store=cast(Any, store),
+    )
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        await forecaster.apredict(_signal())
+    assert len(store.rows) == 1
+    replay = LLMForecaster(
+        config=forecaster.config,
+        record_replay_mode="replay",
+        replay_store=cast(Any, store),
+    )
+    assert await replay.apredict(_signal()) is None

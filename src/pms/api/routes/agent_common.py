@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncpg
 from fastapi import HTTPException, Request
+from pms.core.enums import RunMode
 
 
 AGENT_CONTRIBUTION_SCOPES = frozenset({"paper_operate", "research"})
@@ -22,3 +23,13 @@ def token_id_from_request(request: Request) -> str:
     if not isinstance(token_id, str) or not token_id:
         raise HTTPException(status_code=401, detail="Authenticated token identity is required")
     return token_id
+
+
+def reject_live_agent_write(request: Request) -> None:
+    runner = getattr(request.app.state, "runner", None)
+    config = getattr(runner, "config", None)
+    if config is not None and getattr(config, "mode", None) == RunMode.LIVE:
+        raise HTTPException(
+            status_code=403,
+            detail="Agent contributions are disabled in LIVE mode.",
+        )

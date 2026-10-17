@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
-import time
 from types import SimpleNamespace
 from typing import cast
 
@@ -52,13 +51,21 @@ pytestmark = [
 def _api(pool: asyncpg.Pool) -> FastAPI:
     app = FastAPI()
     app.state.runner = SimpleNamespace(pg_pool=pool)
+    app.state.settings = PMSSettings(
+        mode=RunMode.PAPER,
+        api_token="integration-secret",
+        auto_migrate_default_v2=False,
+    )
 
     @app.middleware("http")
     async def token_context(
         request: Request,
         call_next: RequestResponseEndpoint,
     ) -> Response:
-        request.state.token_id = "integration-token"
+        request.scope["headers"] = [
+            *request.scope["headers"],
+            (b"authorization", b"Bearer integration-secret"),
+        ]
         return await call_next(request)
 
     app.include_router(evidence_router)
@@ -172,7 +179,7 @@ async def test_agent_evidence_and_factor_routes_round_trip_with_pit_and_provenan
             json={
                 "market_id": market_id,
                 "value": 0.7,
-                "ts": (now + timedelta(seconds=1)).isoformat(),
+                "ts": (datetime.now(tz=UTC) + timedelta(seconds=1)).isoformat(),
                 "model": "model-v1",
                 "prompt_hash": "b" * 64,
             },
@@ -586,6 +593,7 @@ async def test_postgres_replay_store_indexed_lookup_and_first_record_wins(
             "openai-test",
             "p" * 64,
             f"{index:064x}",
+            "canonical prompt",
             json.dumps({"prob_estimate": 0.5, "confidence": 0.5, "rationale": "scale"}),
             recorded_at,
             "paper",
@@ -596,23 +604,29 @@ async def test_postgres_replay_store_indexed_lookup_and_first_record_wins(
         await connection.executemany(
             """
             INSERT INTO llm_replay_records (
-                replay_key, model, prompt_hash, input_hash, response,
+                replay_key, model, prompt_hash, input_hash, prompt, response,
                 recorded_at, run_mode
-            ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+            ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
             ON CONFLICT (replay_key) DO NOTHING
             """,
             rows,
         )
     store = PostgresLLMReplayStore(pg_pool)
-    started = time.monotonic()
+    async with pg_pool.acquire() as connection:
+        plan_rows = await connection.fetch(
+            "EXPLAIN (FORMAT TEXT) SELECT response FROM llm_replay_records WHERE replay_key = $1",
+            "w2b-scale-99999",
+        )
+    plan = "\n".join(str(row[0]) for row in plan_rows)
+    assert "llm_replay_records_pkey" in plan
     result = await store.get("w2b-scale-99999")
-    assert time.monotonic() - started < 0.5
     assert result is not None
     await store.put(
         replay_key="w2b-scale-99999",
         model="openai-test",
         prompt_hash="p" * 64,
         input_hash="different",
+        prompt="canonical prompt",
         response={"prob_estimate": 0.1},
         recorded_at=recorded_at,
         run_mode="paper",

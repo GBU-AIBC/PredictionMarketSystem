@@ -324,7 +324,19 @@ def test_routes_have_explicit_auth_or_public_exception_and_typed_openapi() -> No
             if method not in {"get", "post", "put", "patch", "delete"}:
                 continue
             assert operation.get("tags"), (path, method)
-            schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
+            success_response = next(
+                (
+                    response
+                    for code, response in operation["responses"].items()
+                    if code.isdigit()
+                    and 200 <= int(code) < 300
+                    and "content" in response
+                    and "application/json" in response["content"]
+                ),
+                None,
+            )
+            assert success_response is not None, (path, method, operation["responses"])
+            schema = success_response["content"]["application/json"]["schema"]
             assert schema
             while "$ref" in schema:
                 schema = openapi["components"]["schemas"][schema["$ref"].rsplit("/", 1)[-1]]
@@ -384,12 +396,17 @@ def test_generated_authorization_matrix_covers_every_route_and_scope() -> None:
         ("GET", "/approvals/pending"): frozenset({"read"}),
         ("GET", "/evaluation/reports"): frozenset({"read"}),
         ("GET", "/evaluation/reports/{report_id}"): frozenset({"read"}),
+        ("POST", "/evidence"): frozenset({"paper_operate", "research"}),
+        ("GET", "/evidence"): frozenset({"read"}),
+        ("POST", "/factors/{factor_id}/observations"): frozenset({"paper_operate", "research"}),
+        ("GET", "/factors/{factor_id}/observations/provenance"): frozenset({"read"}),
     }
     matrix: dict[tuple[str, str, str], str] = {}
     actual_keys: set[tuple[str, str]] = set()
     any_scope_names = {
         "require_any_scope_paper_operate_live_admin": {"paper_operate", "live_admin"},
         "require_any_scope_kill_paper_operate_live_admin": {"kill", "paper_operate", "live_admin"},
+        "require_any_scope_paper_operate_research": {"paper_operate", "research"},
     }
     for route in app.routes:
         if not isinstance(route, APIRoute) or not route.include_in_schema:
@@ -488,6 +505,10 @@ async def test_behavioral_authorization_matrix_issues_requests_in_both_modes(
         ("GET", "/approvals/pending"): frozenset({"read"}),
         ("GET", "/evaluation/reports"): frozenset({"read"}),
         ("GET", "/evaluation/reports/{report_id}"): frozenset({"read"}),
+            ("POST", "/evidence"): frozenset({"paper_operate", "research"}),
+            ("GET", "/evidence"): frozenset({"read"}),
+            ("POST", "/factors/{factor_id}/observations"): frozenset({"paper_operate", "research"}),
+            ("GET", "/factors/{factor_id}/observations/provenance"): frozenset({"read"}),
     }
     credentials: tuple[tuple[str, str | None, frozenset[str]], ...] = (
         ("none", None, frozenset()),
@@ -586,8 +607,18 @@ async def test_behavioral_authorization_matrix_issues_requests_in_both_modes(
                     status = await issue(client, method, url, headers=headers, **kwargs)
                     required = expected[(method, route_path)]
                     if mode == RunMode.LIVE:
-                        if route_path in {"/decisions/{decision_id}/accept", "/feedback/{feedback_id}/resolve", "/config", "/run/start"}:
+                        if method == "POST" and route_path in {
+                            "/decisions/{decision_id}/accept",
+                            "/feedback/{feedback_id}/resolve",
+                            "/config",
+                            "/run/start",
+                        }:
                             required = frozenset({"live_admin"})
+                        elif method == "POST" and route_path in {
+                            "/evidence",
+                            "/factors/{factor_id}/observations",
+                        }:
+                            required = frozenset()
                         elif route_path == "/run/stop":
                             required = frozenset({"kill", "live_admin"})
                     elif route_path in {"/decisions/{decision_id}/accept", "/feedback/{feedback_id}/resolve", "/config", "/run/start"}:

@@ -1,4 +1,8 @@
-"""PostgreSQL persistence for deterministic LLM record/replay responses."""
+"""PostgreSQL persistence for deterministic LLM record/replay responses.
+
+Rows remain available for deterministic replay and grow with distinct prompt
+keys; operators may call :meth:`prune_before` during maintenance.
+"""
 
 from __future__ import annotations
 
@@ -39,6 +43,7 @@ class PostgresLLMReplayStore:
         model: str,
         prompt_hash: str,
         input_hash: str,
+        prompt: str,
         response: Mapping[str, Any],
         recorded_at: datetime,
         run_mode: str,
@@ -47,15 +52,16 @@ class PostgresLLMReplayStore:
             await connection.execute(
                 """
                 INSERT INTO llm_replay_records (
-                    replay_key, model, prompt_hash, input_hash, response,
+                    replay_key, model, prompt_hash, input_hash, prompt, response,
                     recorded_at, run_mode
-                ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+                ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
                 ON CONFLICT (replay_key) DO NOTHING
                 """,
                 replay_key,
                 model,
                 prompt_hash,
                 input_hash,
+                prompt,
                 _json_response(response),
                 recorded_at,
                 run_mode,

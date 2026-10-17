@@ -6,14 +6,19 @@ from datetime import UTC, datetime
 from typing import Any
 
 import asyncpg
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from pms.storage.agent_evidence_store import (
     AgentEvidence,
     AgentEvidenceStore,
 )
-from pms.api.routes.agent_common import pool_from_request, token_id_from_request
+from pms.api.auth import require_any_scope, require_scope
+from pms.api.routes.agent_common import (
+    pool_from_request,
+    reject_live_agent_write,
+    token_id_from_request,
+)
 
 
 router = APIRouter(tags=["agent"])
@@ -99,14 +104,26 @@ async def list_evidence(
     return AgentEvidenceListResponse(evidence=[_evidence_response(row) for row in rows])
 
 
-@router.post("/evidence", response_model=AgentEvidenceResponse, status_code=201)
+@router.post(
+    "/evidence",
+    response_model=AgentEvidenceResponse,
+    status_code=201,
+    dependencies=[
+        Depends(require_any_scope("paper_operate", "research")),
+        Depends(reject_live_agent_write),
+    ],
+)
 async def post_evidence(request: Request, body: AgentEvidenceRequest) -> AgentEvidenceResponse:
     pool = pool_from_request(request)
     token_id = token_id_from_request(request)
     return await submit_evidence(pool, body, submitted_by_token_id=token_id)
 
 
-@router.get("/evidence", response_model=AgentEvidenceListResponse)
+@router.get(
+    "/evidence",
+    response_model=AgentEvidenceListResponse,
+    dependencies=[Depends(require_scope("read"))],
+)
 async def get_evidence(
     request: Request,
     market_id: str = Query(min_length=1, max_length=256),
