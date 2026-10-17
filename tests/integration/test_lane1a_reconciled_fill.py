@@ -194,6 +194,7 @@ async def test_submission_unknown_filled_reconciles_idempotent_fill(
             legacy_fee_fill.trade_id,
             fees=None,
             slippage_bps=0.0,
+            audit_pending=False,
         )
         await LiveEmergencyAuditWriter(
             Path(live_settings.live_emergency_audit_path)
@@ -215,6 +216,7 @@ async def test_submission_unknown_filled_reconciles_idempotent_fill(
             slippage_bps=0.0,
             reconciled_by="operator",
             evidence="legacy-venue-trade-override",
+            audit_pending=False,
         ) is False
         assert await legacy_store.reconcile_fee(
             legacy_fee_fill.trade_id,
@@ -224,6 +226,7 @@ async def test_submission_unknown_filled_reconciles_idempotent_fill(
             reconciled_by="operator",
             evidence="legacy-venue-trade-override",
             override=True,
+            audit_pending=False,
         )
 
         unresolved = FillRecord(
@@ -258,6 +261,7 @@ async def test_submission_unknown_filled_reconciles_idempotent_fill(
             unresolved.trade_id,
             fees=0.02,
             fee_bps=40,
+            audit_pending=False,
         )
         await LiveEmergencyAuditWriter(
             Path(live_settings.live_emergency_audit_path)

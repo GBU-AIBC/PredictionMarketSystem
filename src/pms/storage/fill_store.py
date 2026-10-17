@@ -171,7 +171,7 @@ class FillStore:
         reconciled_by: str | None = None,
         evidence: str | None = None,
         override: bool = False,
-        audit_pending: bool = False,
+        audit_pending: bool = True,
     ) -> bool:
         """Record verified venue fee telemetry for an unresolved fill once."""
         if not fill_id.strip():
@@ -288,7 +288,9 @@ class FillStore:
                        FROM jsonb_array_elements_text(
                            COALESCE(fill_payloads.payload->'anomaly_flags', '[]'::jsonb)
                        ) AS flag
-                       WHERE flag LIKE 'run_mode=%'
+                       WHERE flag IN (
+                           'run_mode=backtest', 'run_mode=paper', 'run_mode=live'
+                       )
                    )
                 ORDER BY fills.ts ASC, fills.fill_id ASC
                 LIMIT $1
@@ -321,7 +323,9 @@ class FillStore:
                         FROM jsonb_array_elements_text(
                             COALESCE(payload->'anomaly_flags', '[]'::jsonb)
                         ) AS flag
-                        WHERE flag LIKE 'run_mode=%'
+                        WHERE flag IN (
+                            'run_mode=backtest', 'run_mode=paper', 'run_mode=live'
+                        )
                     )
                     FOR UPDATE
                     """
@@ -1012,5 +1016,5 @@ def _run_mode_from_anomaly_flags(value: object) -> str | None:
     for flag in _string_list(value):
         if flag.startswith(prefix):
             mode = flag[len(prefix) :].strip().lower()
-            return mode or None
+            return mode if mode in {"backtest", "paper", "live"} else None
     return None

@@ -8,7 +8,7 @@ import pytest
 
 from pms.core.models import FillRecord, OrderState, Position
 from pms.storage.fill_store import FillStore, _json_object as fill_json_object
-from pms.storage.fill_store import _string_list
+from pms.storage.fill_store import _run_mode_from_anomaly_flags, _string_list
 from pms.storage.order_store import OrderStore, _json_object as order_json_object
 
 
@@ -71,6 +71,11 @@ class _RecordingPool:
 
     def acquire(self) -> _AcquireContext:
         return _AcquireContext(self._connection)
+
+
+def test_invalid_run_mode_is_treated_as_unknown_provenance() -> None:
+    assert _run_mode_from_anomaly_flags(["run_mode=staging"]) is None
+    assert _run_mode_from_anomaly_flags(["run_mode=live"]) == "live"
 
 
 def _order_state() -> OrderState:

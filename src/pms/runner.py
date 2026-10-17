@@ -4690,21 +4690,32 @@ def _is_open_order_state(order_state: OrderState) -> bool:
 
 def _portfolio_with_fill(portfolio: Portfolio, fill: FillRecord) -> Portfolio:
     positions = list(portfolio.open_positions)
-    fill_size = fill.fill_notional_usdc
-    fill_fees = fill.fees or 0.0
+    fill_size_dec = Decimal(str(fill.fill_notional_usdc))
+    fill_fees_dec = Decimal(str(fill.fees or 0.0))
+    fill_size = float(fill_size_dec)
+    fill_fees = float(fill_fees_dec)
     contracts = _filled_contracts(fill)
     for index, position in enumerate(positions):
         if _same_position(position, fill):
-            new_shares = position.shares_held + contracts
-            avg_entry_price = (
-                position.avg_entry_price * position.shares_held
-                + fill.fill_price * contracts
-            ) / new_shares
+            new_shares_dec = Decimal(str(position.shares_held)) + Decimal(
+                str(contracts)
+            )
+            avg_entry_price = float(
+                (
+                    Decimal(str(position.avg_entry_price))
+                    * Decimal(str(position.shares_held))
+                    + Decimal(str(fill.fill_price)) * Decimal(str(contracts))
+                )
+                / new_shares_dec
+            )
+            new_shares = float(new_shares_dec)
             positions[index] = replace(
                 position,
                 shares_held=new_shares,
                 avg_entry_price=avg_entry_price,
-                locked_usdc=position.locked_usdc + fill_size,
+                locked_usdc=float(
+                    Decimal(str(position.locked_usdc)) + fill_size_dec
+                ),
                 current_price=fill.fill_price,
                 risk_group_id=position.risk_group_id or fill.risk_group_id,
             )
