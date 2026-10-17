@@ -165,34 +165,47 @@ class MarketSelector:
         specs = await self._registry.list_market_selections()
         for strategy_id, _version_id, spec in specs:
             strategy_ids.append(strategy_id)
-            reason = await self._discovery_reason(market, spec)
-            if reason is None:
-                reason = await self._explain_for_spec(market, spec)
+            venue = normalize_venue(spec.venue, context="MarketSelector.explain")
+            eligible = await self._store.read_eligible_markets(
+                venue,
+                spec.resolution_time_max_horizon_days,
+                spec.volume_min_usdc,
+            )
+            candidate = next(
+                (
+                    (candidate_market, candidate_tokens)
+                    for candidate_market, candidate_tokens in eligible
+                    if candidate_market.condition_id == market_id
+                ),
+                None,
+            )
+            if candidate is None:
+                reason = await self._discovery_reason(
+                    market,
+                    spec,
+                    eligible_markets=eligible,
+                )
+            else:
+                candidate_market, candidate_tokens = candidate
+                reason = await self._filter_reason(candidate_market, spec)
             strategy_reasons[strategy_id] = "selected" if reason is None else reason
             if reason is not None:
                 reasons.append(reason)
-            read_tokens = getattr(self._store, "read_tokens_for_market", None)
-            if callable(read_tokens):
-                tokens = await read_tokens(market_id)
+            if candidate is not None:
                 token_ids.extend(
                     token.token_id
-                    for token in tokens
+                    for token in candidate_tokens
                     if token.outcome in {"YES", "NO"}
                 )
-            elif reason is None:
-                eligible = await self._store.read_eligible_markets(
-                    spec.venue,
-                    spec.resolution_time_max_horizon_days,
-                    spec.volume_min_usdc,
-                )
-                for candidate, tokens in eligible:
-                    if candidate.condition_id == market_id:
-                        token_ids.extend(
-                            token.token_id
-                            for token in tokens
-                            if token.outcome in {"YES", "NO"}
-                        )
-                        break
+            else:
+                read_tokens = getattr(self._store, "read_tokens_for_market", None)
+                if callable(read_tokens):
+                    tokens = await read_tokens(market_id)
+                    token_ids.extend(
+                        token.token_id
+                        for token in tokens
+                        if token.outcome in {"YES", "NO"}
+                    )
         pinned = tuple(sorted(await self._read_user_subscriptions()))
         token_ids = list(dict.fromkeys(token_ids))
         if pinned and any(token_id in pinned for token_id in token_ids):
@@ -231,13 +244,19 @@ class MarketSelector:
         self,
         market: Market,
         spec: MarketSelectionSpec,
+        *,
+        eligible_markets: Sequence[tuple[Market, Sequence[Token]]] | None = None,
     ) -> SelectionReasonCode | None:
         """Use the store's eligibility query as the discovery source of truth."""
         venue = normalize_venue(spec.venue, context="MarketSelector.explain")
-        eligible = await self._store.read_eligible_markets(
-            venue,
-            spec.resolution_time_max_horizon_days,
-            spec.volume_min_usdc,
+        eligible = (
+            eligible_markets
+            if eligible_markets is not None
+            else await self._store.read_eligible_markets(
+                venue,
+                spec.resolution_time_max_horizon_days,
+                spec.volume_min_usdc,
+            )
         )
         if any(candidate.condition_id == market.condition_id for candidate, _ in eligible):
             return None
