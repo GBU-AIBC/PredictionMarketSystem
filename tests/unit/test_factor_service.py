@@ -544,6 +544,139 @@ async def test_factor_service_quarantines_persistence_after_bounded_retries(
 
 
 @pytest.mark.asyncio
+async def test_factor_service_retries_connection_outage_then_persists_new_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncpg
+
+    calls = 0
+    persisted: list[FactorValueRow] = []
+
+    async def outage_then_recovery(
+        pool: Any,
+        row: FactorValueRow,
+        *,
+        definition_version: str = "1",
+    ) -> None:
+        nonlocal calls
+        del pool, definition_version
+        calls += 1
+        if calls <= 5:
+            raise asyncpg.CannotConnectNowError("database outage")
+        persisted.append(row)
+
+    monkeypatch.setattr(
+        "pms.factors.service.persist_factor_value",
+        outage_then_recovery,
+    )
+    service = FactorService(
+        pool=cast(Any, object()),
+        store=cast(Any, FakeStore()),
+        cadence_s=0.1,
+        factors=(PersistedFactor,),
+        signal_stream=SequenceSignalStream([]),
+    )
+    first_signal = _signal(market_id="outage-recovery-market")
+    healthy_signal = replace(
+        first_signal,
+        fetched_at=first_signal.fetched_at.replace(second=1),
+    )
+
+    for _ in range(5):
+        await service.compute_once([first_signal])
+    assert await service.compute_once([healthy_signal]) == 1
+    assert persisted == [
+        FactorValueRow(
+            factor_id="persisted_factor",
+            param="",
+            market_id=healthy_signal.market_id,
+            ts=healthy_signal.timestamp,
+            value=healthy_signal.yes_price,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_factor_service_finite_stream_keeps_transient_failure_dirty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncpg
+
+    calls = 0
+    persisted = asyncio.Event()
+
+    async def outage_then_recovery(
+        pool: Any,
+        row: FactorValueRow,
+        *,
+        definition_version: str = "1",
+    ) -> None:
+        nonlocal calls
+        del pool, definition_version
+        calls += 1
+        if calls <= 2:
+            raise asyncpg.ConnectionDoesNotExistError("database outage")
+        del row
+        persisted.set()
+
+    monkeypatch.setattr(
+        "pms.factors.service.persist_factor_value",
+        outage_then_recovery,
+    )
+    service = FactorService(
+        pool=cast(Any, object()),
+        store=cast(Any, FakeStore()),
+        cadence_s=0.001,
+        factors=(PersistedFactor,),
+        signal_stream=SequenceSignalStream([_signal(market_id="finite-outage")]),
+    )
+    task = asyncio.create_task(service.run())
+    await asyncio.wait_for(persisted.wait(), timeout=1.0)
+    await asyncio.wait_for(task, timeout=1.0)
+    assert calls == 3
+
+
+@pytest.mark.asyncio
+async def test_factor_service_quarantine_is_scoped_to_failed_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[FactorValueRow] = []
+
+    async def reject_first_observation(
+        pool: Any,
+        row: FactorValueRow,
+        *,
+        definition_version: str = "1",
+    ) -> None:
+        del pool, definition_version
+        if row.ts == first_signal.timestamp:
+            raise ValueError("deterministic integrity failure")
+        persisted.append(row)
+
+    monkeypatch.setattr(
+        "pms.factors.service.persist_factor_value",
+        reject_first_observation,
+    )
+    service = FactorService(
+        pool=cast(Any, object()),
+        store=cast(Any, FakeStore()),
+        cadence_s=0.1,
+        factors=(PersistedFactor,),
+        signal_stream=SequenceSignalStream([]),
+    )
+    first_signal = _signal(market_id="row-scoped-quarantine-market")
+    healthy_signal = replace(
+        first_signal,
+        fetched_at=first_signal.fetched_at.replace(second=1),
+    )
+
+    for _ in range(5):
+        await service.compute_once([first_signal])
+    assert await service.compute_once([healthy_signal]) == 1
+    assert persisted[0].ts == healthy_signal.timestamp
+
+
+@pytest.mark.asyncio
 async def test_factor_service_recovers_market_shell_after_fk_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

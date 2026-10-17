@@ -52,6 +52,18 @@ async def _seed_catalog_and_series(
         connection,
         factor_ids=("metaculus_prior", "orderbook_imbalance"),
     )
+    await connection.execute(
+        """
+        INSERT INTO factors (
+            factor_id, name, description, input_schema_hash, default_params,
+            output_type, direction, owner
+        ) VALUES (
+            'subset_relation', 'Subset relation', 'deferred relation factor',
+            'test', '{}'::jsonb, 'scalar', 'neutral', 'deferred'
+        )
+        ON CONFLICT (factor_id) DO NOTHING
+        """
+    )
     ts_1 = datetime(2026, 4, 18, 10, 0, tzinfo=UTC)
     ts_2 = datetime(2026, 4, 18, 10, 5, tzinfo=UTC)
     ts_3 = datetime(2026, 4, 18, 10, 10, tzinfo=UTC)

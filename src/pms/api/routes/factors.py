@@ -42,6 +42,7 @@ async def list_factor_catalog(pg_pool: asyncpg.Pool) -> dict[str, Any]:
     query = """
     SELECT factor_id, name, description, output_type, direction
     FROM factors
+    WHERE owner <> 'deferred'
     ORDER BY factor_id ASC
     """
     async with pg_pool.acquire() as connection:

@@ -916,13 +916,25 @@ class Runner:
             reader = _PostgresFlbMarketSnapshotReader(
                 PostgresMarketDataStore(self._pg_pool)
             )
-        h1_strategy = (
-            build_h1_flb_strategy(
-                time_in_force=self.config.controller.time_in_force,
+        h1_strategy: Strategy | None = None
+        if strategy_id == H1_FLB_STRATEGY_ID:
+            calibration_model = self._flb_calibration_model
+            h1_strategy = (
+                _h1_flb_strategy_from_settings(
+                    self.config,
+                    calibration_model=calibration_model,
+                )
+                if calibration_model is not None
+                else build_h1_flb_strategy(
+                    time_in_force=self.config.controller.time_in_force,
+                )
             )
-            if strategy_id == H1_FLB_STRATEGY_ID
-            else None
-        )
+        if h1_strategy is not None:
+            _verify_runtime_strategy_version(
+                h1_strategy,
+                strategy_version_id,
+                legacy_ids={"h1-flb-v1"},
+            )
         position_sizing_risk = self.config.risk
         if h1_strategy is not None:
             position_sizing_risk = self.config.risk.model_copy(
@@ -4818,6 +4830,7 @@ def _h1_flb_strategy_from_settings(
     return build_h1_flb_strategy(
         calibration_csv_sha256=provenance.calibration_csv_sha256,
         calibration_source_label=provenance.calibration_source_label,
+        time_in_force=settings.controller.time_in_force,
     )
 
 

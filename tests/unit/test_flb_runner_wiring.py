@@ -16,8 +16,10 @@ from pms.config import (
 from pms.core.enums import RunMode
 from pms.runner import Runner
 from pms.strategies.flb import FlbAgent, FlbController, FlbStrategyModule, LiveFlbSource
+from pms.strategies.flb.projection import build_h1_flb_strategy
 from pms.strategies.flb.source import FlbMarketSnapshot
 from pms.strategies.intents import TradeIntent
+from pms.strategies.versioning import compute_strategy_version_id
 
 
 NOW = datetime(2026, 5, 3, 15, 0, tzinfo=UTC)
@@ -226,6 +228,25 @@ def test_runner_builds_flb_strategy_module_with_live_components() -> None:
     position_sizer_risk = getattr(module.source.position_sizer, "risk")
     assert position_sizer_risk is not None
     assert position_sizer_risk.max_position_per_market == pytest.approx(1.0)
+
+
+def test_runner_flb_module_uses_versioned_time_in_force() -> None:
+    settings = PMSSettings(
+        mode=RunMode.PAPER,
+        controller=ControllerSettings(time_in_force="IOC"),
+    )
+    runner = Runner(config=settings)
+    strategy = build_h1_flb_strategy(time_in_force="IOC")
+    version_id = compute_strategy_version_id(*strategy.snapshot())
+
+    module = runner.build_flb_strategy_module(
+        strategy_id="h1_flb",
+        strategy_version_id=version_id,
+        market_ids=("market-flb-1",),
+        market_reader=_StaticFlbMarketReader(_market()),
+    )
+
+    assert getattr(module.source, "time_in_force").value == "IOC"
 
 
 def test_runner_rejects_configured_flb_calibration_without_provenance(

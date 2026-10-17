@@ -19,6 +19,7 @@ from pms.storage.market_data_store import PostgresMarketDataStore
 
 logger = logging.getLogger(__name__)
 _MAX_PERSIST_RETRIES = 3
+_PersistenceKey = tuple[str, str, str, datetime]
 
 
 async def persist_factor_value(
@@ -75,11 +76,11 @@ class FactorService:
         init=False,
         default_factory=dict,
     )
-    _persistence_failures: dict[tuple[str, str, str], int] = field(
+    _persistence_failures: dict[_PersistenceKey, int] = field(
         init=False,
         default_factory=dict,
     )
-    _quarantined_persistence: set[tuple[str, str, str]] = field(
+    _quarantined_persistence: set[_PersistenceKey] = field(
         init=False,
         default_factory=set,
     )
@@ -110,8 +111,16 @@ class FactorService:
                     }
                 if self._stream_exhausted:
                     self._raise_stream_error(stream_task)
-                    logger.warning("factor signal stream exhausted; factor service exiting")
-                    return
+                    if not dirty_signals:
+                        logger.warning(
+                            "factor signal stream exhausted; factor service exiting"
+                        )
+                        return
+                    # Keep retryable shell and transient persistence failures
+                    # queued even when the finite source has ended.  A later
+                    # database recovery must not require a process restart.
+                    await asyncio.sleep(self.cadence_s)
+                    continue
                 await asyncio.sleep(self.cadence_s)
         except asyncio.CancelledError:
             logger.info("factor service cancelled")
@@ -163,7 +172,8 @@ class FactorService:
                 if row is None:
                     continue
                 dedupe_key = (row.factor_id, row.market_id, row.param)
-                if dedupe_key in self._quarantined_persistence:
+                persistence_key = (*dedupe_key, row.ts)
+                if persistence_key in self._quarantined_persistence:
                     continue
                 if self._last_persisted_ts.get(dedupe_key) == row.ts:
                     continue
@@ -176,7 +186,7 @@ class FactorService:
                             signal,
                             definition_version=factor_cls.definition_version,
                         )
-                except Exception:
+                except Exception as error:
                     # Dedupe key intentionally not advanced: the same row
                     # retries on the next cadence instead of being lost.
                     logger.exception(
@@ -185,12 +195,21 @@ class FactorService:
                         row.market_id,
                         row.ts.isoformat(),
                     )
-                    attempts = self._persistence_failures.get(dedupe_key, 0) + 1
-                    self._persistence_failures[dedupe_key] = attempts
+                    if _is_transient_persistence_error(error):
+                        failed_market_ids.add(signal.market_id)
+                        logger.warning(
+                            "transient factor persist failure; retrying "
+                            "factor_id=%s market_id=%s",
+                            row.factor_id,
+                            signal.market_id,
+                        )
+                        continue
+                    attempts = self._persistence_failures.get(persistence_key, 0) + 1
+                    self._persistence_failures[persistence_key] = attempts
                     if attempts <= _MAX_PERSIST_RETRIES:
                         failed_market_ids.add(signal.market_id)
                     else:
-                        self._quarantined_persistence.add(dedupe_key)
+                        self._quarantined_persistence.add(persistence_key)
                         logger.error(
                             "factor persist quarantined after %d attempts "
                             "factor_id=%s market_id=%s",
@@ -199,7 +218,13 @@ class FactorService:
                             signal.market_id,
                         )
                     continue
-                self._persistence_failures.pop(dedupe_key, None)
+                self._persistence_failures.pop(persistence_key, None)
+                for failed_key in tuple(self._persistence_failures):
+                    if failed_key[:3] == dedupe_key:
+                        self._persistence_failures.pop(failed_key, None)
+                for failed_key in tuple(self._quarantined_persistence):
+                    if failed_key[:3] == dedupe_key:
+                        self._quarantined_persistence.discard(failed_key)
                 self._last_persisted_ts[dedupe_key] = row.ts
                 persisted += 1
         self._last_failed_market_ids = failed_market_ids
@@ -313,6 +338,20 @@ def _is_constraint_violation(
 ) -> bool:
     actual_constraint = getattr(exc, "constraint_name", None)
     return actual_constraint == constraint_name or constraint_name in str(exc)
+
+
+def _is_transient_persistence_error(error: Exception) -> bool:
+    transient_types = (
+        asyncpg.CannotConnectNowError,
+        asyncpg.ConnectionDoesNotExistError,
+        asyncpg.InterfaceError,
+        asyncpg.TooManyConnectionsError,
+        asyncpg.PostgresConnectionError,
+        asyncio.TimeoutError,
+        TimeoutError,
+        OSError,
+    )
+    return isinstance(error, transient_types)
 
 
 def _requires_open_yes_price(factor_cls: type[FactorDefinition]) -> bool:

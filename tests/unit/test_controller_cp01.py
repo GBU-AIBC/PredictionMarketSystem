@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from dataclasses import replace
 from hashlib import sha256
 import importlib
 import json
@@ -13,7 +14,6 @@ from pms.config import ControllerSettings, PMSSettings, StrategyRuntimeSettings
 from pms.controller.forecasters.flb import FlbForecaster
 from pms.controller.pipeline import (
     _decision_cost_edges,
-    _strategy_economic_int,
     _strategy_fee_rate,
 )
 from pms.core.enums import RunMode
@@ -28,6 +28,7 @@ from pms.strategies.projections import (
     StrategyConfig,
 )
 from pms.strategies.versioning import compute_strategy_version_id
+from pms.strategies.economics import strategy_economic_int
 
 
 def _load_symbol(module_name: str, symbol_name: str) -> Any:
@@ -85,13 +86,19 @@ def test_h1_decision_economics_come_from_hashed_projection() -> None:
     )
     signal = _signal()
 
+    evidence_signal = replace(signal, external_signal={"fee_rate_bps": 1000})
+    zero_fee_signal = replace(signal, external_signal={"fee_rate_bps": 0})
+    assert _strategy_fee_rate(active, evidence_signal, settings_a) == pytest.approx(0.10)
+    assert _strategy_fee_rate(active, zero_fee_signal, settings_a) == pytest.approx(0.0)
+    assert _strategy_fee_rate(active, signal, settings_a) == pytest.approx(0.07)
+
     def decision_cost(settings: PMSSettings, strategy_projection: Any) -> float:
         return _decision_cost_edges(
             decision_price=0.4,
             spread_bps=20,
             settings=settings,
             fee_rate=_strategy_fee_rate(strategy_projection, signal, settings),
-            max_slippage_bps=_strategy_economic_int(
+            max_slippage_bps=strategy_economic_int(
                 strategy_projection,
                 "max_slippage_bps",
                 settings.controller.max_slippage_bps,
