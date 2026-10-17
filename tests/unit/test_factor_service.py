@@ -472,3 +472,51 @@ async def test_factor_service_retries_failed_dirty_market_on_next_cadence(
         await asyncio.gather(task, return_exceptions=True)
 
     assert calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_factor_service_recovers_market_shell_after_fk_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncpg
+
+    calls = 0
+    persisted: list[FactorValueRow] = []
+
+    async def flaky_persist(
+        pool: Any,
+        row: FactorValueRow,
+        *,
+        definition_version: str = "1",
+    ) -> None:
+        nonlocal calls
+        del pool, definition_version
+        calls += 1
+        if calls == 1:
+            raise asyncpg.ForeignKeyViolationError("factor_values_market_id_fkey")
+        persisted.append(row)
+
+    monkeypatch.setattr("pms.factors.service.persist_factor_value", flaky_persist)
+    store = FakeStore()
+    service = FactorService(
+        pool=cast(Any, object()),
+        store=cast(Any, store),
+        cadence_s=0.1,
+        factors=(PersistedFactor,),
+        signal_stream=SequenceSignalStream([]),
+    )
+    signal = _signal(market_id="shell-retry-market")
+    service._known_market_ids.add(signal.market_id)  # noqa: SLF001
+    row = FactorValueRow(
+        factor_id="persisted_factor",
+        param="",
+        market_id=signal.market_id,
+        ts=signal.timestamp,
+        value=signal.yes_price,
+    )
+
+    await service._persist_factor_value(row, signal)  # noqa: SLF001
+
+    assert calls == 2
+    assert persisted == [row]
+    assert signal.market_id in store.markets

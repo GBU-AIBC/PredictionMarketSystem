@@ -5,7 +5,7 @@ from typing import Any, cast
 
 import pytest
 
-from pms.controller.factor_snapshot import PostgresFactorSnapshotReader
+from pms.controller.factor_snapshot import PostgresFactorSnapshotReader, _freshness_slas
 from pms.strategies.projections import FactorCompositionStep
 
 
@@ -62,3 +62,28 @@ async def test_optional_factor_sla_drops_stale_value_from_snapshot() -> None:
     assert snapshot.values == {}
     assert snapshot.missing_factors == ()
     assert snapshot.stale_factors == ()
+
+
+def test_freshness_sla_none_does_not_overwrite_numeric_sla() -> None:
+    steps = (
+        FactorCompositionStep(
+            factor_id="metaculus_prior",
+            role="rule_delta",
+            param="",
+            weight=1.0,
+            threshold=None,
+            required=False,
+            freshness_sla_s=10.0,
+        ),
+        FactorCompositionStep(
+            factor_id="metaculus_prior",
+            role="rule_delta",
+            param="",
+            weight=1.0,
+            threshold=None,
+            required=False,
+            freshness_sla_s=None,
+        ),
+    )
+
+    assert _freshness_slas(steps) == {("metaculus_prior", ""): 10.0}

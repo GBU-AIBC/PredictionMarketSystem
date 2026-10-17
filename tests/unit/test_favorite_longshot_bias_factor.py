@@ -7,7 +7,12 @@ import pytest
 from pms.core.enums import MarketStatus
 from pms.core.models import MarketSignal
 from pms.factors.base import EMPTY_OUTER_RING
-from pms.factors.catalog import FACTOR_CATALOG_ROWS, validate_registered_factor_catalog
+from pms.factors.catalog import (
+    FACTOR_CATALOG_ROWS,
+    FactorCatalogEntry,
+    validate_registered_factor_catalog,
+)
+import pms.factors.catalog as catalog
 from pms.factors.definitions import FavoriteLongshotBias, REGISTERED
 
 
@@ -33,6 +38,30 @@ def test_registered_includes_favorite_longshot_bias() -> None:
 
 def test_registered_factor_catalog_has_no_drift() -> None:
     validate_registered_factor_catalog()
+
+
+def test_catalog_factor_without_registered_definition_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        catalog,
+        "FACTOR_CATALOG_ROWS",
+        (
+            *FACTOR_CATALOG_ROWS,
+            FactorCatalogEntry(
+                factor_id="unregistered_factor",
+                name="Unregistered",
+                description="test",
+                input_schema_hash="test",
+                output_type="scalar",
+                direction="neutral",
+                owner="system",
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="missing from REGISTERED"):
+        validate_registered_factor_catalog()
 
 
 def test_catalog_includes_flb_factor_as_schema_compatible_neutral_direction() -> None:

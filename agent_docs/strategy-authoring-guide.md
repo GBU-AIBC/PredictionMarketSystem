@@ -581,7 +581,7 @@ to know what a field controls.
 |---|---|---|
 | `strategy_id` | yes | Must be unique and human-readable. Use `<theme>_v<n>`. Once installed, a new id means a new strategy from the registry's POV — version-bumping a `_v1` to `_v2` is fine for major semantic change. |
 | `factor_composition` | yes | A tuple of `FactorCompositionStep` (see §5.2). Order matters for `precedence_rank` roles. |
-| `metadata` | yes | A tuple of `(key, value)` pairs of strings. Convention keys: `owner`, `purpose`, `tier`, `price_reference`, `live_allowed`, `requires_strict_factor_gates`. Set `live_allowed=false` until the strategy has cleared PAPER soak. |
+| `metadata` | yes | A tuple of `(key, value)` pairs of strings. Convention keys: `owner`, `purpose`, `tier`, `price_reference`, and `live_allowed`. Strict factor gates are a runtime `ControllerSettings` policy, not strategy metadata. Set `live_allowed=false` until the strategy has cleared PAPER soak. |
 
 ### 5.2 `FactorCompositionStep.role` values
 
@@ -603,8 +603,8 @@ calibrator participates).
 | `rule_delta` | binding | Additive shift to the rules forecaster output |
 | `runtime_probability` | binding | Forecaster output used as direct probability (typically `llm`) |
 
-The install script's `_RAW_FACTOR_ROLES` filter (§3.3) is the
-authoritative list of raw roles.
+`pms.controller.factor_snapshot.RAW_FACTOR_ROLES` is the authoritative
+list of raw roles used by both snapshot and registry projection paths.
 
 ### 5.3 `ForecasterSpec`
 

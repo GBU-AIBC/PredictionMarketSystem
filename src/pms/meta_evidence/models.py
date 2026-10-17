@@ -20,6 +20,7 @@ DecayStatusValue = Literal[
     "insufficient_resolved_outcomes",
     "insufficient_peak_data",
     "insufficient_data",
+    "producer_not_wired",
 ]
 TrendStatus = Literal["warming_up", "active"]
 

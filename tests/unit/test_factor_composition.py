@@ -116,6 +116,18 @@ def test_composition_threshold_tolerates_binary_float_rounding() -> None:
     assert result == pytest.approx(0.6)
 
 
+def test_threshold_edge_output_is_bounded_to_probability_domain() -> None:
+    result = apply_composition(
+        (_step("fair_value_spread", role="threshold_edge", weight=1.0, threshold=0.0),),
+        {
+            ("fair_value_spread", ""): 2.0,
+            ("yes_price", ""): 0.5,
+        },
+    )
+
+    assert result == pytest.approx(1.0 - 1e-6)
+
+
 def test_validate_composition_rejects_unknown_role_and_factor() -> None:
     with pytest.raises(ValueError, match="unknown composition role"):
         validate_composition((_step("yes_price", role="typo", weight=1.0),))

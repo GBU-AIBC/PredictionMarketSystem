@@ -182,6 +182,14 @@ def validate_registered_factor_catalog() -> None:
     if missing_ids:
         msg = "registered factors missing from catalog: " + ", ".join(missing_ids)
         raise ValueError(msg)
+    unregistered_ids = sorted(
+        entry.factor_id
+        for entry in FACTOR_CATALOG_ROWS
+        if entry.owner != "deferred" and entry.factor_id not in registered_ids
+    )
+    if unregistered_ids:
+        msg = "catalog factors missing from REGISTERED: " + ", ".join(unregistered_ids)
+        raise ValueError(msg)
 
 
 async def seed_factor_catalog(

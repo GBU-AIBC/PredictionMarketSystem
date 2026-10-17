@@ -93,31 +93,31 @@ def apply_composition(
     weighted_steps = _eligible_weighted_steps(composition, factor_values)
     non_weighted_steps = tuple(step for step in composition if step.role != "weighted")
     if weighted_steps and not non_weighted_steps:
-        return _apply_weighted(weighted_steps, factor_values)
+        return _bounded_probability(_apply_weighted(weighted_steps, factor_values))
 
     branch_probabilities = evaluate_branch_probabilities(composition, factor_values)
     blended_probability = _apply_blend_weighted(composition, branch_probabilities)
     if blended_probability is not None:
-        return blended_probability
+        return _bounded_probability(blended_probability)
 
     precedence_probability = branch_probabilities.get("rules")
     if precedence_probability is not None:
-        return precedence_probability
+        return _bounded_probability(precedence_probability)
 
     posterior_probability = branch_probabilities.get("statistical")
     if posterior_probability is not None:
-        return posterior_probability
+        return _bounded_probability(posterior_probability)
 
     runtime_probability = _first_runtime_probability(composition, branch_probabilities)
     if runtime_probability is not None:
-        return runtime_probability
+        return _bounded_probability(runtime_probability)
 
     if weighted_steps:
-        return _apply_weighted(weighted_steps, factor_values)
+        return _bounded_probability(_apply_weighted(weighted_steps, factor_values))
 
     fallback = factor_values.get(("yes_price", ""))
     if fallback is not None:
-        return fallback
+        return _bounded_probability(fallback)
 
     msg = "composition could not resolve a probability"
     raise KeyError(msg)
@@ -237,11 +237,15 @@ def _apply_threshold_precedence(
         if step.factor_id == "fair_value_spread":
             if _below_threshold(edge, threshold):
                 continue
-            return _required_factor_value(factor_values, "yes_price", "") + edge
+            return _bounded_probability(
+                _required_factor_value(factor_values, "yes_price", "") + edge
+            )
         if step.factor_id == "subset_pricing_violation":
             if edge < threshold:
                 continue
-            return _required_factor_value(factor_values, "subset_price", "") - edge
+            return _bounded_probability(
+                _required_factor_value(factor_values, "subset_price", "") - edge
+            )
         if step.factor_id == "orderbook_imbalance":
             msg = (
                 "orderbook_imbalance is a raw depth factor, not a probability "
@@ -250,7 +254,7 @@ def _apply_threshold_precedence(
             raise ValueError(msg)
         if _below_threshold(edge, threshold):
             continue
-        return edge
+        return _bounded_probability(edge)
 
     return None
 

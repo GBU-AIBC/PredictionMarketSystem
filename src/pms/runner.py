@@ -54,7 +54,10 @@ from pms.controller.baselines import (
 )
 from pms.controller.diagnostics import ControllerDiagnostic
 from pms.controller.factory import ControllerPipelineFactory
-from pms.controller.factor_snapshot import PostgresFactorSnapshotReader
+from pms.controller.factor_snapshot import (
+    RAW_FACTOR_ROLES,
+    PostgresFactorSnapshotReader,
+)
 from pms.controller.outcome_tokens import MarketDataOutcomeTokenResolver
 from pms.controller.sizers.kelly import KellySizer
 from pms.core.enums import OrderStatus, RunMode, Side, TimeInForce
@@ -264,17 +267,6 @@ TRADING_REQUIRED_WORKERS: tuple[str, ...] = (
 READINESS_REQUIRED_WORKERS: tuple[str, ...] = (
     *TRADING_REQUIRED_WORKERS,
     WORKER_RUNTIME_HEARTBEAT,
-)
-RAW_FACTOR_COMPOSITION_ROLES = frozenset(
-    {
-        "weighted",
-        "precedence_rank",
-        "threshold_edge",
-        "posterior_prior",
-        "posterior_success",
-        "posterior_failure",
-        "rule_delta",
-    }
 )
 REGISTERED_FACTOR_IDS = frozenset(factor_cls.factor_id for factor_cls in REGISTERED)
 DEFAULT_V2_FACTOR_COMPOSITION = DEFAULT_STRATEGY_COMPOSITION
@@ -4437,7 +4429,7 @@ def _raw_factor_steps(
     for step in steps:
         role = getattr(step, "role", None)
         factor_id = getattr(step, "factor_id", None)
-        if role not in RAW_FACTOR_COMPOSITION_ROLES:
+        if role not in RAW_FACTOR_ROLES:
             continue
         if factor_id not in REGISTERED_FACTOR_IDS:
             continue
