@@ -71,7 +71,9 @@ class AnchoringLagDivergence(FactorDefinition):
         )
         delta_effective = (llm_posterior - yes_price) * decay
         if abs(delta_effective) <= self._divergence_threshold:
-            return None
+            # Preserve a current, neutral observation so the factor panel can
+            # never fall back to a stale divergence after repricing.
+            delta_effective = 0.0
 
         return FactorValueRow(
             factor_id=self.factor_id,

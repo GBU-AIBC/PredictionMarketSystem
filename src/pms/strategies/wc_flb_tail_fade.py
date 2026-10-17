@@ -73,7 +73,6 @@ def build_wc_flb_tail_fade_strategy() -> Strategy:
                 ("purpose", "wc2026_flb_tail_fade_paper_soak"),
                 ("price_reference", "best_ask"),
                 ("live_allowed", "false"),
-                ("requires_strict_factor_gates", "false"),
             ),
         ),
         risk=RiskParams(

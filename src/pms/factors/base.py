@@ -41,6 +41,7 @@ class FactorDefinition(ABC):
 
     factor_id: ClassVar[str]
     required_inputs: ClassVar[tuple[str, ...]]
+    definition_version: ClassVar[str] = "1"
 
     @abstractmethod
     def compute(

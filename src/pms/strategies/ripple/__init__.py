@@ -7,6 +7,7 @@ from pms.strategies.ripple.source import (
     RippleMarketSnapshot,
     RippleObservationFixture,
     RippleObservationSource,
+    build_ripple_strategy,
 )
 from pms.strategies.ripple.strategy import RippleStrategyModule
 
@@ -18,4 +19,5 @@ __all__ = [
     "RippleObservationFixture",
     "RippleObservationSource",
     "RippleStrategyModule",
+    "build_ripple_strategy",
 ]

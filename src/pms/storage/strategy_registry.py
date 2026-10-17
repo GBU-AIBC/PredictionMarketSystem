@@ -26,6 +26,7 @@ from pms.strategies.projections import (
     StrategyVersion,
 )
 from pms.strategies.versioning import (
+    compute_legacy_strategy_version_id,
     compute_strategy_version_id,
     serialize_strategy_config_json,
 )
@@ -549,6 +550,7 @@ def _strategy_from_versioned_config_json(
     strategy_id: str,
     strategy_version_id: str,
 ) -> Strategy:
+    payload = _load_json_object(raw_value)
     strategy = _strategy_from_config_json(raw_value)
     if strategy.config.strategy_id != strategy_id:
         msg = (
@@ -561,6 +563,25 @@ def _strategy_from_versioned_config_json(
         strategy_version_id != _LEGACY_BOOTSTRAP_STRATEGY_VERSION_ID
         and expected_version_id != strategy_version_id
     ):
+        # Rows written before factor-definition versions were part of the
+        # payload have no `factor_definition_versions` key. Preserve their
+        # historical identity while requiring the new hash for new rows.
+        payload_has_factor_versions = "factor_definition_versions" in payload
+        if (
+            not payload_has_factor_versions
+            and compute_legacy_strategy_version_id(*strategy.snapshot())
+            == strategy_version_id
+        ):
+            logger.warning(
+                "legacy strategy version accepted with factor definition drift",
+                extra={
+                    "event": "factor_definition_version_drift",
+                    "strategy_id": strategy_id,
+                    "strategy_version_id": strategy_version_id,
+                    "expected_version_id": expected_version_id,
+                },
+            )
+            return strategy
         msg = (
             "strategy_version_id does not match strategy config payload: "
             f"row={strategy_version_id!r}, expected={expected_version_id!r}"

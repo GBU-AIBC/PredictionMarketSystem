@@ -149,6 +149,7 @@ async def test_orderbook_imbalance_compute_and_persist(
 
     await persist_factor_value(pg_pool, row)
     await persist_factor_value(pg_pool, row)
+    await persist_factor_value(pg_pool, row, definition_version="orderbook-v2")
 
     async with pg_pool.acquire() as connection:
         factor_name = await connection.fetchval(
@@ -171,10 +172,23 @@ async def test_orderbook_imbalance_compute_and_persist(
             """,
             "orderbook_imbalance",
         )
+        definition_versions = await connection.fetch(
+            """
+            SELECT definition_version
+            FROM factor_values
+            WHERE factor_id = $1
+            ORDER BY definition_version
+            """,
+            "orderbook_imbalance",
+        )
 
     assert factor_name == "Orderbook Imbalance"
     assert stored_row is not None
-    assert stored_count == 1
+    assert stored_count == 2
+    assert [row["definition_version"] for row in definition_versions] == [
+        "1",
+        "orderbook-v2",
+    ]
     assert stored_row["factor_id"] == row.factor_id
     assert stored_row["param"] == row.param
     assert stored_row["market_id"] == row.market_id

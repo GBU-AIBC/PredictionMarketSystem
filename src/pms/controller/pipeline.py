@@ -55,6 +55,13 @@ from pms.metrics import (
     increment_metric,
 )
 from pms.strategies.projections import ActiveStrategy, CalibrationContext, CalibrationSpec
+from pms.strategies.economics import (
+    strategy_economic_float,
+    strategy_economic_int,
+    strategy_economic_str,
+    strategy_metadata,
+    strategy_risk_settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +170,12 @@ class ControllerPipeline:
         if self.calibrator is None:
             self.calibrator = NetcalCalibrator()
         if self.sizer is None:
-            self.sizer = KellySizer(risk=self.settings.risk)
+            self.sizer = KellySizer(
+                risk=strategy_risk_settings(
+                    self.strategy,
+                    fallback=self.settings.risk,
+                )
+            )
         if self.router is None:
             self.router = Router(self.settings.controller)
 
@@ -272,6 +284,11 @@ class ControllerPipeline:
             strategy=self.strategy,
             sizer=sizer,
             settings=self.settings,
+        )
+        strategy_max_slippage_bps = strategy_economic_int(
+            self.strategy,
+            "max_slippage_bps",
+            self.settings.controller.max_slippage_bps,
         )
         risk_group_id = _risk_group_id(signal)
         group_capacity_diagnostic = _risk_group_capacity_diagnostic(
@@ -612,7 +629,7 @@ class ControllerPipeline:
                 )
             decision_edge = decision_probability - decision_price
         if (
-            _strategy_metadata(self.strategy).get("price_reference") == "best_ask"
+            strategy_metadata(self.strategy).get("price_reference") == "best_ask"
         ):
             direct_required = not _decision_uses_signal_orderbook(
                 execution_signal,
@@ -735,7 +752,7 @@ class ControllerPipeline:
         # covers the best_ask strategies whose pricing fell back to
         # yes_price because no ask existed — there the spread is a real cost.
         spread_already_in_price = (
-            _strategy_metadata(self.strategy).get("price_reference")
+            strategy_metadata(self.strategy).get("price_reference")
             == "best_ask"
             and decision_price == best_ask(execution_signal)
         )
@@ -743,10 +760,12 @@ class ControllerPipeline:
             decision_price=decision_price,
             spread_bps=decision_spread_bps,
             settings=self.settings,
-            fee_rate=market_fee_rate_from_metadata(
-                execution_signal.external_signal,
-                fallback_rate=self.settings.strategies.flb_fee_rate,
+            fee_rate=_strategy_fee_rate(
+                self.strategy,
+                execution_signal,
+                self.settings,
             ),
+            max_slippage_bps=strategy_max_slippage_bps,
             spread_already_in_price=spread_already_in_price,
         )
         net_edge_after_costs = decision_edge - decision_costs.total_edge
@@ -765,7 +784,7 @@ class ControllerPipeline:
                     "spread_already_in_price": spread_already_in_price,
                     "fee_rate": decision_costs.fee_rate,
                     "fee_edge": decision_costs.fee_edge,
-                    "max_slippage_bps": self.settings.controller.max_slippage_bps,
+                    "max_slippage_bps": strategy_max_slippage_bps,
                     "slippage_edge": decision_costs.slippage_edge,
                     "net_edge_after_costs": net_edge_after_costs,
                     "decision_outcome": decision_outcome,
@@ -831,12 +850,12 @@ class ControllerPipeline:
         executable_depth_usdc = _executable_buy_depth_usdc(
             execution_signal.orderbook,
             limit_price=decision_price,
-            max_slippage_bps=self.settings.controller.max_slippage_bps,
+            max_slippage_bps=strategy_max_slippage_bps,
         )
         if (
             executable_depth_usdc is not None
             and self.settings.mode != RunMode.BACKTEST
-            and _strategy_metadata(self.strategy).get("price_reference") == "best_ask"
+            and strategy_metadata(self.strategy).get("price_reference") == "best_ask"
             and _decision_uses_signal_orderbook(
                 execution_signal,
                 token_id=decision_token_id,
@@ -858,7 +877,7 @@ class ControllerPipeline:
                         "decision_outcome": decision_outcome,
                         "decision_price": decision_price,
                         "max_slippage_bps": (
-                            self.settings.controller.max_slippage_bps
+                            strategy_max_slippage_bps
                         ),
                     },
                 )
@@ -996,7 +1015,7 @@ class ControllerPipeline:
                 "spread_already_in_price": spread_already_in_price,
                 "fee_rate": decision_costs.fee_rate,
                 "fee_edge": decision_costs.fee_edge,
-                "max_slippage_bps": self.settings.controller.max_slippage_bps,
+                "max_slippage_bps": strategy_max_slippage_bps,
                 "slippage_edge": decision_costs.slippage_edge,
                 "net_edge_after_costs": net_edge_after_costs,
             },
@@ -1024,11 +1043,17 @@ class ControllerPipeline:
             limit_price=decision_price,
             notional_usdc=size,
             order_type="limit",
-            max_slippage_bps=self.settings.controller.max_slippage_bps,
+            max_slippage_bps=strategy_max_slippage_bps,
             stop_conditions=router.stop_conditions(signal),
             prob_estimate=decision_probability,
             expected_edge=decision_edge,
-            time_in_force=TimeInForce(self.settings.controller.time_in_force.upper()),
+            time_in_force=TimeInForce(
+                strategy_economic_str(
+                    self.strategy,
+                    "time_in_force",
+                    self.settings.controller.time_in_force.upper(),
+                ).upper()
+            ),
             opportunity_id=opportunity.opportunity_id,
             strategy_id=self.strategy_id,
             strategy_version_id=self.strategy_version_id,
@@ -1049,7 +1074,7 @@ class ControllerPipeline:
         if (
             self.settings.mode == RunMode.BACKTEST
             or self.direct_book_reader is None
-            or _strategy_metadata(self.strategy).get("price_reference") != "best_ask"
+            or strategy_metadata(self.strategy).get("price_reference") != "best_ask"
         ):
             return signal
         direct_read = await self._read_direct_outcome_execution_signal(
@@ -1263,6 +1288,7 @@ def _decision_cost_edges(
     spread_bps: int | None,
     settings: PMSSettings,
     fee_rate: float | None = None,
+    max_slippage_bps: int | None = None,
     spread_already_in_price: bool = False,
 ) -> _DecisionCostEdges:
     price = Decimal(str(decision_price))
@@ -1272,7 +1298,12 @@ def _decision_cost_edges(
     fee_rate_decimal = Decimal(str(effective_fee_rate))
     fee_edge = fee_rate_decimal * (Decimal("1.0") - price)
     slippage_edge = (
-        Decimal(settings.controller.max_slippage_bps) / Decimal("10000")
+        Decimal(
+            settings.controller.max_slippage_bps
+            if max_slippage_bps is None
+            else max_slippage_bps
+        )
+        / Decimal("10000")
     ) * price
     spread_edge = (
         Decimal("0")
@@ -1284,6 +1315,22 @@ def _decision_cost_edges(
         fee_rate=effective_fee_rate,
         fee_edge=float(fee_edge),
         slippage_edge=float(slippage_edge),
+    )
+
+
+def _strategy_fee_rate(
+    strategy: ActiveStrategy | None,
+    signal: MarketSignal,
+    settings: PMSSettings,
+) -> float:
+    strategy_fallback = strategy_economic_float(
+        strategy,
+        "fee_rate",
+        settings.strategies.flb_fee_rate,
+    )
+    return market_fee_rate_from_metadata(
+        signal.external_signal,
+        fallback_rate=strategy_fallback,
     )
 
 
@@ -1357,7 +1404,7 @@ def _direct_signal_reference_price(
     *,
     strategy: ActiveStrategy | None,
 ) -> float:
-    if _strategy_metadata(strategy).get("price_reference") != "best_ask":
+    if strategy_metadata(strategy).get("price_reference") != "best_ask":
         return signal.yes_price
     executable_price = best_ask(signal)
     return signal.yes_price if executable_price is None else executable_price
@@ -1675,6 +1722,8 @@ def _external_text(signal: MarketSignal, key: str) -> str | None:
 
 
 def _strict_factor_gates(settings: PMSSettings) -> bool:
+    # Strictness is a runtime safety policy owned by ControllerSettings (and
+    # forced on in LIVE). Strategy metadata does not carry a second gate flag.
     return settings.mode == RunMode.LIVE or settings.controller.strict_factor_gates
 
 
@@ -1723,16 +1772,10 @@ def _yes_reference_price(
     signal: MarketSignal,
     strategy: ActiveStrategy | None,
 ) -> float:
-    if _strategy_metadata(strategy).get("price_reference") != "best_ask":
+    if strategy_metadata(strategy).get("price_reference") != "best_ask":
         return signal.yes_price
     executable_price = best_ask(signal)
     return signal.yes_price if executable_price is None else executable_price
-
-
-def _strategy_metadata(strategy: ActiveStrategy | None) -> dict[str, str]:
-    if strategy is None:
-        return {}
-    return dict(strategy.config.metadata)
 
 
 def _market_exposure_usdc(portfolio: Portfolio, *, market_id: str) -> float:

@@ -107,11 +107,12 @@ pointers are in §7.
 ## 3. Worked example — Channel A end-to-end
 
 The example used through §3.1–§3.11 is a hypothetical strategy
-called `imbalance_with_prior_v1`: take a position on the YES side
-when `orderbook_imbalance > 0.15` **and** `metaculus_prior > 0.6`,
-using the `rules` forecaster, with a 90-day horizon ceiling and a
-$2 max position. This is illustrative; substitute your own
-parameters.
+called `imbalance_with_prior_v1`: use `orderbook_imbalance` as a scaled
+rule delta and use `metaculus_prior > 0.6` as a probability edge, using
+the `rules` forecaster, with a 90-day horizon ceiling and a $2 max
+position. The two evidence branches are precedence-ranked, so either
+one can provide the probability when the other is quiet. This is
+illustrative; substitute your own parameters.
 
 ### 3.1 Check the raw factors you need already exist
 
@@ -166,16 +167,19 @@ def build_imbalance_with_prior_strategy() -> Strategy:
             factor_composition=(
                 FactorCompositionStep(
                     factor_id="orderbook_imbalance",
-                    role="threshold_edge",
+                    # Raw depth is scaled as a rule delta before it becomes a
+                    # probability; threshold_edge is reserved for already
+                    # probability-shaped edges such as fair_value_spread.
+                    role="rule_delta",
                     param="",
-                    weight=1.0,
+                    weight=0.25,
                     threshold=0.15,
                     required=True,
                     freshness_sla_s=_FACTOR_FRESHNESS_S,
                 ),
                 FactorCompositionStep(
                     factor_id="metaculus_prior",
-                    role="posterior_prior",
+                    role="threshold_edge",
                     param="",
                     weight=1.0,
                     threshold=0.60,
@@ -228,9 +232,10 @@ def build_imbalance_with_prior_strategy() -> Strategy:
     )
 ```
 
-Field-level reference is in §5. The constructor's `__init__` rejects
-`None` for any required projection (`aggregate.py:55-62`); typos surface
-as `TypeError` immediately, not at runtime.
+Field-level reference is in §5. The constructor validates every composition
+role and factor id against the catalog (`pms.factors.composition`); unknown
+roles, factor ids, and forbidden raw-factor role combinations fail loudly
+before a version can be registered.
 
 **Run mypy before going further.** This file ships with the strict-mypy
 baseline:
@@ -258,6 +263,7 @@ import sys
 import asyncpg
 
 from pms.factors.definitions import REGISTERED
+from pms.controller.factor_snapshot import RAW_FACTOR_ROLES
 from pms.storage.strategy_registry import PostgresStrategyRegistry
 from pms.strategies.aggregate import Strategy
 from pms.strategies.imbalance_with_prior import (
@@ -265,16 +271,6 @@ from pms.strategies.imbalance_with_prior import (
 )
 from pms.strategies.projections import FactorCompositionStep, StrategyVersion
 
-_RAW_FACTOR_ROLES = frozenset(
-    {
-        "weighted",
-        "precedence_rank",
-        "threshold_edge",
-        "posterior_prior",
-        "posterior_success",
-        "posterior_failure",
-    }
-)
 _REGISTERED_FACTOR_IDS = frozenset(
     factor_cls.factor_id for factor_cls in REGISTERED
 )
@@ -300,7 +296,7 @@ def _raw_factor_steps(strategy: Strategy) -> tuple[FactorCompositionStep, ...]:
     return tuple(
         step
         for step in strategy.config.factor_composition
-        if step.role in _RAW_FACTOR_ROLES
+        if step.role in RAW_FACTOR_ROLES
         and step.factor_id in _REGISTERED_FACTOR_IDS
     )
 
@@ -372,7 +368,7 @@ psql "$DATABASE_URL" -c "SELECT factor_id, role, weight, threshold FROM strategy
 ```
 
 The third query should list only the **raw** factors filtered by
-`_RAW_FACTOR_ROLES` in the install script — `rules` is a forecaster
+`RAW_FACTOR_ROLES` in the install script — `rules` is a forecaster
 binding, not a raw factor, so it correctly does not appear in
 `strategy_factors`.
 
@@ -576,7 +572,7 @@ to know what a field controls.
 |---|---|---|
 | `strategy_id` | yes | Must be unique and human-readable. Use `<theme>_v<n>`. Once installed, a new id means a new strategy from the registry's POV — version-bumping a `_v1` to `_v2` is fine for major semantic change. |
 | `factor_composition` | yes | A tuple of `FactorCompositionStep` (see §5.2). Order matters for `precedence_rank` roles. |
-| `metadata` | yes | A tuple of `(key, value)` pairs of strings. Convention keys: `owner`, `purpose`, `tier`, `price_reference`, `live_allowed`, `requires_strict_factor_gates`. Set `live_allowed=false` until the strategy has cleared PAPER soak. |
+| `metadata` | yes | A tuple of `(key, value)` pairs of strings. Convention keys: `owner`, `purpose`, `tier`, `price_reference`, and `live_allowed`. Strict factor gates are a runtime `ControllerSettings` policy, not strategy metadata. Set `live_allowed=false` until the strategy has cleared PAPER soak. |
 
 ### 5.2 `FactorCompositionStep.role` values
 
@@ -598,8 +594,8 @@ calibrator participates).
 | `rule_delta` | binding | Additive shift to the rules forecaster output |
 | `runtime_probability` | binding | Forecaster output used as direct probability (typically `llm`) |
 
-The install script's `_RAW_FACTOR_ROLES` filter (§3.3) is the
-authoritative list of raw roles.
+`pms.controller.factor_snapshot.RAW_FACTOR_ROLES` is the authoritative
+list of raw roles used by both snapshot and registry projection paths.
 
 ### 5.3 `ForecasterSpec`
 
@@ -756,18 +752,23 @@ Steps:
    the canonical shape.
 2. Register it in `src/pms/factors/definitions/__init__.py` — add to
    the `REGISTERED` tuple and to `__all__`.
-3. Write piecewise tests (promoted rule
+3. Add the matching `FactorCatalogEntry` to
+   `src/pms/factors/catalog.py` and include it in the catalog seed path.
+   The startup parity check intentionally fails fast with the missing factor
+   IDs if either side is absent; add the missing definition or catalog row
+   named in that error before starting the service.
+4. Write piecewise tests (promoted rule
    `domain-math-piecewise`): if your `compute()` has guards (zero
    depth → `None`, missing field → fallback, etc.), test each branch
    plus the boundaries between them.
-4. Run the gate:
+5. Run the gate:
 
    ```bash
    uv run pytest tests/unit/factors/test_<your_factor>.py -q
    uv run mypy src/pms/factors/definitions/<your_factor>.py --strict
    ```
 
-5. Only after the factor is in the registry can a strategy reference
+6. Only after the factor is registered and cataloged can a strategy reference
    its `factor_id` in `FactorCompositionStep`.
 
 Reusability test: if your factor encodes strategy-specific weights
@@ -778,12 +779,21 @@ or thresholds, it isn't raw. Move the parameter to the strategy's
 
 ## 9. Common pitfalls
 
+### Deferred infrastructure
+
+Meta-evidence producers (F-12) and cross-market relation factor lifecycle
+integration (F-13) remain deferred until they have a bounded producer,
+freshness contract, and production writer. Their factor ids are therefore
+excluded from the seeded/public catalog; do not author a strategy against
+`subset_relation`, `contradiction_relation`, `semantic_similarity`, or
+`cross_market_mispricing` yet.
+
 Listed in rough frequency order based on retro patterns plus the
 invariants most likely to bite during strategy authoring.
 
 | Pitfall | What goes wrong | The rule that says don't |
 |---|---|---|
-| Putting a composite expression in `factor_composition` (e.g. `factor_id="0.3*imbalance + 0.7*prior"`) | `_RAW_FACTOR_ROLES` filter drops it from `strategy_factors`, runtime treats it as missing | Invariant 4 |
+| Putting a composite expression in `factor_composition` (e.g. `factor_id="0.3*imbalance + 0.7*prior"`) | `RAW_FACTOR_ROLES` filter drops it from `strategy_factors`, runtime treats it as missing | Invariant 4 |
 | Editing a `strategy_versions.config_json` row in-place after install | Historical eval rows tagged with the old hash become incomparable; `mean(brier)` silently averages across versions | Invariant 3 |
 | Strategy code importing from `pms.sensor` or `pms.actuator` | Import-linter rejects the PR | Invariant 5 |
 | Plugin strategy writing to `markets` / `book_snapshots` / `factor_values` | Schema is grep-checked; PR rejected | Invariant 8 |

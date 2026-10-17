@@ -10,6 +10,9 @@ from typing import Any
 
 import pytest
 
+from pms.factors.definitions import FavoriteLongshotBias
+from pms.strategies.paper_multifactor import build_paper_multi_factor_strategy
+
 
 EXPECTED_DEFAULT_VERSION_ID = (
     "239f947ac755ee51b72b787d707dd207d7319b28e564047d2f3d956ea457ca29"
@@ -101,6 +104,22 @@ def test_default_strategy_version_id_matches_locked_fixture() -> None:
     version_id = compute_strategy_version_id(**_build_projection_inputs())
 
     assert version_id == EXPECTED_DEFAULT_VERSION_ID
+
+
+def test_factor_definition_version_changes_strategy_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strategy = build_paper_multi_factor_strategy()
+    compute_strategy_version_id = _load_symbol(
+        "pms.strategies.versioning",
+        "compute_strategy_version_id",
+    )
+    baseline = compute_strategy_version_id(*strategy.snapshot())
+
+    monkeypatch.setattr(FavoriteLongshotBias, "definition_version", "2")
+    changed = compute_strategy_version_id(*strategy.snapshot())
+
+    assert changed != baseline
 
 
 def test_metadata_ordering_does_not_change_strategy_version_id() -> None:

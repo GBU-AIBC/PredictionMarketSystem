@@ -11,12 +11,21 @@ from pms.strategies.projections import (
 )
 
 H1_FLB_STRATEGY_ID = "h1_flb"
+H1_FLB_LEGACY_VERSION_IDS = frozenset({"h1-flb-v1"})
+H1_FLB_ECONOMICS_VERSION = "h1-flb-economics-v1"
+H1_FLB_ENTRY_EXECUTION_COST_BPS = 15.0
+H1_FLB_FEE_RATE = 0.07
+H1_FLB_MAX_SLIPPAGE_BPS = 50
+H1_FLB_MIN_EXPECTED_EDGE = 0.02
+H1_FLB_LONGSHOT_THRESHOLD = 0.10
+H1_FLB_FAVORITE_THRESHOLD = 0.90
 
 
 def build_h1_flb_strategy(
     *,
     calibration_csv_sha256: str | None = None,
     calibration_source_label: str | None = None,
+    time_in_force: str = "GTC",
 ) -> Strategy:
     metadata: tuple[tuple[str, str], ...] = (
         ("owner", "system"),
@@ -25,11 +34,23 @@ def build_h1_flb_strategy(
         ("purpose", "calibrated_h1_flb_paper_soak"),
         ("price_reference", "best_ask"),
         ("live_allowed", "true"),
-        ("requires_strict_factor_gates", "true"),
         ("alpha_source", "warehouse_flb_decile_model_v1"),
         ("edge_model_source", "flb_calibration_model_v1"),
         ("calibration_source", "warehouse_flb_v1"),
         ("evidence_source", "paper_soak_go_report_v1"),
+        # Economics and gate thresholds are part of the content-addressed
+        # strategy projection.  Runtime wiring must use these values for this
+        # strategy version rather than mutable global settings.
+        ("economics_version", H1_FLB_ECONOMICS_VERSION),
+        ("entry_execution_cost_bps", str(H1_FLB_ENTRY_EXECUTION_COST_BPS)),
+        ("fee_rate", str(H1_FLB_FEE_RATE)),
+        ("max_slippage_bps", str(H1_FLB_MAX_SLIPPAGE_BPS)),
+        ("time_in_force", time_in_force.upper()),
+        ("min_confidence", "0.60"),
+        ("source_confidence", "0.65"),
+        ("min_expected_edge", str(H1_FLB_MIN_EXPECTED_EDGE)),
+        ("longshot_yes_threshold", str(H1_FLB_LONGSHOT_THRESHOLD)),
+        ("favorite_yes_threshold", str(H1_FLB_FAVORITE_THRESHOLD)),
     )
     if calibration_csv_sha256 is not None:
         metadata = (

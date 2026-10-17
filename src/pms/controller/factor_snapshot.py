@@ -8,6 +8,8 @@ import json
 from typing import Protocol
 
 import asyncpg
+from pms.core.validation import validate_finite
+from pms.factors.definitions import current_definition_version
 
 from pms.strategies.projections import FactorCompositionStep
 
@@ -33,6 +35,7 @@ class FactorSnapshot:
     timestamps: Mapping[FactorKey, datetime] = field(default_factory=dict)
     ages_ms: Mapping[FactorKey, float] = field(default_factory=dict)
     stale_factors: tuple[FactorKey, ...] = ()
+    definition_versions: Mapping[FactorKey, str] = field(default_factory=dict)
     snapshot_hash: str | None = None
 
 
@@ -110,11 +113,14 @@ class PostgresFactorSnapshotReader:
 
         factor_ids = [factor_id for factor_id, _ in snapshot_keys]
         params = [param for _, param in snapshot_keys]
+        definition_versions = [
+            current_definition_version(factor_id) for factor_id in factor_ids
+        ]
         async with self.pool.acquire() as connection:
             rows = await connection.fetch(
                 """
-                WITH required(factor_id, param) AS (
-                    SELECT * FROM unnest($3::text[], $4::text[])
+                WITH required(factor_id, param, definition_version) AS (
+                    SELECT * FROM unnest($3::text[], $4::text[], $5::text[])
                 ),
                 latest AS (
                     SELECT DISTINCT ON (fv.factor_id, fv.param)
@@ -126,6 +132,7 @@ class PostgresFactorSnapshotReader:
                     INNER JOIN required
                         ON required.factor_id = fv.factor_id
                        AND required.param = fv.param
+                       AND required.definition_version = fv.definition_version
                     WHERE fv.market_id = $1
                       AND fv.ts <= $2
                     ORDER BY fv.factor_id ASC, fv.param ASC, fv.ts DESC
@@ -145,12 +152,14 @@ class PostgresFactorSnapshotReader:
                 as_of,
                 factor_ids,
                 params,
+                definition_versions,
             )
         values: dict[FactorKey, float] = {}
         timestamps: dict[FactorKey, datetime] = {}
         ages_ms: dict[FactorKey, float] = {}
         missing_factors: list[FactorKey] = []
         stale_factors: list[FactorKey] = []
+        selected_definition_versions: dict[FactorKey, str] = {}
         freshness_slas = _freshness_slas(required)
         required_key_set = set(required_keys)
         for row in rows:
@@ -160,21 +169,35 @@ class PostgresFactorSnapshotReader:
                 if key in required_key_set:
                     missing_factors.append(key)
                 continue
-            values[key] = float(value)
+            try:
+                values[key] = validate_finite(value, field_name=f"factor {key[0]} value")
+            except (TypeError, ValueError):
+                if key in required_key_set:
+                    missing_factors.append(key)
+                continue
             ts = row["ts"]
+            selected_definition_versions[key] = str(
+                row.get("definition_version", current_definition_version(key[0]))
+            )
             if isinstance(ts, datetime):
                 timestamps[key] = ts
                 age_ms = max(0.0, (as_of - ts).total_seconds() * 1000.0)
                 ages_ms[key] = age_ms
                 freshness_sla_s = freshness_slas.get(key)
                 if freshness_sla_s is not None and age_ms > freshness_sla_s * 1000.0:
-                    stale_factors.append(key)
+                    if key in required_key_set:
+                        stale_factors.append(key)
+                    # A stale optional value is still unsafe to compose.  Keep
+                    # its identity for diagnostics while removing its value
+                    # from the usable snapshot.
+                    values.pop(key, None)
         return FactorSnapshot(
             values=values,
             missing_factors=tuple(missing_factors),
             timestamps=timestamps,
             ages_ms=ages_ms,
             stale_factors=tuple(stale_factors),
+            definition_versions=selected_definition_versions,
             snapshot_hash=_snapshot_hash(
                 market_id=market_id,
                 as_of=as_of,
@@ -184,6 +207,7 @@ class PostgresFactorSnapshotReader:
                 values=values,
                 missing_factors=tuple(missing_factors),
                 stale_factors=tuple(stale_factors),
+                definition_versions=selected_definition_versions,
             ),
         )
 
@@ -198,6 +222,7 @@ def _snapshot_hash(
     values: Mapping[FactorKey, float],
     missing_factors: Sequence[FactorKey],
     stale_factors: Sequence[FactorKey] = (),
+    definition_versions: Mapping[FactorKey, str] | None = None,
 ) -> str:
     payload = {
         "market_id": market_id,
@@ -219,6 +244,10 @@ def _snapshot_hash(
         "stale_factors": [
             [factor_id, param]
             for factor_id, param in sorted(stale_factors)
+        ],
+        "definition_versions": [
+            [factor_id, param, (definition_versions or {})[(factor_id, param)]]
+            for factor_id, param in sorted(definition_versions or {})
         ],
     }
     return sha256(
@@ -271,11 +300,10 @@ def _freshness_slas(
 ) -> dict[FactorKey, float | None]:
     slas: dict[FactorKey, float | None] = {}
     for step in steps:
-        if not _requires_raw_factor(step):
+        if not _uses_raw_factor(step):
             continue
         raw_sla = getattr(step, "freshness_sla_s", None)
         if raw_sla is None:
-            slas[(step.factor_id, step.param)] = None
             continue
         freshness_sla_s = float(raw_sla)
         key = (step.factor_id, step.param)

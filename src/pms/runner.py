@@ -7,7 +7,7 @@ import logging
 from copy import deepcopy
 from math import isfinite
 from hashlib import sha256
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -54,7 +54,10 @@ from pms.controller.baselines import (
 )
 from pms.controller.diagnostics import ControllerDiagnostic
 from pms.controller.factory import ControllerPipelineFactory
-from pms.controller.factor_snapshot import PostgresFactorSnapshotReader
+from pms.controller.factor_snapshot import (
+    RAW_FACTOR_ROLES,
+    PostgresFactorSnapshotReader,
+)
 from pms.controller.outcome_tokens import MarketDataOutcomeTokenResolver
 from pms.controller.sizers.kelly import KellySizer
 from pms.core.enums import OrderStatus, RunMode, Side, TimeInForce
@@ -148,7 +151,11 @@ from pms.strategies.anchoring import (
     AnchoringLagStrategyModule,
     LiveAnchoringSource,
 )
-from pms.strategies.anchoring.source import AnchoringMarketSnapshotReader
+from pms.strategies.anchoring.source import (
+    ANCHORING_LEGACY_VERSION_IDS,
+    AnchoringMarketSnapshotReader,
+    build_anchoring_strategy,
+)
 from pms.strategies.flb import FlbAgent, FlbController, FlbStrategyModule
 from pms.strategies.flb.artifacts import (
     flb_calibration_provenance_path,
@@ -162,6 +169,7 @@ from pms.strategies.flb.source import (
     load_flb_calibration_csv,
 )
 from pms.strategies.flb.projection import (
+    H1_FLB_LEGACY_VERSION_IDS,
     H1_FLB_STRATEGY_ID,
     build_h1_flb_strategy,
 )
@@ -188,10 +196,13 @@ from pms.strategies.ripple import (
     RippleStrategyModule,
 )
 from pms.strategies.ripple.source import (
+    RIPPLE_LEGACY_VERSION_IDS,
     RippleFactorSnapshotReader,
     RippleMarketSnapshotReader,
+    build_ripple_strategy,
 )
 from pms.strategies.runtime_bridge import StrategyRunResult
+from pms.strategies.economics import strategy_economic_float
 from pms.strategies.versioning import compute_strategy_version_id
 from pms.supervision import (
     ALIVE_WORKER_STATES,
@@ -245,17 +256,6 @@ TRADING_REQUIRED_WORKERS: tuple[str, ...] = (
 READINESS_REQUIRED_WORKERS: tuple[str, ...] = (
     *TRADING_REQUIRED_WORKERS,
     WORKER_RUNTIME_HEARTBEAT,
-)
-RAW_FACTOR_COMPOSITION_ROLES = frozenset(
-    {
-        "weighted",
-        "precedence_rank",
-        "threshold_edge",
-        "posterior_prior",
-        "posterior_success",
-        "posterior_failure",
-        "rule_delta",
-    }
 )
 REGISTERED_FACTOR_IDS = frozenset(factor_cls.factor_id for factor_cls in REGISTERED)
 DEFAULT_V2_FACTOR_COMPOSITION = DEFAULT_STRATEGY_COMPOSITION
@@ -415,6 +415,10 @@ class Runner:
     )
     _controller_factory: ControllerPipelineFactory = field(init=False)
     _controller_runtimes: dict[str, StrategyControllerRuntime] = field(
+        init=False,
+        default_factory=dict,
+    )
+    _active_strategies_by_version: dict[tuple[str, str], ActiveStrategy] = field(
         init=False,
         default_factory=dict,
     )
@@ -828,6 +832,7 @@ class Runner:
         self._subscription_controller = None
         self._strategy_registry = None
         self._controller_runtimes = {}
+        self._active_strategies_by_version = {}
         self._controller_signal_queues = {}
         self._controller_pipeline_tasks = {}
         self._controller_release_cancel_point = None
@@ -920,25 +925,97 @@ class Runner:
             reader = _PostgresFlbMarketSnapshotReader(
                 PostgresMarketDataStore(self._pg_pool)
             )
+        h1_strategy: Strategy | None = None
+        if strategy_id == H1_FLB_STRATEGY_ID:
+            calibration_model = self._flb_calibration_model
+            h1_strategy = (
+                _h1_flb_strategy_from_settings(
+                    self.config,
+                    calibration_model=calibration_model,
+                )
+                if calibration_model is not None
+                else build_h1_flb_strategy(
+                    time_in_force=self.config.controller.time_in_force,
+                )
+            )
+        if h1_strategy is not None:
+            _verify_runtime_strategy_version(
+                h1_strategy,
+                strategy_version_id,
+                legacy_ids=H1_FLB_LEGACY_VERSION_IDS,
+            )
+        position_sizing_risk = self.config.risk
+        if h1_strategy is not None:
+            position_sizing_risk = self.config.risk.model_copy(
+                update={
+                    "max_position_per_market": (
+                        h1_strategy.risk.max_position_notional_usdc
+                    )
+                }
+            )
+        h1_metadata = dict(h1_strategy.config.metadata) if h1_strategy else {}
 
         return FlbStrategyModule(
             source=LiveFlbSource(
                 market_ids=tuple(market_ids),
                 market_reader=reader,
-                position_sizer=KellySizer(self.config.risk),
+                position_sizer=KellySizer(risk=position_sizing_risk),
                 portfolio=self.portfolio,
-                max_slippage_bps=self.config.controller.max_slippage_bps,
-                entry_execution_cost_bps=(
-                    self.config.strategies.flb_entry_execution_cost_bps
+                max_slippage_bps=(
+                    int(h1_metadata["max_slippage_bps"])
+                    if h1_strategy is not None
+                    else self.config.controller.max_slippage_bps
                 ),
-                fee_rate=self.config.strategies.flb_fee_rate,
-                time_in_force=TimeInForce(
-                    self.config.controller.time_in_force.upper()
+                entry_execution_cost_bps=(
+                    float(h1_metadata["entry_execution_cost_bps"])
+                    if h1_strategy is not None
+                    else self.config.strategies.flb_entry_execution_cost_bps
+                ),
+                fee_rate=(
+                    float(h1_metadata["fee_rate"])
+                    if h1_strategy is not None
+                    else self.config.strategies.flb_fee_rate
+                ),
+                longshot_yes_threshold=(
+                    float(h1_metadata["longshot_yes_threshold"])
+                    if h1_strategy is not None
+                    else 0.10
+                ),
+                favorite_yes_threshold=(
+                    float(h1_metadata["favorite_yes_threshold"])
+                    if h1_strategy is not None
+                    else 0.90
+                ),
+                min_expected_edge=(
+                    float(h1_metadata["min_expected_edge"])
+                    if h1_strategy is not None
+                    else 0.02
+                ),
+                confidence=(
+                    float(h1_metadata["source_confidence"])
+                    if h1_strategy is not None
+                    else 0.65
+                ),
+                time_in_force=(
+                    TimeInForce(h1_metadata["time_in_force"])
+                    if h1_strategy is not None
+                    else TimeInForce(self.config.controller.time_in_force.upper())
                 ),
                 calibration_model=self._flb_calibration_model,
             ),
             controller=FlbController(),
-            agent=FlbAgent(),
+            agent=FlbAgent(
+                min_confidence=(
+                    float(h1_metadata["min_confidence"])
+                    if h1_strategy is not None
+                    else 0.6
+                ),
+                min_expected_edge=(
+                    float(h1_metadata["min_expected_edge"])
+                    if h1_strategy is not None
+                    else 0.02
+                ),
+            ),
             strategy_id=strategy_id,
             strategy_version_id=strategy_version_id,
         )
@@ -1008,23 +1085,40 @@ class Runner:
         else:
             resolved_market_reader = market_reader
 
+        ripple_strategy = build_ripple_strategy(
+            strategy_id,
+            time_in_force=self.config.controller.time_in_force,
+        )
+        _verify_runtime_strategy_version(
+            ripple_strategy,
+            strategy_version_id,
+            legacy_ids=RIPPLE_LEGACY_VERSION_IDS,
+        )
+        ripple_metadata = dict(ripple_strategy.config.metadata)
+
         return RippleStrategyModule(
             source=LiveRippleSource(
                 market_ids=tuple(market_ids),
                 factor_reader=resolved_factor_reader,
                 market_reader=resolved_market_reader,
                 position_sizer=KellySizer(
-                    risk=self.config.risk,
+                    risk=self.config.risk.model_copy(
+                        update={
+                            "max_position_per_market": (
+                                ripple_strategy.risk.max_position_notional_usdc
+                            )
+                        }
+                    ),
                     fraction=Decimal("0.25"),
                 ),
                 portfolio=self.portfolio,
-                max_slippage_bps=self.config.controller.max_slippage_bps,
-                time_in_force=TimeInForce(
-                    self.config.controller.time_in_force.upper()
-                ),
+                prior_strength=float(ripple_metadata["prior_strength"]),
+                min_expected_edge=float(ripple_metadata["min_expected_edge"]),
+                max_slippage_bps=int(ripple_metadata["max_slippage_bps"]),
+                time_in_force=TimeInForce(ripple_metadata["time_in_force"]),
             ),
             controller=RippleController(),
-            agent=RippleAgent(),
+            agent=RippleAgent(min_confidence=float(ripple_metadata["min_confidence"])),
             strategy_id=strategy_id,
             strategy_version_id=strategy_version_id,
         )
@@ -1074,19 +1168,43 @@ class Runner:
             )
             raise RuntimeError(msg)
 
+        anchoring_strategy = build_anchoring_strategy(
+            strategy_id,
+            time_in_force=self.config.controller.time_in_force,
+        )
+        _verify_runtime_strategy_version(
+            anchoring_strategy,
+            strategy_version_id,
+            legacy_ids=ANCHORING_LEGACY_VERSION_IDS,
+        )
+        anchoring_metadata = dict(anchoring_strategy.config.metadata)
+
         return AnchoringLagStrategyModule(
             source=LiveAnchoringSource(
                 market_ids=tuple(market_ids),
                 market_reader=market_reader,
-                position_sizer=KellySizer(self.config.risk),
-                portfolio=self.portfolio,
-                max_slippage_bps=self.config.controller.max_slippage_bps,
-                time_in_force=TimeInForce(
-                    self.config.controller.time_in_force.upper()
+                position_sizer=KellySizer(
+                    self.config.risk.model_copy(
+                        update={
+                            "max_position_per_market": (
+                                anchoring_strategy.risk.max_position_notional_usdc
+                            )
+                        }
+                    )
                 ),
+                portfolio=self.portfolio,
+                min_divergence=float(anchoring_metadata["min_divergence"]),
+                min_confidence=float(anchoring_metadata["min_confidence"]),
+                min_expected_edge=float(anchoring_metadata["min_expected_edge"]),
+                max_slippage_bps=int(anchoring_metadata["max_slippage_bps"]),
+                time_in_force=TimeInForce(anchoring_metadata["time_in_force"]),
             ),
             controller=AnchoringController(),
-            agent=AnchoringAgent(),
+            agent=AnchoringAgent(
+                min_confidence=float(anchoring_metadata["min_confidence"]),
+                min_expected_edge=float(anchoring_metadata["min_expected_edge"]),
+                min_divergence=float(anchoring_metadata["min_divergence"]),
+            ),
             strategy_id=strategy_id,
             strategy_version_id=strategy_version_id,
         )
@@ -1868,7 +1986,7 @@ class Runner:
                 fill_fee_rate = (
                     None
                     if self.config.mode == RunMode.LIVE
-                    else self.config.strategies.flb_fee_rate
+                    else self._paper_fill_fee_rate(decision)
                 )
                 fill = _fill_from_order(
                     order_state, decision, signal, fee_rate=fill_fee_rate
@@ -1980,6 +2098,18 @@ class Runner:
                     self._release_position_exit_key(decision.decision_id)
                     self._release_position_capacity_reservation(decision.decision_id)
                 self._decision_queue.task_done()
+
+    def _paper_fill_fee_rate(self, decision: TradeDecision) -> float:
+        strategy = self._active_strategies_by_version.get(
+            (decision.strategy_id, decision.strategy_version_id)
+        )
+        if strategy is None:
+            return self.config.strategies.flb_fee_rate
+        return strategy_economic_float(
+            strategy,
+            "fee_rate",
+            self.config.strategies.flb_fee_rate,
+        )
 
     async def _decision_expiry_loop(self) -> None:
         while True:
@@ -2937,6 +3067,7 @@ class Runner:
         self._subscription_controller = None
         self._strategy_registry = None
         self._controller_runtimes = {}
+        self._active_strategies_by_version = {}
         self._controller_signal_queues = {}
         self._controller_pipeline_tasks = {}
         self._controller_release_cancel_point = None
@@ -3406,7 +3537,13 @@ class Runner:
             self._attach_controller_runtime(runtime)
 
     async def _build_controller_runtimes(self) -> list[StrategyControllerRuntime]:
+        self._active_strategies_by_version = {}
         if self.controller is not None:
+            strategy = getattr(self.controller, "strategy", None)
+            if isinstance(strategy, ActiveStrategy):
+                self._active_strategies_by_version = {
+                    (strategy.strategy_id, strategy.strategy_version_id): strategy
+                }
             return [
                 StrategyControllerRuntime(
                     strategy_id="default",
@@ -3424,6 +3561,10 @@ class Runner:
             active_strategies = await registry.list_active_strategies()
             if not active_strategies:
                 return []
+            self._active_strategies_by_version = {
+                (strategy.strategy_id, strategy.strategy_version_id): strategy
+                for strategy in active_strategies
+            }
             self._require_live_active_strategies_match_preflight(active_strategies)
             scopes: dict[str, frozenset[str]] = {}
             if (
@@ -3447,6 +3588,11 @@ class Runner:
             ]
 
         default_strategy = _default_active_strategy(self.config)
+        self._active_strategies_by_version = {
+            (default_strategy.strategy_id, default_strategy.strategy_version_id): (
+                default_strategy
+            )
+        }
         pipeline = self._controller_factory.build(default_strategy)
         return [
             StrategyControllerRuntime(
@@ -4378,7 +4524,7 @@ def _raw_factor_steps(
     for step in steps:
         role = getattr(step, "role", None)
         factor_id = getattr(step, "factor_id", None)
-        if role not in RAW_FACTOR_COMPOSITION_ROLES:
+        if role not in RAW_FACTOR_ROLES:
             continue
         if factor_id not in REGISTERED_FACTOR_IDS:
             continue
@@ -4741,7 +4887,35 @@ def _h1_flb_strategy_from_settings(
     return build_h1_flb_strategy(
         calibration_csv_sha256=provenance.calibration_csv_sha256,
         calibration_source_label=provenance.calibration_source_label,
+        time_in_force=settings.controller.time_in_force,
     )
+
+
+def _verify_runtime_strategy_version(
+    strategy: Strategy,
+    strategy_version_id: str,
+    *,
+    legacy_ids: Collection[str],
+) -> str:
+    expected_version_id = compute_strategy_version_id(*strategy.snapshot())
+    if strategy_version_id == expected_version_id:
+        return expected_version_id
+    if strategy_version_id in legacy_ids:
+        logger.warning(
+            "legacy runtime strategy version accepted with economics drift",
+            extra={
+                "event": "strategy_economics_version_drift",
+                "strategy_id": strategy.config.strategy_id,
+                "strategy_version_id": strategy_version_id,
+                "expected_version_id": expected_version_id,
+            },
+        )
+        return strategy_version_id
+    msg = (
+        "strategy_version_id does not match runtime strategy projection: "
+        f"row={strategy_version_id!r}, expected={expected_version_id!r}"
+    )
+    raise ValueError(msg)
 
 
 def _market_implied_baseline_prob_estimate(decision: TradeDecision) -> float:

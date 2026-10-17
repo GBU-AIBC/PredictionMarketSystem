@@ -8,7 +8,7 @@ from pms.artifact_path_safety import (
     require_path_outside_working_tree,
     require_private_parent,
 )
-from pms.config import PMSSettings, RiskSettings
+from pms.config import PMSSettings
 from pms.controller.calibrators.netcal import NetcalCalibrator
 from pms.controller.factor_snapshot import (
     FactorSnapshotReader,
@@ -37,6 +37,7 @@ from pms.strategies.flb.artifacts import (
 )
 from pms.strategies.flb.source import load_flb_calibration_csv
 from pms.strategies.projections import ActiveStrategy, FactorCompositionStep
+from pms.strategies.economics import strategy_risk_settings
 
 
 @dataclass
@@ -71,7 +72,7 @@ class ControllerPipelineFactory:
             forecasters=self._build_forecasters(strategy),
             calibrator=NetcalCalibrator(),
             sizer=KellySizer(
-                risk=_risk_settings(
+                risk=strategy_risk_settings(
                     strategy,
                     fallback=self.settings.risk,
                 )
@@ -186,27 +187,6 @@ def _build_forecaster(
         )
     msg = f"Unsupported forecaster {name!r}"
     raise ValueError(msg)
-
-
-def _risk_settings(
-    strategy: ActiveStrategy,
-    *,
-    fallback: RiskSettings,
-) -> RiskSettings:
-    return RiskSettings(
-        max_position_per_market=strategy.risk.max_position_notional_usdc,
-        max_total_exposure=fallback.max_total_exposure,
-        max_drawdown_pct=strategy.risk.max_daily_drawdown_pct,
-        max_daily_loss_usdc=fallback.max_daily_loss_usdc,
-        max_open_positions=fallback.max_open_positions,
-        max_exposure_per_risk_group=fallback.max_exposure_per_risk_group,
-        min_order_usdc=max(
-            strategy.risk.min_order_size_usdc,
-            fallback.min_order_usdc,
-        ),
-        slippage_threshold_bps=fallback.slippage_threshold_bps,
-        max_quantity_shares=fallback.max_quantity_shares,
-    )
 
 
 def _assert_strategy_mode_allowed(strategy: ActiveStrategy, *, mode: RunMode) -> None:

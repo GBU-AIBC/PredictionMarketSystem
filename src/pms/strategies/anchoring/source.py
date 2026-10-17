@@ -10,16 +10,70 @@ from typing import Protocol
 from pms.core.enums import TimeInForce
 from pms.core.models import BookSide, Outcome, Portfolio, Venue
 from pms.factors.definitions.anchoring_lag_divergence import DEFAULT_DECAY_WINDOW_HOURS
+from pms.strategies.aggregate import Strategy
 from pms.strategies.anchoring.evaluator import (
     DEFAULT_MIN_CONFIDENCE,
     DEFAULT_MIN_DIVERGENCE,
     DEFAULT_MIN_EXPECTED_EDGE,
 )
 from pms.strategies.intents import StrategyContext, StrategyObservation
+from pms.strategies.projections import (
+    EvalSpec,
+    ForecasterSpec,
+    MarketSelectionSpec,
+    RiskParams,
+    StrategyConfig,
+)
 
 
 ANCHORING_RESEARCH_REF = "research:h2-anchoring-lag-spec#h2"
 LIVE_ANCHORING_SOURCE = "live_anchoring_lag_source"
+ANCHORING_ECONOMICS_VERSION = "anchoring-economics-v1"
+ANCHORING_LEGACY_VERSION_IDS = frozenset({"h2-anchoring-lag-v1"})
+ANCHORING_MAX_POSITION_NOTIONAL_USDC = 1.0
+ANCHORING_DEFAULT_MIN_DIVERGENCE = DEFAULT_MIN_DIVERGENCE
+ANCHORING_DEFAULT_MIN_CONFIDENCE = DEFAULT_MIN_CONFIDENCE
+ANCHORING_DEFAULT_MIN_EXPECTED_EDGE = DEFAULT_MIN_EXPECTED_EDGE
+ANCHORING_DEFAULT_MAX_SLIPPAGE_BPS = 50
+ANCHORING_DEFAULT_FEE_RATE = 0.07
+ANCHORING_DEFAULT_TIME_IN_FORCE = TimeInForce.GTC
+
+
+def build_anchoring_strategy(
+    strategy_id: str,
+    *,
+    time_in_force: str = ANCHORING_DEFAULT_TIME_IN_FORCE.value,
+    fee_rate: float = ANCHORING_DEFAULT_FEE_RATE,
+) -> Strategy:
+    """Build the immutable projection that owns H2 runtime economics."""
+    return Strategy(
+        config=StrategyConfig(
+            strategy_id=strategy_id,
+            factor_composition=(),
+            metadata=(
+                ("economics_version", ANCHORING_ECONOMICS_VERSION),
+                ("min_divergence", str(ANCHORING_DEFAULT_MIN_DIVERGENCE)),
+                ("min_confidence", str(ANCHORING_DEFAULT_MIN_CONFIDENCE)),
+                ("min_expected_edge", str(ANCHORING_DEFAULT_MIN_EXPECTED_EDGE)),
+                ("decay_window_hours", str(DEFAULT_DECAY_WINDOW_HOURS)),
+                ("max_slippage_bps", str(ANCHORING_DEFAULT_MAX_SLIPPAGE_BPS)),
+                ("fee_rate", str(fee_rate)),
+                ("time_in_force", time_in_force.upper()),
+            ),
+        ),
+        risk=RiskParams(
+            max_position_notional_usdc=ANCHORING_MAX_POSITION_NOTIONAL_USDC,
+            max_daily_drawdown_pct=20.0,
+            min_order_size_usdc=1.0,
+        ),
+        eval_spec=EvalSpec(metrics=("pnl", "fill_rate")),
+        forecaster=ForecasterSpec(forecasters=(("anchoring", ()),)),
+        market_selection=MarketSelectionSpec(
+            venue="polymarket",
+            resolution_time_max_horizon_days=7,
+            volume_min_usdc=0.0,
+        ),
+    )
 
 
 class AnchoringMarketSnapshotReader(Protocol):
@@ -184,6 +238,12 @@ def _observation_from_market(
     evidence_refs = _evidence_refs(market)
     metadata = {
         "source": LIVE_ANCHORING_SOURCE,
+        "economics_version": ANCHORING_ECONOMICS_VERSION,
+        "min_divergence": min_divergence,
+        "min_confidence": min_confidence,
+        "min_expected_edge": min_expected_edge,
+        "decay_window_hours": decay_window_hours,
+        "max_slippage_bps": max_slippage_bps,
         "h2_signal": signal.signal_name,
         "yes_price": market.yes_price,
         "llm_posterior": market.llm_posterior,
@@ -194,9 +254,6 @@ def _observation_from_market(
         "observed_at": market.observed_at.isoformat(),
         "resolves_at": market.resolves_at.isoformat() if market.resolves_at else None,
         "delta_effective": signal.delta_effective,
-        "min_divergence": min_divergence,
-        "decay_window_hours": decay_window_hours,
-        "min_expected_edge": min_expected_edge,
     }
     payload = {
         "market_id": market.market_id,

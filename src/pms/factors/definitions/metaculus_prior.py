@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pms.core.models import MarketSignal
+from pms.core.validation import validate_probability
 from pms.factors.base import FactorDefinition, FactorValueRow, OuterRingReader
 
 
@@ -24,5 +25,8 @@ class MetaculusPrior(FactorDefinition):
             param="",
             market_id=signal.market_id,
             ts=signal.timestamp,
-            value=float(raw_metaculus_prob),
+            value=validate_probability(
+                raw_metaculus_prob,
+                field_name="external_signal.metaculus_prob",
+            ),
         )

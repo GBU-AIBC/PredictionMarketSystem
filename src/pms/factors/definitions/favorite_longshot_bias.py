@@ -34,7 +34,10 @@ class FavoriteLongshotBias(FactorDefinition):
         elif yes_price > FAVORITE_YES_THRESHOLD:
             value = yes_price - FAVORITE_YES_THRESHOLD
         else:
-            return None
+            # A raw factor row is a time series.  Persisting an explicit
+            # neutral value clears any previously active tail signal from the
+            # snapshot instead of leaving the last tail value live.
+            value = Decimal("0")
 
         return FactorValueRow(
             factor_id=self.factor_id,

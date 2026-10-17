@@ -6,6 +6,7 @@ from pms.strategies.anchoring.source import (
     ANCHORING_RESEARCH_REF,
     AnchoringMarketSnapshot,
     LiveAnchoringSource,
+    build_anchoring_strategy,
 )
 from pms.strategies.anchoring.strategy import AnchoringLagStrategyModule
 
@@ -16,4 +17,5 @@ __all__ = [
     "AnchoringLagStrategyModule",
     "AnchoringMarketSnapshot",
     "LiveAnchoringSource",
+    "build_anchoring_strategy",
 ]

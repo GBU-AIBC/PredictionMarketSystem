@@ -79,17 +79,21 @@ def test_anchoring_lag_factor_outputs_negative_decayed_divergence() -> None:
     assert row.value == pytest.approx(-0.20)
 
 
-def test_anchoring_lag_factor_returns_none_below_threshold_or_after_decay_window() -> None:
+def test_anchoring_lag_factor_emits_neutral_below_threshold_or_after_decay_window() -> None:
     factor = AnchoringLagDivergence()
 
-    assert factor.compute(
+    below_threshold = factor.compute(
         _signal(yes_price=0.50, llm_posterior=0.60, news_timestamp=NOW),
         EMPTY_OUTER_RING,
-    ) is None
-    assert factor.compute(
+    )
+    assert below_threshold is not None
+    assert below_threshold.value == pytest.approx(0.0)
+    after_decay = factor.compute(
         _signal(yes_price=0.50, llm_posterior=0.90, news_timestamp=NOW - timedelta(hours=24)),
         EMPTY_OUTER_RING,
-    ) is None
+    )
+    assert after_decay is not None
+    assert after_decay.value == pytest.approx(0.0)
 
 
 def test_anchoring_lag_factor_returns_none_when_llm_news_inputs_are_absent() -> None:
@@ -116,11 +120,13 @@ def test_anchoring_lag_factor_returns_none_for_null_llm_news_inputs() -> None:
     assert AnchoringLagDivergence().compute(signal, EMPTY_OUTER_RING) is None
 
 
-def test_anchoring_lag_factor_returns_none_for_future_news_timestamp() -> None:
-    assert AnchoringLagDivergence().compute(
+def test_anchoring_lag_factor_emits_neutral_for_future_news_timestamp() -> None:
+    row = AnchoringLagDivergence().compute(
         _signal(news_timestamp=NOW + timedelta(seconds=1)),
         EMPTY_OUTER_RING,
-    ) is None
+    )
+    assert row is not None
+    assert row.value == pytest.approx(0.0)
 
 
 def test_anchoring_lag_factor_rejects_invalid_probability_inputs() -> None:

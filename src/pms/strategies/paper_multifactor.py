@@ -93,7 +93,6 @@ def build_paper_multi_factor_strategy() -> Strategy:
                 ("purpose", "paper_multi_factor_phase_a"),
                 ("price_reference", "best_ask"),
                 ("live_allowed", "false"),
-                ("requires_strict_factor_gates", "false"),
             ),
         ),
         risk=RiskParams(

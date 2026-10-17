@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -13,11 +14,16 @@ from pms.config import (
     RiskSettings,
     StrategyRuntimeSettings,
 )
-from pms.core.enums import RunMode
+from pms.core.enums import RunMode, TimeInForce
+from pms.core.models import TradeDecision
 from pms.runner import Runner
 from pms.strategies.flb import FlbAgent, FlbController, FlbStrategyModule, LiveFlbSource
+from pms.strategies.flb.projection import build_h1_flb_strategy
 from pms.strategies.flb.source import FlbMarketSnapshot
+from pms.strategies.ripple.source import build_ripple_strategy
+from pms.strategies.anchoring.source import build_anchoring_strategy
 from pms.strategies.intents import TradeIntent
+from pms.strategies.versioning import compute_strategy_version_id
 
 
 NOW = datetime(2026, 5, 3, 15, 0, tzinfo=UTC)
@@ -223,6 +229,120 @@ def test_runner_builds_flb_strategy_module_with_live_components() -> None:
     assert isinstance(module.agent, FlbAgent)
     assert module.strategy_id == "h1_flb"
     assert module.strategy_version_id == "h1-flb-v1"
+    assert module.source.confidence == pytest.approx(0.65)
+    assert getattr(module.agent, "min_confidence") == pytest.approx(0.60)
+    position_sizer_risk = getattr(module.source.position_sizer, "risk")
+    assert position_sizer_risk is not None
+    assert position_sizer_risk.max_position_per_market == pytest.approx(1.0)
+
+
+def test_runner_flb_module_uses_versioned_time_in_force() -> None:
+    settings = PMSSettings(
+        mode=RunMode.PAPER,
+        controller=ControllerSettings(time_in_force="IOC"),
+    )
+    runner = Runner(config=settings)
+    strategy = build_h1_flb_strategy(time_in_force="IOC")
+    version_id = compute_strategy_version_id(*strategy.snapshot())
+
+    module = runner.build_flb_strategy_module(
+        strategy_id="h1_flb",
+        strategy_version_id=version_id,
+        market_ids=("market-flb-1",),
+        market_reader=_StaticFlbMarketReader(_market()),
+    )
+
+    assert getattr(module.source, "time_in_force").value == "IOC"
+
+
+def test_runner_flb_module_rejects_mismatched_strategy_version() -> None:
+    runner = Runner(config=_settings())
+
+    with pytest.raises(ValueError, match="runtime strategy projection"):
+        runner.build_flb_strategy_module(
+            strategy_id="h1_flb",
+            strategy_version_id="mismatched-version",
+            market_ids=("market-flb-1",),
+            market_reader=_StaticFlbMarketReader(_market()),
+        )
+
+
+def test_paper_fill_fee_uses_versioned_strategy_fee() -> None:
+    strategy = build_h1_flb_strategy()
+    version_id = compute_strategy_version_id(*strategy.snapshot())
+    runner = Runner(
+        config=PMSSettings(
+            strategies=StrategyRuntimeSettings(flb_fee_rate=0.25),
+        )
+    )
+    runner._active_strategies_by_version[("h1_flb", version_id)] = strategy.to_active(
+        strategy_version_id=version_id
+    )
+    decision = TradeDecision(
+        decision_id="decision-fee",
+        market_id="market-fee",
+        token_id="token-fee",
+        venue="polymarket",
+        side="BUY",
+        limit_price=0.5,
+        notional_usdc=10.0,
+        order_type="limit",
+        max_slippage_bps=50,
+        stop_conditions=[],
+        prob_estimate=0.7,
+        expected_edge=0.2,
+        time_in_force=TimeInForce.GTC,
+        opportunity_id="opportunity-fee",
+        strategy_id="h1_flb",
+        strategy_version_id=version_id,
+        action="BUY",
+    )
+
+    assert runner._paper_fill_fee_rate(decision) == pytest.approx(0.07)
+
+
+@pytest.mark.parametrize(
+    ("builder", "strategy_id"),
+    (
+        (build_ripple_strategy, "ripple"),
+        (build_anchoring_strategy, "h2_anchoring_lag"),
+    ),
+)
+def test_paper_fill_fee_uses_versioned_fee_for_non_h1_strategies(
+    builder: Any,
+    strategy_id: str,
+) -> None:
+    strategy = builder(strategy_id)
+    version_id = compute_strategy_version_id(*strategy.snapshot())
+    runner = Runner(
+        config=PMSSettings(
+            strategies=StrategyRuntimeSettings(flb_fee_rate=0.25),
+        )
+    )
+    runner._active_strategies_by_version[(strategy_id, version_id)] = strategy.to_active(
+        strategy_version_id=version_id
+    )
+    decision = TradeDecision(
+        decision_id=f"decision-fee-{strategy_id}",
+        market_id="market-fee",
+        token_id="token-fee",
+        venue="polymarket",
+        side="BUY",
+        limit_price=0.5,
+        notional_usdc=10.0,
+        order_type="limit",
+        max_slippage_bps=50,
+        stop_conditions=[],
+        prob_estimate=0.7,
+        expected_edge=0.2,
+        time_in_force=TimeInForce.GTC,
+        opportunity_id=f"opportunity-fee-{strategy_id}",
+        strategy_id=strategy_id,
+        strategy_version_id=version_id,
+        action="BUY",
+    )
+
+    assert runner._paper_fill_fee_rate(decision) == pytest.approx(0.07)
 
 
 def test_runner_rejects_configured_flb_calibration_without_provenance(
@@ -356,19 +476,9 @@ async def test_runner_calls_flb_module_without_live_capital() -> None:
     )
 
     assert reader.calls == [("market-flb-1", NOW)]
-    assert len(results) == 1
-    judgement = results[0].judgement
-    assert judgement is not None
-    assert judgement.approved is True
-
-    assert len(results[0].intents) == 1
-    intent = results[0].intents[0]
-    assert isinstance(intent, TradeIntent)
-    assert intent.outcome == "NO"
-    assert intent.token_id == "token-no"
-    assert intent.limit_price == pytest.approx(0.96)
-    assert intent.expected_edge == pytest.approx(0.02)
-    assert intent.notional_usdc <= 5.0
+    # H1's hashed economics include the 7% fee and 15 bps execution cost;
+    # the gross 2c edge is therefore correctly rejected.
+    assert results == ()
 
     assert runner.state.decisions == []
     assert runner._decision_queue.empty()  # noqa: SLF001
@@ -429,7 +539,17 @@ async def test_runner_wires_configured_flb_entry_costs(tmp_path: Path) -> None:
         market_reader=reader,
     )
 
-    assert results == ()
+    assert len(results) == 1
+    assert len(results[0].intents) == 1
+    module = runner.build_flb_strategy_module(
+        strategy_id="h1_flb",
+        strategy_version_id="h1-flb-v1",
+        market_ids=("market-flb-1",),
+        market_reader=reader,
+    )
+    assert isinstance(module.source, LiveFlbSource)
+    assert module.source.entry_execution_cost_bps == pytest.approx(15.0)
+    assert module.source.fee_rate == pytest.approx(0.07)
 
 
 def test_runner_flb_module_requires_explicit_markets_without_pg_pool() -> None:
@@ -460,12 +580,7 @@ async def test_postgres_flb_reader_uses_as_of_price_snapshot() -> None:
         as_of=NOW,
     )
 
-    assert len(results) == 1
-    intent = results[0].intents[0]
-    assert isinstance(intent, TradeIntent)
-    assert intent.outcome == "NO"
-    assert intent.expected_price == pytest.approx(0.97)
-    assert intent.limit_price == pytest.approx(0.95)
+    assert results == ()
     assert connection.fetchval_calls[0][1] == ("token-yes",)
     assert connection.fetchrow_calls[1][1] == ("market-flb-1", NOW)
     assert "ORDER BY match_rank ASC" in connection.fetchval_calls[0][0]

@@ -38,6 +38,17 @@ class RiskParams:
     max_daily_drawdown_pct: float
     min_order_size_usdc: float
 
+    def __post_init__(self) -> None:
+        if (
+            not isfinite(self.max_position_notional_usdc)
+            or self.max_position_notional_usdc < 0.0
+            or not isfinite(self.max_daily_drawdown_pct)
+            or self.max_daily_drawdown_pct < 0.0
+            or not isfinite(self.min_order_size_usdc)
+            or self.min_order_size_usdc < 0.0
+        ):
+            raise ValueError("RiskParams values must be finite and non-negative")
+
 
 @dataclass(frozen=True, slots=True)
 class EvalSpec:
@@ -132,6 +143,9 @@ class ActiveStrategy:
     calibration: CalibrationSpec = field(default_factory=CalibrationSpec)
 
     def __post_init__(self) -> None:
+        from .economics import validate_strategy_economics
+
+        validate_strategy_economics(self.config.metadata)
         if not self.strategy_id:
             msg = "ActiveStrategy.strategy_id must be non-empty"
             raise ValueError(msg)

@@ -12,7 +12,15 @@ from typing import runtime_checkable
 from pms.core.enums import TimeInForce
 from pms.core.models import BookSide, Outcome, Portfolio, Venue
 from pms.strategies.intents import StrategyContext, StrategyObservation
-from pms.strategies.projections import FactorCompositionStep
+from pms.strategies.aggregate import Strategy
+from pms.strategies.projections import (
+    EvalSpec,
+    FactorCompositionStep,
+    ForecasterSpec,
+    MarketSelectionSpec,
+    RiskParams,
+    StrategyConfig,
+)
 from pms.strategies.ripple.evaluator import (
     DEFAULT_MIN_EXPECTED_EDGE,
     DEFAULT_PRIOR_STRENGTH,
@@ -23,6 +31,14 @@ from pms.strategies.ripple.evaluator import (
 
 
 LIVE_RIPPLE_SOURCE = "live_factor_service"
+RIPPLE_ECONOMICS_VERSION = "ripple-economics-v1"
+RIPPLE_LEGACY_VERSION_IDS = frozenset({"ripple-v1"})
+RIPPLE_MAX_POSITION_NOTIONAL_USDC = 1.0
+RIPPLE_DEFAULT_PRIOR_STRENGTH = DEFAULT_PRIOR_STRENGTH
+RIPPLE_DEFAULT_MIN_EXPECTED_EDGE = DEFAULT_MIN_EXPECTED_EDGE
+RIPPLE_DEFAULT_MAX_SLIPPAGE_BPS = 50
+RIPPLE_DEFAULT_FEE_RATE = 0.07
+RIPPLE_DEFAULT_TIME_IN_FORCE = TimeInForce.GTC
 RIPPLE_FACTOR_REQUIREMENTS: tuple[FactorCompositionStep, ...] = (
     FactorCompositionStep(
         factor_id="metaculus_prior",
@@ -70,6 +86,42 @@ RIPPLE_FACTOR_REQUIREMENTS: tuple[FactorCompositionStep, ...] = (
         freshness_sla_s=3600.0,
     ),
 )
+
+
+def build_ripple_strategy(
+    strategy_id: str,
+    *,
+    time_in_force: str = RIPPLE_DEFAULT_TIME_IN_FORCE.value,
+    fee_rate: float = RIPPLE_DEFAULT_FEE_RATE,
+) -> Strategy:
+    """Build the immutable projection that owns Ripple's runtime economics."""
+    return Strategy(
+        config=StrategyConfig(
+            strategy_id=strategy_id,
+            factor_composition=RIPPLE_FACTOR_REQUIREMENTS,
+            metadata=(
+                ("economics_version", RIPPLE_ECONOMICS_VERSION),
+                ("prior_strength", str(RIPPLE_DEFAULT_PRIOR_STRENGTH)),
+                ("min_expected_edge", str(RIPPLE_DEFAULT_MIN_EXPECTED_EDGE)),
+                ("max_slippage_bps", str(RIPPLE_DEFAULT_MAX_SLIPPAGE_BPS)),
+                ("fee_rate", str(fee_rate)),
+                ("min_confidence", "0.60"),
+                ("time_in_force", time_in_force.upper()),
+            ),
+        ),
+        risk=RiskParams(
+            max_position_notional_usdc=RIPPLE_MAX_POSITION_NOTIONAL_USDC,
+            max_daily_drawdown_pct=20.0,
+            min_order_size_usdc=1.0,
+        ),
+        eval_spec=EvalSpec(metrics=("pnl", "fill_rate")),
+        forecaster=ForecasterSpec(forecasters=(("ripple", ()),)),
+        market_selection=MarketSelectionSpec(
+            venue="polymarket",
+            resolution_time_max_horizon_days=7,
+            volume_min_usdc=0.0,
+        ),
+    )
 
 
 FactorKey = tuple[str, str]
@@ -312,6 +364,17 @@ def _live_observation(
     max_slippage_bps: int,
     time_in_force: TimeInForce,
 ) -> StrategyObservation | None:
+    prior_key = ("metaculus_prior", "")
+    if (
+        prior_key in snapshot.missing_factors
+        or prior_key in snapshot.stale_factors
+        or prior_key not in snapshot.values
+        or snapshot.snapshot_hash is None
+    ):
+        # Ripple's posterior is only meaningful when its external prior was
+        # actually observed in the point-in-time snapshot.  Falling back to
+        # the market price turns missing evidence into false provenance.
+        return None
     prior_probability = _bounded_probability(
         _factor_value(snapshot, "metaculus_prior", fallback=market.yes_price),
         "metaculus_prior",
@@ -351,6 +414,10 @@ def _live_observation(
     evidence_refs = _live_evidence_refs(market, snapshot)
     payload_metadata = {
         "source": LIVE_RIPPLE_SOURCE,
+        "economics_version": RIPPLE_ECONOMICS_VERSION,
+        "prior_strength": prior_strength,
+        "min_expected_edge": min_expected_edge,
+        "max_slippage_bps": max_slippage_bps,
         "factor_snapshot_hash": snapshot.snapshot_hash,
         "factor_values": _string_factor_values(snapshot.values),
         "missing_factors": _string_factor_keys(snapshot.missing_factors),
@@ -362,7 +429,6 @@ def _live_observation(
         "resolves_at": market.resolves_at.isoformat() if market.resolves_at else None,
         "orderbook_imbalance": orderbook_imbalance,
         "metaculus_prior": prior_probability,
-        "prior_strength": prior_strength,
         "yes_count": yes_count,
         "no_count": no_count,
         "posterior_probability": probability_estimate,
