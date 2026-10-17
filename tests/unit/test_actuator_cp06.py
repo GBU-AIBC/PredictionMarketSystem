@@ -3102,6 +3102,35 @@ async def test_every_order_consume_failure_blocks_waiting_concurrent_submit() ->
 
 
 @pytest.mark.asyncio
+async def test_polymarket_actuator_timeout_is_submission_unknown_and_consumes_approval() -> None:
+    @dataclass
+    class _TimeoutClient:
+        requires_live_mode: bool = False
+
+        async def submit_order(
+            self,
+            order: PolymarketOrderRequest,
+            credentials: object,
+        ) -> PolymarketOrderResult:
+            del order, credentials
+            raise asyncio.TimeoutError("client request timed out")
+
+    gate = RecordingOperatorGate(approved=True)
+    actuator = PolymarketActuator(
+        _live_settings(operator_approval_mode="every_order"),
+        client=_TimeoutClient(),
+        operator_gate=gate,
+        quote_provider=AllowQuoteProvider(),
+    )
+
+    with pytest.raises(PolymarketSubmissionUnknownError):
+        await actuator.execute(_decision(), _portfolio())
+
+    assert len(gate.consumed) == 1
+    assert actuator._first_order_approved() is True  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_polymarket_actuator_first_order_gate_is_serialized() -> None:
     # The lock around the gate must serialize gate calls — a second concurrent
     # task cannot observe an in-progress gate. After the live-hardening fix

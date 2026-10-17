@@ -842,12 +842,20 @@ def create_app(
     )
     async def clear_live_halt(payload: HaltClearRequest) -> dict[str, str]:
         try:
-            await active_runner.clear_live_halt(cleared_by=payload.cleared_by)
+            remaining_halt = await active_runner.clear_live_halt(
+                cleared_by=payload.cleared_by
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {"status": "cleared", "cleared_by": payload.cleared_by}
+        response = {
+            "status": "cleared" if remaining_halt is None else "clear_recorded",
+            "cleared_by": payload.cleared_by,
+        }
+        if remaining_halt is not None:
+            response["active_trigger_kind"] = remaining_halt.trigger_kind
+        return response
 
     @app.post("/config", dependencies=[Depends(require_api_token)])
     async def update_config(update: ConfigUpdate) -> dict[str, str]:

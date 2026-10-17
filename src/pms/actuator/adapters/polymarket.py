@@ -643,7 +643,7 @@ class PolymarketSDKClient:
             # must surface as submission_unknown. Duck-typed (class name
             # + attribute) so polymarket.py keeps no hard dependency on
             # the SDK's exception class.
-            if _is_sdk_transport_failure(exc):
+            if _is_sdk_transport_failure(exc) or _is_transport_timeout(exc):
                 logger.warning(
                     "Polymarket live order submission transport failure (%s): %s; "
                     "treating as submission_unknown",
@@ -1220,7 +1220,28 @@ class PolymarketActuator:
         else:
             quote = await self.quote_provider.quote(request, credentials)
         _validate_pre_submit_quote(request, quote, self.settings)
-        result = await self.client.submit_order(request, credentials)
+        try:
+            result = await self.client.submit_order(request, credentials)
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            msg = (
+                "Polymarket live order submission timed out; order status is "
+                "unknown — reconcile with venue before retrying"
+            )
+            raise PolymarketSubmissionUnknownError(
+                msg,
+                order_state=_submission_unknown_order_state(decision),
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            if _is_sdk_transport_failure(exc):
+                msg = (
+                    "Polymarket live order submission transport failure; order "
+                    "status is unknown — reconcile with venue before retrying"
+                )
+                raise PolymarketSubmissionUnknownError(
+                    msg,
+                    order_state=_submission_unknown_order_state(decision),
+                ) from exc
+            raise
         order_state = _order_state_from_result(decision, result, quote=quote)
         _raise_if_unexpected_resting_non_gtc(
             settings=self.settings,
@@ -3202,6 +3223,18 @@ def _is_sdk_transport_failure(exc: BaseException) -> bool:
         return False
     status_code = getattr(exc, "status_code", _MISSING_SENTINEL)
     return status_code is None
+
+
+def _is_transport_timeout(exc: BaseException) -> bool:
+    """Recognize common async HTTP timeout names without importing a client."""
+    name = type(exc).__name__.lower()
+    return name in {
+        "timeoutexception",
+        "readtimeout",
+        "writetimeout",
+        "connecttimeout",
+        "pooltimeout",
+    }
 
 
 _MISSING_SENTINEL: Final[object] = object()

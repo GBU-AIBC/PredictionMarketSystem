@@ -112,6 +112,18 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--fees", type=float)
     reconcile.add_argument("--fee-bps", type=int)
     reconcile.add_argument("--database-url")
+    fee_reconcile = subparsers.add_parser(
+        "reconcile-live-fee",
+        help="Record audited venue fee evidence for an unresolved LIVE fill.",
+    )
+    fee_reconcile.add_argument("--config")
+    fee_reconcile.add_argument("--fill-id", required=True)
+    fee_reconcile.add_argument("--fees", required=True, type=float)
+    fee_reconcile.add_argument("--fee-bps", type=int)
+    fee_reconcile.add_argument("--slippage-bps", type=float)
+    fee_reconcile.add_argument("--reconciled-by", required=True)
+    fee_reconcile.add_argument("--evidence", required=True)
+    fee_reconcile.add_argument("--database-url")
     reconcile_live_order = subparsers.add_parser(
         "reconcile-live-order",
         help=(
@@ -311,6 +323,85 @@ async def _main_async(args: argparse.Namespace) -> int:
             )
         )
         return 0 if updated else 1
+    if args.command == "reconcile-live-fee":
+        try:
+            fill_id = _normalize_fee_reconcile_fill_id(cast(str, args.fill_id))
+            reconciled_by = normalize_submission_unknown_reconciled_by(
+                cast(str, args.reconciled_by)
+            )
+            evidence = _normalize_fee_reconcile_evidence(cast(str, args.evidence))
+            fees = float(args.fees)
+            if not math.isfinite(fees) or fees < 0.0:
+                raise ValueError("fees must be finite and non-negative")
+            fee_bps = cast(int | None, args.fee_bps)
+            if fee_bps is not None and (isinstance(fee_bps, bool) or fee_bps < 0):
+                raise ValueError("fee_bps must be non-negative")
+            slippage_bps = cast(float | None, args.slippage_bps)
+            if slippage_bps is not None and not math.isfinite(slippage_bps):
+                raise ValueError("slippage_bps must be finite")
+        except (TypeError, ValueError) as exc:
+            _print_fee_reconcile_failure(args, exc)
+            return 1
+        try:
+            settings = _load_cli_settings(cast(str | None, args.config))
+        except Exception as exc:  # noqa: BLE001
+            _print_fee_reconcile_failure(args, exc)
+            return 1
+        database_url = args.database_url or settings.database.dsn
+        try:
+            pool = await asyncpg.create_pool(dsn=database_url, min_size=1, max_size=1)
+        except Exception as exc:  # noqa: BLE001
+            _print_fee_reconcile_failure(args, exc, settings=settings)
+            return 1
+        updated = False
+        try:
+            try:
+                await ensure_schema_current(pool)
+                updated = await FillStore(pool).reconcile_fee(
+                    fill_id,
+                    fees=fees,
+                    fee_bps=fee_bps,
+                    slippage_bps=slippage_bps,
+                )
+                if updated:
+                    await LiveEmergencyAuditWriter(
+                        Path(settings.live_emergency_audit_path)
+                    ).append_fee_reconcile(
+                        fill_id=fill_id,
+                        fees=fees,
+                        fee_bps=fee_bps,
+                        slippage_bps=slippage_bps,
+                        reconciled_by=reconciled_by,
+                        evidence=evidence,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                _print_fee_reconcile_failure(args, exc, settings=settings)
+                return 1
+        finally:
+            await pool.close()
+        if not updated:
+            _print_fee_reconcile_failure(
+                args,
+                RuntimeError(
+                    "fill was not found or already has reconciled fee telemetry"
+                ),
+                settings=settings,
+            )
+            return 1
+        print(
+            json.dumps(
+                {
+                    "updated": True,
+                    "fill_id": fill_id,
+                    "fees": fees,
+                    "fee_bps": fee_bps,
+                    "reconciled_by": reconciled_by,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+
     if args.command == "reconcile-live-order":
         try:
             decision_id = normalize_submission_unknown_decision_id(
@@ -754,6 +845,47 @@ def _containing_working_tree_root(path: Path) -> Path | None:
         if (candidate / ".git").exists():
             return candidate
     return None
+
+
+def _normalize_fee_reconcile_fill_id(fill_id: str) -> str:
+    normalized = fill_id.strip()
+    if normalized == "":
+        raise ValueError("fill_id is required")
+    if any(marker in normalized.lower() for marker in ("placeholder", "todo", "fill_in", "<", ">")):
+        raise ValueError("fill_id must not contain a placeholder")
+    return normalized
+
+
+def _normalize_fee_reconcile_evidence(evidence: str) -> str:
+    normalized = evidence.strip()
+    if normalized == "":
+        raise ValueError("evidence is required")
+    if any(character in normalized for character in ("\n", "\r")):
+        raise ValueError("evidence must not contain newlines")
+    return normalized
+
+
+def _print_fee_reconcile_failure(
+    args: argparse.Namespace,
+    exc: Exception,
+    *,
+    settings: PMSSettings | None = None,
+) -> None:
+    error = (
+        redact_database_error(str(exc))
+        if settings is None
+        else redact_live_error(str(exc), settings)
+    )
+    print(
+        json.dumps(
+            {
+                "updated": False,
+                "fill_id": cast(str, args.fill_id),
+                "error": error,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def _print_reconcile_failure(

@@ -45,7 +45,7 @@ from pms.actuator.exit_monitor import (
     mark_position_from_signal,
 )
 from pms.actuator.feedback import ActuatorFeedback
-from pms.actuator.risk import RiskManager, RiskTradeResult
+from pms.actuator.risk import HaltState, RiskManager, RiskTradeResult
 from pms.config import PMSSettings, validate_live_mode_ready
 from pms.controller._price_utils import best_ask
 from pms.controller.baselines import (
@@ -2923,7 +2923,7 @@ class Runner:
             return
         self._persisted_halt_triggered_at = state.triggered_at
 
-    async def clear_live_halt(self, *, cleared_by: str) -> None:
+    async def clear_live_halt(self, *, cleared_by: str) -> HaltState | None:
         if self.config.mode != RunMode.LIVE:
             raise RuntimeError("halt clear is only available in LIVE mode")
         await LiveEmergencyAuditWriter(
@@ -2933,6 +2933,8 @@ class Runner:
         self.portfolio = replace(self.portfolio, max_drawdown_pct=None)
         self._risk_peak_equity = _portfolio_equity(self.portfolio)
         self._persisted_halt_triggered_at = None
+        remaining = self.actuator_executor.risk.check_auto_halt(self.portfolio)
+        return remaining if remaining.halted else None
 
     async def _hard_halt_live_persistence_failure(
         self,
@@ -3322,15 +3324,29 @@ class Runner:
             Path(self.config.live_emergency_audit_path)
         )
         if self.config.mode == RunMode.LIVE:
-            unknown_telemetry = [
-                trade.fill_id
-                for trade in trades
-                if trade.fees is None or trade.slippage_bps is None
-            ]
-            if unknown_telemetry:
+            unresolved_telemetry: list[str] = []
+            for trade in trades:
+                missing: list[str] = []
+                if trade.fees is None:
+                    missing.append("fee")
+                if trade.slippage_bps is None:
+                    missing.append("execution_slippage")
+                if missing:
+                    unresolved_telemetry.append(
+                        f"{trade.fill_id} ({', '.join(missing)})"
+                    )
+            if unresolved_telemetry:
+                shown = unresolved_telemetry[:20]
+                omitted = len(unresolved_telemetry) - len(shown)
+                suffix = f"; {omitted} more" if omitted > 0 else ""
                 raise RuntimeError(
-                    "LIVE risk telemetry contains unknown fee/slippage for fills: "
-                    + ", ".join(unknown_telemetry[:10])
+                    "LIVE risk telemetry has unresolved fills: "
+                    + ", ".join(shown)
+                    + suffix
+                    + "; reconcile venue fees with: pms-live "
+                    "reconcile-live-fee --fill-id <fill-id> --fees <venue-fee> "
+                    "[--slippage-bps <execution-slippage-bps>] "
+                    "--reconciled-by <operator> --evidence <venue-evidence>"
                 )
         clear_day_start = (
             clear_cutoff.astimezone(UTC).replace(

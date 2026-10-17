@@ -40,6 +40,41 @@ class LiveEmergencyAuditWriter:
         )
         await asyncio.to_thread(_append_jsonl, self.path, record)
 
+    async def append_fee_reconcile(
+        self,
+        *,
+        fill_id: str,
+        fees: float,
+        fee_bps: int | None,
+        slippage_bps: float | None,
+        reconciled_by: str,
+        evidence: str,
+    ) -> None:
+        if not fill_id.strip():
+            raise ValueError("fill_id is required")
+        if not math.isfinite(fees) or fees < 0.0:
+            raise ValueError("fees must be finite and non-negative")
+        if fee_bps is not None and (
+            isinstance(fee_bps, bool)
+            or not isinstance(fee_bps, int)
+            or fee_bps < 0
+        ):
+            raise ValueError("fee_bps must be a non-negative integer")
+        if slippage_bps is not None and not math.isfinite(slippage_bps):
+            raise ValueError("slippage_bps must be finite")
+        record = {
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+            "phase": "live_fee_reconcile",
+            "event": "fee_reconciled",
+            "fill_id": fill_id.strip(),
+            "fees": fees,
+            "fee_bps": fee_bps,
+            "slippage_bps": slippage_bps,
+            "reconciled_by": _require_operator_id(reconciled_by, "reconciled_by"),
+            "evidence": _require_operator_text(evidence, "evidence"),
+        }
+        await asyncio.to_thread(_append_jsonl, self.path, record)
+
     async def append_manual_stop(
         self,
         *,

@@ -12,6 +12,7 @@ from typing import Any, cast
 
 import pytest
 
+from pms import live_cli
 from pms.actuator.adapters.polymarket import (
     LiveOrderPreview,
     LivePreSubmitQuote,
@@ -196,6 +197,86 @@ async def test_halt_persistence_requires_explicit_clear(tmp_path: Path) -> None:
     assert restored.actuator_executor.risk.active_halt() == state
     await writer.append_halt_clear(cleared_by="operator")
     assert read_active_halt(path) is None
+
+
+@pytest.mark.asyncio
+async def test_live_fee_reconcile_cli_updates_store_and_audits(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Pool:
+        async def close(self) -> None:
+            pass
+
+    calls: dict[str, object] = {}
+
+    class Store:
+        def __init__(self, pool: object) -> None:
+            calls["pool"] = pool
+
+        async def reconcile_fee(
+            self,
+            fill_id: str,
+            *,
+            fees: float,
+            fee_bps: int | None,
+            slippage_bps: float | None,
+        ) -> bool:
+            calls["fee"] = (fill_id, fees, fee_bps, slippage_bps)
+            return True
+
+    class Audit:
+        def __init__(self, path: Path) -> None:
+            calls["audit_path"] = path
+
+        async def append_fee_reconcile(self, **kwargs: object) -> None:
+            calls["audit"] = kwargs
+
+    settings = PMSSettings(
+        live_emergency_audit_path=str(tmp_path / "audit.jsonl"),
+    )
+
+    async def create_pool(**_: object) -> Pool:
+        return Pool()
+
+    async def ensure_schema(_: object) -> None:
+        calls["schema"] = True
+
+    monkeypatch.setattr(live_cli, "_load_cli_settings", lambda _: settings)
+    monkeypatch.setattr(asyncpg, "create_pool", create_pool)
+    monkeypatch.setattr(live_cli, "ensure_schema_current", ensure_schema)
+    monkeypatch.setattr(live_cli, "FillStore", Store)
+    monkeypatch.setattr(live_cli, "LiveEmergencyAuditWriter", Audit)
+    args = live_cli.build_parser().parse_args(
+        [
+            "reconcile-live-fee",
+            "--fill-id",
+            "fill-live-1",
+            "--fees",
+            "0.12",
+            "--fee-bps",
+            "15",
+            "--reconciled-by",
+            "operator",
+            "--evidence",
+            "venue-trade-1",
+            "--database-url",
+            "postgres://test",
+        ]
+    )
+
+    assert await live_cli._main_async(args) == 0
+    assert calls["fee"] == ("fill-live-1", 0.12, 15, None)
+    assert calls["audit"] == {
+        "fill_id": "fill-live-1",
+        "fees": 0.12,
+        "fee_bps": 15,
+        "slippage_bps": None,
+        "reconciled_by": "operator",
+        "evidence": "venue-trade-1",
+    }
+    assert json.loads(capsys.readouterr().out)["updated"] is True
 
 
 def test_unreadable_halt_audit_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -786,7 +867,10 @@ async def test_risk_replay_keeps_pre_clear_inventory_basis_for_post_clear_loss(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_client", [True, False], ids=["client", "duck-typed"])
-async def test_live_missing_fee_persists_fill_before_fail_closed(with_client: bool) -> None:
+async def test_live_missing_fee_persists_fill_before_fail_closed(
+    with_client: bool,
+    tmp_path: Path,
+) -> None:
     @dataclass
     class LiveAdapter:
         client: object | None = object()
@@ -830,7 +914,7 @@ async def test_live_missing_fee_persists_fill_before_fail_closed(with_client: bo
     settings = PMSSettings(
         mode=RunMode.LIVE,
         live_trading_enabled=True,
-        live_emergency_audit_path="/tmp/lane-1a-fee-audit.jsonl",
+        live_emergency_audit_path=str(tmp_path / "lane-1a-fee-audit.jsonl"),
         risk=RiskSettings(
             max_position_per_market=100.0,
             max_total_exposure=100.0,

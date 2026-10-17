@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 import json
+import math
 from typing import Any, cast
 
 import asyncpg
@@ -156,6 +157,71 @@ class FillStore:
                 resolved_outcome,
             )
         return row is not None
+
+    async def reconcile_fee(
+        self,
+        fill_id: str,
+        *,
+        fees: float,
+        fee_bps: int | None = None,
+        slippage_bps: float | None = None,
+    ) -> bool:
+        """Record verified venue fee telemetry for an unresolved fill once."""
+        if not fill_id.strip():
+            raise ValueError("fill_id is required")
+        if not math.isfinite(fees) or fees < 0.0:
+            raise ValueError("fees must be finite and non-negative")
+        if fee_bps is not None and (
+            isinstance(fee_bps, bool)
+            or not isinstance(fee_bps, int)
+            or fee_bps < 0
+        ):
+            raise ValueError("fee_bps must be a non-negative integer")
+        if slippage_bps is not None and not math.isfinite(slippage_bps):
+            raise ValueError("slippage_bps must be finite")
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    SELECT payload
+                    FROM fill_payloads
+                    WHERE fill_id = $1
+                    FOR UPDATE
+                    """,
+                    fill_id,
+                )
+                if row is None:
+                    return False
+                payload = _json_object(row["payload"])
+                if payload.get("fees") is not None:
+                    return False
+                payload["fees"] = fees
+                payload["fee_bps"] = fee_bps
+                flags = [
+                    flag
+                    for flag in _string_list(payload.get("anomaly_flags"))
+                    if flag != "fee_unreconciled"
+                    and not flag.startswith("fee_reconciled")
+                    and (
+                        slippage_bps is None
+                        or not flag.startswith("execution_slippage_bps=")
+                    )
+                ]
+                flags.append("fee_reconciled")
+                if slippage_bps is not None:
+                    flags.append(f"execution_slippage_bps={slippage_bps:.9f}")
+                payload["anomaly_flags"] = flags
+                await connection.execute(
+                    """
+                    UPDATE fill_payloads
+                    SET payload = $2::jsonb
+                    WHERE fill_id = $1
+                    """,
+                    fill_id,
+                    json.dumps(payload),
+                )
+        return True
 
     async def read_positions(self) -> list[Position]:
         async with self._pool().acquire() as connection:

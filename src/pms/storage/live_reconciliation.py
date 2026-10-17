@@ -414,7 +414,10 @@ async def _insert_reconciled_fill(
                 'fill_price', $3::double precision,
                 'executed_at', $4::text,
                 'status', 'filled',
-                'anomaly_flags', jsonb_build_array('reconciled_from_submission_unknown'),
+                'anomaly_flags', jsonb_build_array(
+                    'reconciled_from_submission_unknown',
+                    'execution_slippage_bps=0.000000000'
+                ),
                 'fee_bps', $5::integer,
                 'fees', $6::double precision,
                 'liquidity_side', NULL,

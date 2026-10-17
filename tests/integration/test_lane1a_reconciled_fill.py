@@ -3,11 +3,17 @@ from __future__ import annotations
 import json
 import os
 from datetime import UTC, datetime
+from pathlib import Path
 
 import asyncpg
 import pytest
 
+from pms.config import PMSSettings, RiskSettings
+from pms.core.enums import RunMode
+from pms.core.models import FillRecord
+from pms.runner import Runner
 from pms.storage.fill_store import FillStore
+from pms.storage.live_emergency_audit import LiveEmergencyAuditWriter
 from pms.storage.live_reconciliation import SubmissionUnknownReconciliationStore
 
 
@@ -17,7 +23,9 @@ from pms.storage.live_reconciliation import SubmissionUnknownReconciliationStore
     reason="set PMS_RUN_INTEGRATION=1 to run integration tests",
 )
 @pytest.mark.asyncio
-async def test_submission_unknown_filled_reconciles_idempotent_fill() -> None:
+async def test_submission_unknown_filled_reconciles_idempotent_fill(
+    tmp_path: Path,
+) -> None:
     dsn = os.environ.get("PMS_TEST_DATABASE_URL")
     if not dsn:
         pytest.skip("PMS_TEST_DATABASE_URL is required")
@@ -32,10 +40,23 @@ async def test_submission_unknown_filled_reconciles_idempotent_fill() -> None:
                 "payload JSONB NOT NULL)"
             )
             await connection.execute(
+                "CREATE TABLE IF NOT EXISTS fill_payloads ("
+                "fill_id TEXT PRIMARY KEY REFERENCES fills(fill_id) ON DELETE CASCADE, "
+                "payload JSONB NOT NULL)"
+            )
+            await connection.execute(
                 "DELETE FROM fill_payloads WHERE fill_id = $1",
                 fill_id,
             )
             await connection.execute("DELETE FROM fills WHERE fill_id = $1", fill_id)
+            await connection.execute(
+                "DELETE FROM fill_payloads WHERE fill_id = $1",
+                "lane-1a-unresolved-trade",
+            )
+            await connection.execute(
+                "DELETE FROM fills WHERE fill_id = $1",
+                "lane-1a-unresolved-trade",
+            )
             await connection.execute(
                 "DELETE FROM order_intents WHERE decision_id = $1",
                 decision_id,
@@ -103,6 +124,63 @@ async def test_submission_unknown_filled_reconciles_idempotent_fill() -> None:
         assert fill is not None
         assert fill.fill_quantity == pytest.approx(10.0)
         assert fill.risk_group_id == "lane-1a-risk-group"
+        trades = await FillStore(pool).read_trades(limit=10)
+        assert trades[0].slippage_bps == pytest.approx(0.0)
+
+        live_settings = PMSSettings(
+            mode=RunMode.LIVE,
+            live_emergency_audit_path=str(tmp_path / "live-audit.jsonl"),
+            risk=RiskSettings(max_daily_loss_usdc=20.0),
+        )
+        restart_runner = Runner(config=live_settings)
+        restart_runner.bind_pg_pool(pool)
+        await restart_runner._reconcile_risk_from_db()  # noqa: SLF001
+
+        unresolved = FillRecord(
+            trade_id="lane-1a-unresolved-trade",
+            order_id="lane-1a-unresolved-order",
+            decision_id="lane-1a-unresolved-decision",
+            market_id="lane-1a-unresolved-market",
+            token_id="lane-1a-unresolved-token",
+            venue="polymarket",
+            side="BUY",
+            fill_price=0.5,
+            fill_notional_usdc=5.0,
+            fill_quantity=10.0,
+            executed_at=filled_at,
+            filled_at=filled_at,
+            status="filled",
+            anomaly_flags=[
+                "fee_unreconciled",
+                "execution_slippage_bps=0.000000000",
+            ],
+            strategy_id="lane-1a-strategy",
+            strategy_version_id="lane-1a-v1",
+        )
+        unresolved_store = FillStore(pool)
+        await unresolved_store.insert(unresolved)
+        refused_runner = Runner(config=live_settings)
+        refused_runner.bind_pg_pool(pool)
+        with pytest.raises(RuntimeError, match="reconcile-live-fee"):
+            await refused_runner._reconcile_risk_from_db()  # noqa: SLF001
+        assert await unresolved_store.reconcile_fee(
+            unresolved.trade_id,
+            fees=0.02,
+            fee_bps=40,
+        )
+        await LiveEmergencyAuditWriter(
+            Path(live_settings.live_emergency_audit_path)
+        ).append_fee_reconcile(
+            fill_id=unresolved.trade_id,
+            fees=0.02,
+            fee_bps=40,
+            slippage_bps=None,
+            reconciled_by="operator",
+            evidence="venue-trade-42",
+        )
+        recovered_runner = Runner(config=live_settings)
+        recovered_runner.bind_pg_pool(pool)
+        await recovered_runner._reconcile_risk_from_db()  # noqa: SLF001
         assert await store.reconcile_submission_unknown(
             decision_id=decision_id,
             venue_order_id="lane-1a-venue-order",
