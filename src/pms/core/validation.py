@@ -3,34 +3,46 @@
 from __future__ import annotations
 
 import math
-from typing import Final, cast
+from decimal import Decimal
+from typing import SupportsFloat, SupportsIndex, cast
 
-from pms.core.enums import Venue
 from pms.core.exceptions import (
     DomainValidationError,
     NonFiniteValueError,
     OutOfDomainValueError,
 )
 
-_POLYMARKET_BOUNDS: Final[tuple[float, float, bool, bool]] = (0.0, 1.0, False, True)
-_KALSHI_BOUNDS: Final[tuple[float, float, bool, bool]] = (0.01, 0.99, True, True)
 
+def validate_finite(value: object, *, field_name: str = "value") -> float:
+    """Return ``value`` as a finite, canonicalized float.
 
-def _as_finite_float(value: object, *, field_name: str) -> float:
-    if value is None or isinstance(value, bool):
+    ``bool``, bytes, bytearrays, missing values, and non-numeric values are
+    rejected as domain errors. Numeric values that cannot be represented as a
+    finite float, including overflow and Decimal NaN variants, are rejected as
+    :class:`NonFiniteValueError` so callers can report one stable reason.
+    """
+
+    if value is None or isinstance(value, (bool, bytes, bytearray)):
         msg = f"{field_name} must be numeric"
         raise DomainValidationError(msg)
 
+    if isinstance(value, Decimal) and not value.is_finite():
+        msg = f"{field_name} must be finite"
+        raise NonFiniteValueError(msg)
+
     try:
-        parsed = float(cast(int | float | str, value))
-    except (TypeError, ValueError, OverflowError) as exc:
+        parsed = float(cast(str | SupportsFloat | SupportsIndex, value))
+    except OverflowError as exc:
+        msg = f"{field_name} must be finite"
+        raise NonFiniteValueError(msg) from exc
+    except (TypeError, ValueError) as exc:
         msg = f"{field_name} must be numeric"
         raise DomainValidationError(msg) from exc
 
     if not math.isfinite(parsed):
         msg = f"{field_name} must be finite"
         raise NonFiniteValueError(msg)
-    return parsed
+    return 0.0 if parsed == 0.0 else parsed
 
 
 def _within_bounds(
@@ -55,7 +67,7 @@ def _within_bounds(
 def validate_probability(value: object, *, field_name: str = "probability") -> float:
     """Return a finite probability in the closed interval ``[0, 1]``."""
 
-    parsed = _as_finite_float(value, field_name=field_name)
+    parsed = validate_finite(value, field_name=field_name)
     return _within_bounds(
         parsed,
         field_name=field_name,
@@ -66,105 +78,72 @@ def validate_probability(value: object, *, field_name: str = "probability") -> f
     )
 
 
-def validate_price(
-    value: object,
-    *,
-    venue: Venue | str | None = None,
-    field_name: str = "price",
-) -> float:
-    """Return a finite open-interval price, or a venue-bounded price.
+def validate_price(value: object, *, field_name: str = "price") -> float:
+    """Return a finite price in the open interval ``(0, 1)``."""
 
-    The generic contract is ``0 < price < 1``.  Passing ``venue`` applies the
-    venue's wire bounds instead: Polymarket accepts ``(0, 1]`` and the
-    reserved Kalshi contract uses ``[0.01, 0.99]``.
-    """
-
-    if venue is None:
-        bounds = (0.0, 1.0, False, False)
-    else:
-        bounds = _venue_price_bounds(venue)
-    parsed = _as_finite_float(value, field_name=field_name)
+    parsed = validate_finite(value, field_name=field_name)
     return _within_bounds(
         parsed,
         field_name=field_name,
-        lower=bounds[0],
-        upper=bounds[1],
-        include_lower=bounds[2],
-        include_upper=bounds[3],
+        lower=0.0,
+        upper=1.0,
+        include_lower=False,
+        include_upper=False,
     )
 
 
-def validate_venue_price(
-    value: object,
-    venue: Venue | str,
-    *,
-    field_name: str = "price",
-) -> float:
-    """Return ``value`` after applying the selected venue's price bounds."""
+def validate_positive(value: object, *, field_name: str = "value") -> float:
+    """Return a finite value strictly greater than zero."""
 
-    return validate_price(value, venue=venue, field_name=field_name)
+    parsed = validate_finite(value, field_name=field_name)
+    return _within_bounds(
+        parsed,
+        field_name=field_name,
+        lower=0.0,
+        upper=math.inf,
+        include_lower=False,
+        include_upper=False,
+    )
 
 
-def _venue_price_bounds(
-    venue: Venue | str,
-) -> tuple[float, float, bool, bool]:
-    if isinstance(venue, Venue):
-        venue_name = venue.value
-    else:
-        venue_name = str(venue).strip().lower()
-
-    if venue_name == Venue.POLYMARKET.value:
-        return _POLYMARKET_BOUNDS
-    if venue_name == Venue.KALSHI.value:
-        return _KALSHI_BOUNDS
-
-    msg = f"unsupported venue {venue!r}"
-    raise DomainValidationError(msg)
+def _non_negative(value: object, *, field_name: str) -> float:
+    parsed = validate_finite(value, field_name=field_name)
+    return _within_bounds(
+        parsed,
+        field_name=field_name,
+        lower=0.0,
+        upper=math.inf,
+        include_lower=True,
+        include_upper=False,
+    )
 
 
 def validate_notional(value: object, *, field_name: str = "notional") -> float:
     """Return a finite non-negative notional."""
 
-    parsed = _as_finite_float(value, field_name=field_name)
-    return _within_bounds(
-        parsed,
-        field_name=field_name,
-        lower=0.0,
-        upper=math.inf,
-        include_lower=True,
-        include_upper=False,
-    )
+    return _non_negative(value, field_name=field_name)
 
 
 def validate_quantity(value: object, *, field_name: str = "quantity") -> float:
     """Return a finite non-negative quantity."""
 
-    parsed = _as_finite_float(value, field_name=field_name)
-    return _within_bounds(
-        parsed,
-        field_name=field_name,
-        lower=0.0,
-        upper=math.inf,
-        include_lower=True,
-        include_upper=False,
-    )
+    return _non_negative(value, field_name=field_name)
 
 
 def normalize_resolved_outcome(raw: object) -> float | None:
     """Normalize optional resolution evidence to a finite probability.
 
-    Invalid, missing, non-finite, and out-of-range evidence is treated as
-    unresolved so optional metadata cannot abort fill or evaluation handling.
-    Numeric strings are accepted for compatibility with JSON and CSV inputs;
-    booleans are deliberately excluded even though ``float(bool)`` succeeds.
+    Missing evidence returns ``None``. Invalid, non-finite, and out-of-range
+    evidence is also treated as unresolved so optional metadata cannot abort
+    fill or evaluation handling. Callers that need an anomaly can distinguish
+    the two cases with ``raw is not None and normalized is None``. Numeric
+    strings are accepted for compatibility with JSON and CSV inputs; booleans
+    are deliberately excluded even though ``float(bool)`` succeeds.
     """
 
-    if raw is None or isinstance(raw, bool):
+    if raw is None:
         return None
     try:
-        parsed = float(cast(int | float | str, raw))
-    except (TypeError, ValueError, OverflowError):
+        return validate_probability(raw, field_name="resolved_outcome")
+    except DomainValidationError:
         return None
-    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
-        return None
-    return parsed
