@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from typing import Any, Protocol, cast
 
 import httpx
@@ -26,6 +27,18 @@ class ResolutionSource(Protocol):
         self,
         condition_ids: Sequence[str],
     ) -> Mapping[str, float]: ...
+
+
+class MarketResolutionStore(Protocol):
+    async def upsert(
+        self,
+        market_id: str,
+        *,
+        resolved_outcome: object,
+        resolved_at: Any | None = None,
+        source: str,
+        observed_at: Any | None = None,
+    ) -> None: ...
 
 
 class ResolutionFillStore(Protocol):
@@ -74,6 +87,7 @@ class ResolutionSweepResult:
     fills_resolved: int
     eval_records_appended: int
     fills_failed: int
+    persistence_failures: int = 0
 
 
 @dataclass(frozen=True)
@@ -88,6 +102,7 @@ class GammaResolutionSource:
 
     http_client: httpx.AsyncClient
     batch_size: int = _CONDITION_ID_BATCH_SIZE
+    resolved_at_by_market: dict[str, datetime | None] = field(default_factory=dict)
 
     async def fetch_resolutions(
         self,
@@ -120,10 +135,13 @@ class GammaResolutionSource:
             for row in payload:
                 if not isinstance(row, dict):
                     continue
-                resolution = _resolution_from_gamma_row(cast(dict[str, Any], row))
+                resolution = _resolution_with_timestamp_from_gamma_row(
+                    cast(dict[str, Any], row)
+                )
                 if resolution is not None:
-                    condition_id, resolved_outcome = resolution
+                    condition_id, resolved_outcome, resolved_at = resolution
                     resolutions[condition_id] = resolved_outcome
+                    self.resolved_at_by_market[condition_id] = resolved_at
         return resolutions
 
 
@@ -146,6 +164,7 @@ class ResolutionSweeper:
     decision_reader: ResolutionDecisionReader
     eval_spool: ResolutionEvalSpool
     resolution_source: ResolutionSource
+    resolution_store: MarketResolutionStore | None = None
 
     async def sweep_once(self) -> ResolutionSweepResult:
         unresolved = await self.fill_store.read_unresolved_fills()
@@ -158,6 +177,28 @@ class ResolutionSweeper:
             )
         condition_ids = list(dict.fromkeys(fill.market_id for fill in unresolved))
         resolutions = await self.resolution_source.fetch_resolutions(condition_ids)
+        persistence_failures = 0
+        if self.resolution_store is not None:
+            for market_id, label in resolutions.items():
+                resolved_at = getattr(
+                    self.resolution_source,
+                    "resolved_at_by_market",
+                    {},
+                ).get(market_id)
+                try:
+                    await self.resolution_store.upsert(
+                        market_id,
+                        resolved_outcome=label,
+                        resolved_at=resolved_at,
+                        source="gamma",
+                    )
+                except Exception:  # noqa: BLE001
+                    persistence_failures += 1
+                    logger.warning(
+                        "could not persist market resolution for %s; continuing sweep",
+                        market_id,
+                        exc_info=True,
+                    )
         fills_resolved = 0
         eval_records_appended = 0
         fills_failed = 0
@@ -179,11 +220,16 @@ class ResolutionSweeper:
                 fills_resolved += 1
             if outcome.eval_record_appended:
                 eval_records_appended += 1
+        flush_feedback = getattr(self.eval_spool, "flush_feedback", None)
+        scored_count = getattr(self.eval_spool, "_scored_record_count", 0)
+        if callable(flush_feedback) and scored_count > 2:
+            await flush_feedback()
         return ResolutionSweepResult(
             unresolved_fills=len(unresolved),
             fills_resolved=fills_resolved,
             eval_records_appended=eval_records_appended,
             fills_failed=fills_failed,
+            persistence_failures=persistence_failures,
         )
 
     async def _append_and_resolve(
@@ -236,6 +282,13 @@ class ResolutionSweeper:
 
 
 def _resolution_from_gamma_row(row: dict[str, Any]) -> tuple[str, float] | None:
+    resolution = _resolution_with_timestamp_from_gamma_row(row)
+    return None if resolution is None else resolution[:2]
+
+
+def _resolution_with_timestamp_from_gamma_row(
+    row: dict[str, Any],
+) -> tuple[str, float, datetime | None] | None:
     condition_id = str(row.get("conditionId") or row.get("condition_id") or "")
     if condition_id == "":
         return None
@@ -263,12 +316,24 @@ def _resolution_from_gamma_row(row: dict[str, Any]) -> tuple[str, float] | None:
         abs(yes_price - 1.0) <= _SETTLED_TOLERANCE
         and abs(no_price) <= _SETTLED_TOLERANCE
     ):
-        return condition_id, 1.0
+        return condition_id, 1.0, _gamma_resolution_timestamp(row)
     if (
         abs(no_price - 1.0) <= _SETTLED_TOLERANCE
         and abs(yes_price) <= _SETTLED_TOLERANCE
     ):
-        return condition_id, 0.0
+        return condition_id, 0.0, _gamma_resolution_timestamp(row)
+    return None
+
+
+def _gamma_resolution_timestamp(row: Mapping[str, Any]) -> datetime | None:
+    for key in ("resolvedAt", "resolved_at", "resolutionDate", "endDate"):
+        raw = row.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
     return None
 
 

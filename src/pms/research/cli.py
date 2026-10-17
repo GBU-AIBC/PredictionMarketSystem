@@ -17,10 +17,12 @@ import sys
 from typing import Callable
 
 import asyncpg
+import httpx
 import yaml
 
 from pms.config import PMSSettings
 from pms.core.exceptions import PMSBootError
+from pms.evaluation.resolution import GammaResolutionSource
 from pms.research.report import EvaluationReportGenerator
 from pms.research.runner import BacktestRunner, CancelProbe
 from pms.research.sweep import (
@@ -31,6 +33,7 @@ from pms.research.sweep import (
     deserialize_execution_config,
 )
 from pms.storage.schema_check import ensure_schema_current
+from pms.storage.market_resolution_store import MarketResolutionStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +51,14 @@ class _WorkerArgs:
     database_url: str | None
     poll_interval: float
     max_runs: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolutionBackfillArgs:
+    database_url: str | None
+    market_ids: tuple[str, ...]
+    start: datetime | None
+    end: datetime | None
 
 
 @dataclass(slots=True)
@@ -73,6 +84,11 @@ def build_parser() -> argparse.ArgumentParser:
     worker_parser.add_argument("--database-url")
     worker_parser.add_argument("--poll-interval", type=float, default=1.0)
     worker_parser.add_argument("--max-runs", type=int)
+    resolution_parser = subparsers.add_parser("resolution-backfill")
+    resolution_parser.add_argument("--database-url")
+    resolution_parser.add_argument("--market-id", action="append", default=[])
+    resolution_parser.add_argument("--start")
+    resolution_parser.add_argument("--end")
     return parser
 
 
@@ -106,6 +122,15 @@ def main() -> None:
         except PMSBootError as exc:
             print(str(exc), file=sys.stderr)
             raise SystemExit(1) from exc
+
+    if namespace.command == "resolution-backfill":
+        args = _ResolutionBackfillArgs(
+            database_url=_optional_string(namespace.database_url),
+            market_ids=tuple(str(item) for item in namespace.market_id),
+            start=_parse_cli_datetime(namespace.start),
+            end=_parse_cli_datetime(namespace.end),
+        )
+        raise SystemExit(asyncio.run(_run_resolution_backfill(args)))
 
     raise SystemExit(f"unknown command: {namespace.command}")
 
@@ -213,6 +238,51 @@ async def _run_worker(args: _WorkerArgs) -> int:
     return 0
 
 
+async def _run_resolution_backfill(args: _ResolutionBackfillArgs) -> int:
+    pool = await _create_pool(args.database_url)
+    try:
+        await ensure_schema_current(pool)
+        market_ids = list(args.market_ids)
+        if not market_ids:
+            rows = await pool.fetch(
+                """
+                SELECT condition_id FROM markets
+                WHERE ($1::timestamptz IS NULL OR resolves_at >= $1)
+                  AND ($2::timestamptz IS NULL OR resolves_at <= $2)
+                ORDER BY condition_id
+                """,
+                args.start,
+                args.end,
+            )
+            market_ids = [str(row["condition_id"]) for row in rows]
+        settings = PMSSettings.load()
+        timeout = httpx.Timeout(settings.sensor.discovery_http_timeout_s)
+        async with httpx.AsyncClient(
+            base_url="https://gamma-api.polymarket.com",
+            timeout=timeout,
+            trust_env=False,
+        ) as client:
+            source = GammaResolutionSource(http_client=client)
+            resolutions = await source.fetch_resolutions(market_ids)
+        store = MarketResolutionStore(pool)
+        for market_id, resolved_outcome in resolutions.items():
+            await store.upsert(
+                market_id,
+                resolved_outcome=resolved_outcome,
+                resolved_at=source.resolved_at_by_market.get(market_id),
+                source="gamma",
+            )
+        _print_json(
+            {
+                "requested_market_count": len(market_ids),
+                "resolved_market_count": len(resolutions),
+            }
+        )
+        return 0
+    finally:
+        await pool.close()
+
+
 async def _create_pool(database_url: str | None) -> asyncpg.Pool:
     settings = PMSSettings.load()
     dsn = database_url or settings.database.dsn
@@ -230,6 +300,20 @@ def _load_yaml_payload(path_or_stdin: str) -> dict[str, object]:
         msg = "sweep spec must decode to a mapping"
         raise TypeError(msg)
     return dict(loaded)
+
+
+def _parse_cli_datetime(value: object) -> datetime | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _parameter_grid(raw_value: object) -> dict[str, Sequence[object]]:

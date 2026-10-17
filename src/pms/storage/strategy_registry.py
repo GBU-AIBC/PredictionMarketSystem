@@ -9,6 +9,7 @@ from typing import cast
 
 import asyncpg
 
+from pms.config import PMSSettings
 from pms.strategies.aggregate import Strategy
 from pms.strategies.projections import (
     ActiveStrategy,
@@ -35,6 +36,17 @@ from pms.strategies.versioning import (
 logger = logging.getLogger(__name__)
 
 StrategyChangeCallback = Callable[[], Awaitable[None]]
+LLMIdentity = tuple[str | None, str, str]
+
+
+def llm_identity_for_settings(settings: PMSSettings) -> LLMIdentity | None:
+    if not settings.llm.enabled:
+        return None
+    return (
+        settings.llm.provider,
+        settings.llm.model,
+        settings.llm.prompt_version,
+    )
 
 # The load-bearing legacy bootstrap version id seeded by schema.sql
 # (`INSERT INTO strategy_versions ... 'default-v1'`). It predates
@@ -45,8 +57,14 @@ _LEGACY_BOOTSTRAP_STRATEGY_VERSION_ID = "default-v1"
 
 
 class PostgresStrategyRegistry:
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        *,
+        llm_identity: LLMIdentity | None = None,
+    ) -> None:
         self._pool = pool
+        self._llm_identity = llm_identity
         self._strategy_change_callbacks: list[StrategyChangeCallback] = []
 
     def register_change_callback(self, fn: StrategyChangeCallback) -> None:
@@ -90,8 +108,19 @@ class PostgresStrategyRegistry:
         pass `activate=False` to populate dependent rows before activation.
         """
         strategy_id = strategy.config.strategy_id
-        strategy_version_id = compute_strategy_version_id(*strategy.snapshot())
-        config_json = _strategy_to_config_json(strategy)
+        llm_identity = (
+            self._llm_identity
+            if any(name == "llm" for name, _ in strategy.forecaster.forecasters)
+            else None
+        )
+        strategy_version_id = compute_strategy_version_id(
+            *strategy.snapshot(),
+            llm_identity=llm_identity,
+        )
+        config_json = _strategy_to_config_json(
+            strategy,
+            llm_identity=llm_identity,
+        )
         metadata_json = json.dumps(
             dict(strategy.config.metadata),
             sort_keys=True,
@@ -523,6 +552,18 @@ def _strategy_from_config_json(raw_value: object) -> Strategy:
                 eval_spec_payload.get("min_win_rate", DEFAULT_MIN_WIN_RATE),
                 "eval_spec.min_win_rate",
             ),
+            min_brier_samples=_json_int(
+                eval_spec_payload.get("min_brier_samples", 20),
+                "eval_spec.min_brier_samples",
+            ),
+            min_slippage_samples=_json_int(
+                eval_spec_payload.get("min_slippage_samples", 20),
+                "eval_spec.min_slippage_samples",
+            ),
+            min_win_rate_samples=_json_int(
+                eval_spec_payload.get("min_win_rate_samples", 20),
+                "eval_spec.min_win_rate_samples",
+            ),
         ),
         forecaster=ForecasterSpec(
             forecasters=tuple(
@@ -558,7 +599,14 @@ def _strategy_from_versioned_config_json(
             f"row={strategy_id!r}, payload={strategy.config.strategy_id!r}"
         )
         raise ValueError(msg)
-    expected_version_id = compute_strategy_version_id(*strategy.snapshot())
+    llm_identity = _llm_identity_from_config_json(raw_value)
+    if llm_identity is None:
+        expected_version_id = compute_strategy_version_id(*strategy.snapshot())
+    else:
+        expected_version_id = compute_strategy_version_id(
+            *strategy.snapshot(),
+            llm_identity=llm_identity,
+        )
     if (
         strategy_version_id != _LEGACY_BOOTSTRAP_STRATEGY_VERSION_ID
         and expected_version_id != strategy_version_id
@@ -691,8 +739,30 @@ def _calibration_from_config_json(raw_value: object) -> CalibrationSpec:
     )
 
 
-def _strategy_to_config_json(strategy: Strategy) -> str:
-    return serialize_strategy_config_json(*strategy.snapshot())
+def _strategy_to_config_json(
+    strategy: Strategy,
+    *,
+    llm_identity: LLMIdentity | None = None,
+) -> str:
+    return serialize_strategy_config_json(
+        *strategy.snapshot(),
+        llm_identity=llm_identity,
+    )
+
+
+def _llm_identity_from_config_json(raw_value: object) -> LLMIdentity | None:
+    payload = _load_json_object(raw_value)
+    raw_identity = payload.get("llm_identity")
+    if not isinstance(raw_identity, list) or len(raw_identity) != 3:
+        return None
+    provider = raw_identity[0]
+    model = raw_identity[1]
+    prompt_version = raw_identity[2]
+    if provider is not None and not isinstance(provider, str):
+        return None
+    if not isinstance(model, str) or not isinstance(prompt_version, str):
+        return None
+    return provider, model, prompt_version
 
 
 def _load_json_object(raw_value: object) -> dict[str, object]:
@@ -879,3 +949,9 @@ def _json_float(value: object, field_name: str) -> float:
         msg = f"{field_name} must decode to a finite float"
         raise ValueError(msg)
     return decoded
+
+
+def _json_int(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return value

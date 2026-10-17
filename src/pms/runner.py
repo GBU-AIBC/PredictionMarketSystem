@@ -137,12 +137,16 @@ from pms.storage.fill_store import FillStore
 from pms.storage.first_order_audit import JsonlFirstOrderAuditWriter
 from pms.storage.live_emergency_audit import LiveEmergencyAuditWriter
 from pms.storage.market_data_store import PostgresMarketDataStore
+from pms.storage.market_resolution_store import MarketResolutionStore
 from pms.storage.market_subscription_store import PostgresMarketSubscriptionStore
 from pms.storage.opportunity_store import OpportunityStore
 from pms.storage.order_store import OrderStore
 from pms.storage.quote_eval_store import QuoteEvalStore
 from pms.storage.runtime_heartbeat_store import RuntimeHeartbeatStore
-from pms.storage.strategy_registry import PostgresStrategyRegistry
+from pms.storage.strategy_registry import (
+    PostgresStrategyRegistry,
+    llm_identity_for_settings,
+)
 from pms.strategies.aggregate import Strategy
 from pms.strategies.defaults import DEFAULT_STRATEGY_COMPOSITION
 from pms.strategies.anchoring import (
@@ -673,7 +677,11 @@ class Runner:
                 if self._pg_pool is None:
                     msg = "Runner PostgreSQL pool is not initialized"
                     raise RuntimeError(msg)
+                llm_identity = llm_identity_for_settings(self.config)
+                # Keep construction compatible with registry test doubles;
+                # the concrete registry reads this identity during versioning.
                 self._strategy_registry = PostgresStrategyRegistry(self._pg_pool)
+                setattr(self._strategy_registry, "_llm_identity", llm_identity)
                 if self.config.mode == RunMode.LIVE:
                     self._live_preflight_active_strategies_fingerprint = (
                         await require_live_preflight_active_strategies_artifact(
@@ -2208,6 +2216,11 @@ class Runner:
                 decision_reader=self.decision_store,
                 eval_spool=self._evaluator_spool,
                 resolution_source=GammaResolutionSource(http_client=http_client),
+                resolution_store=(
+                    MarketResolutionStore(self._pg_pool)
+                    if self._pg_pool is not None
+                    else None
+                ),
             )
             return await sweeper.sweep_once()
 
@@ -3987,6 +4000,11 @@ def _default_active_strategy(settings: PMSSettings) -> ActiveStrategy:
         eval_spec,
         forecaster,
         market_selection,
+        llm_identity=(
+            settings.llm.provider,
+            settings.llm.model,
+            settings.llm.prompt_version,
+        ) if settings.llm.enabled else None,
     )
     return ActiveStrategy(
         strategy_id="default",
@@ -4557,6 +4575,9 @@ def _decision_evidence_from_signal(
         "decision_side": decision.side,
         "venue": signal.venue,
         "market_status": signal.market_status,
+        "category": _optional_text(
+            signal.external_signal.get("category")
+        ) or _optional_text(signal.external_signal.get("market_category")),
         "signal_fetched_at": signal.fetched_at.isoformat(),
         "yes_price": canonical_yes_price,
         "direct_token_price": signal.yes_price,

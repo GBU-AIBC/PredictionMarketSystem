@@ -28,7 +28,13 @@ class NetcalCalibrator:
         if len(records) < self.min_samples:
             return prob
         points = sorted(
-            (record.prob_estimate, record.resolved_outcome) for record in records
+            (
+                record.calibration_prob_estimate
+                if record.calibration_prob_estimate is not None
+                else record.prob_estimate,
+                record.resolved_outcome,
+            )
+            for record in records
         )
         blocks = _pava(points)
         for upper_bound, value in blocks:

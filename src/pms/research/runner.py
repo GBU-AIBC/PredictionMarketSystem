@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -27,6 +28,7 @@ from pms.core.models import (
     Position,
     TradeDecision,
 )
+from pms.core.validation import normalize_resolved_outcome
 from pms.evaluation.metrics import StrategyVersionKey
 from pms.research.entities import PortfolioTarget, serialize_portfolio_target_json
 from pms.research.execution import BacktestExecutionSimulator
@@ -114,6 +116,7 @@ class _StrategySliceAccumulator:
     decision_count: int = 0
     fill_count: int = 0
     fills_with_resolution: int = 0
+    decisions_with_resolution: int = 0
     brier_scores: list[Decimal] = field(default_factory=list)
     slippage_bps_values: list[Decimal] = field(default_factory=list)
     cumulative_pnl: Decimal = Decimal("0")
@@ -130,6 +133,7 @@ class _StrategySliceAccumulator:
         self.decision_count += 1
         resolved_outcome = _resolved_outcome(signal)
         if resolved_outcome is not None:
+            self.decisions_with_resolution += 1
             prob_estimate = _yes_probability(decision)
             resolved = Decimal(str(resolved_outcome))
             self.brier_scores.append((prob_estimate - resolved) ** 2)
@@ -251,6 +255,7 @@ class _StrategyAccumulator:
     # contribute real P&L; when this stays zero we must not publish a
     # spurious 0.0 pnl_cum (see `as_insert_args`).
     fills_with_resolution: int = 0
+    decisions_with_resolution: int = 0
     brier_scores: list[Decimal] = field(default_factory=list)
     slippage_bps_values: list[Decimal] = field(default_factory=list)
     cumulative_pnl: Decimal = Decimal("0")
@@ -290,6 +295,7 @@ class _StrategyAccumulator:
             )
         resolved_outcome = _resolved_outcome(signal)
         if resolved_outcome is not None:
+            self.decisions_with_resolution += 1
             prob_estimate = _yes_probability(decision)
             resolved = Decimal(str(resolved_outcome))
             self.brier_scores.append((prob_estimate - resolved) ** 2)
@@ -326,6 +332,17 @@ class _StrategyAccumulator:
         drawdown = self.peak_equity - self.cumulative_pnl
         if drawdown > self.max_drawdown:
             self.max_drawdown = drawdown
+        previous_execution = self._execution_rows_by_decision.get(fill.decision_id)
+        previous_pnl = (
+            None
+            if previous_execution is None
+            else previous_execution.pnl
+        )
+        execution_pnl = (
+            None
+            if _resolved_outcome(signal) is None
+            else float(pnl_delta + Decimal(str(previous_pnl or 0.0)))
+        )
         self._execution_rows_by_decision[fill.decision_id] = _BacktestExecutionRow(
             decision_id=fill.decision_id,
             strategy_id=self.strategy_id,
@@ -336,7 +353,7 @@ class _StrategyAccumulator:
                 decision=decision,
                 fill_price=fill.fill_price,
             ),
-            pnl=float(pnl_delta) if _resolved_outcome(signal) is not None else None,
+            pnl=execution_pnl,
             rejection_reason=None,
             created_at=signal.fetched_at,
         )
@@ -505,6 +522,7 @@ class BacktestRunner:
         default_factory=BacktestExecutionSimulator
     )
     strategy_loader: StrategyLoader | None = None
+    evaluation_as_of: datetime | None = None
     cancel_probe: CancelProbe | None = None
     host_provider: HostProvider = socket.gethostname
     pid_provider: PidProvider = os.getpid
@@ -554,6 +572,7 @@ class BacktestRunner:
             msg = "no_strategy_versions"
             raise ValueError(msg)
         strategies = await self._load_strategies(claimed_run.spec.strategy_versions)
+        evaluation_as_of = self.evaluation_as_of or datetime.now(tz=UTC)
         accumulators: list[_StrategyAccumulator] = []
         for index, strategy in enumerate(strategies):
             if index == 0:
@@ -564,8 +583,20 @@ class BacktestRunner:
                 strategy=strategy,
                 spec=claimed_run.spec,
                 exec_config=claimed_run.exec_config,
+                evaluation_as_of=evaluation_as_of,
             )
             accumulators.append(accumulator)
+        missing_labels = [
+            accumulator.strategy_id
+            for accumulator in accumulators
+            if accumulator.decision_count > 0
+            and accumulator.decisions_with_resolution == 0
+        ]
+        if missing_labels:
+            raise ValueError(
+                "required resolution labels missing for strategy runs: "
+                + ", ".join(missing_labels)
+            )
         # atomic persist: either every strategy_runs row lands or none — prevents
         # partial success leaking into reports when a later strategy raises.
         await self._insert_strategy_runs_atomically(
@@ -580,6 +611,7 @@ class BacktestRunner:
         strategy: ActiveStrategy,
         spec: BacktestSpec,
         exec_config: BacktestExecutionConfig,
+        evaluation_as_of: datetime | None = None,
     ) -> _StrategyAccumulator:
         replay_engine = self._required_replay_engine()
         pipeline = self.controller_factory.build(strategy)
@@ -592,7 +624,13 @@ class BacktestRunner:
         observed_order_totals: dict[str, tuple[float, float]] = {}
         order_decisions: dict[str, TradeDecision] = {}
 
+        evaluation_cutoff = evaluation_as_of or datetime.now(tz=UTC)
         async for signal in replay_engine.stream(spec, exec_config):
+            scoring_signal = _signal_with_replay_resolution(
+                signal,
+                replay_engine,
+                evaluation_as_of=evaluation_cutoff,
+            )
             slice_descriptors = _slice_descriptors(
                 signal=signal,
                 spec=spec,
@@ -618,7 +656,7 @@ class BacktestRunner:
                 fill = _fill_from_order(
                     advanced_state,
                     decision=decision_for_fill,
-                    signal=signal,
+                    signal=scoring_signal,
                     prior_filled_notional_usdc=prior_notional,
                     prior_filled_quantity=prior_quantity,
                     execution_model=spec.execution_model,
@@ -627,13 +665,13 @@ class BacktestRunner:
                     continue
                 portfolio = _portfolio_with_fill(portfolio, fill)
                 accumulator.record_fill(
-                    signal=signal,
+                    signal=scoring_signal,
                     decision=decision_for_fill,
                     fill=fill,
                 )
                 for slice_descriptor in slice_descriptors:
                     accumulator.record_slice_fill(
-                        signal=signal,
+                        signal=scoring_signal,
                         decision=decision_for_fill,
                         fill=fill,
                         slice_descriptor=slice_descriptor,
@@ -649,13 +687,13 @@ class BacktestRunner:
                 continue
             opportunity, decision = emission
             accumulator.record_decision(
-                signal=signal,
+                signal=scoring_signal,
                 opportunity=opportunity,
                 decision=decision,
             )
             for slice_descriptor in slice_descriptors:
                 accumulator.record_slice_decision(
-                    signal=signal,
+                    signal=scoring_signal,
                     opportunity=opportunity,
                     decision=decision,
                     slice_descriptor=slice_descriptor,
@@ -686,7 +724,7 @@ class BacktestRunner:
             fill = _fill_from_order(
                 order_state,
                 decision=cast(TradeDecision, decision),
-                signal=signal,
+                signal=scoring_signal,
                 prior_filled_notional_usdc=prior_notional,
                 prior_filled_quantity=prior_quantity,
                 execution_model=spec.execution_model,
@@ -700,13 +738,13 @@ class BacktestRunner:
                 continue
             portfolio = _portfolio_with_fill(portfolio, fill)
             accumulator.record_fill(
-                signal=signal,
+                signal=scoring_signal,
                 decision=decision,
                 fill=fill,
             )
             for slice_descriptor in slice_descriptors:
                 accumulator.record_slice_fill(
-                    signal=signal,
+                    signal=scoring_signal,
                     decision=decision,
                     fill=fill,
                     slice_descriptor=slice_descriptor,
@@ -1230,10 +1268,38 @@ def _slug_fragment(value: str) -> str:
 
 
 def _resolved_outcome(signal: MarketSignal) -> float | None:
-    value = signal.external_signal.get("resolved_outcome")
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    return None
+    return normalize_resolved_outcome(signal.external_signal.get("resolved_outcome"))
+
+
+def _signal_with_replay_resolution(
+    signal: MarketSignal,
+    replay_engine: object,
+    *,
+    evaluation_as_of: datetime | None = None,
+) -> MarketSignal:
+    resolver = getattr(replay_engine, "resolution_for", None)
+    if not callable(resolver):
+        return signal
+    cutoff = evaluation_as_of or datetime.now(tz=UTC)
+    parameters = inspect.signature(resolver).parameters
+    accepts_cutoff = "as_of" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if accepts_cutoff:
+        resolved_value = resolver(signal.market_id, as_of=cutoff)
+    else:
+        # Keep compatibility with test/research replay adapters that expose
+        # only the historical one-argument resolver contract.  Do not retry
+        # after a resolver that accepted ``as_of`` raised internally.
+        resolved_value = resolver(signal.market_id)
+    resolved = normalize_resolved_outcome(resolved_value)
+    if resolved is None:
+        return signal
+    return replace(
+        signal,
+        external_signal={**signal.external_signal, "resolved_outcome": resolved},
+    )
 
 
 def _pnl_delta(

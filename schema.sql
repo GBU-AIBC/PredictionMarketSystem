@@ -43,6 +43,15 @@ CREATE INDEX IF NOT EXISTS idx_markets_price_updated_at
     ON markets (price_updated_at DESC)
     WHERE price_updated_at IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS market_resolutions (
+    market_id TEXT PRIMARY KEY REFERENCES markets(condition_id) ON DELETE CASCADE,
+    resolved_outcome DOUBLE PRECISION NOT NULL
+        CHECK (resolved_outcome >= 0.0 AND resolved_outcome <= 1.0),
+    resolved_at TIMESTAMPTZ,
+    source TEXT NOT NULL CHECK (source <> ''),
+    observed_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS market_price_snapshots (
     condition_id TEXT NOT NULL,
     snapshot_at TIMESTAMPTZ NOT NULL,
@@ -290,7 +299,8 @@ CREATE TABLE IF NOT EXISTS eval_records (
     strategy_id TEXT NOT NULL,
     strategy_version_id TEXT NOT NULL,
     edge_at_decision DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    spread_bps_at_decision INTEGER
+    spread_bps_at_decision INTEGER,
+    calibration_prob_estimate DOUBLE PRECISION
 );
 
 ALTER TABLE eval_records
@@ -299,7 +309,8 @@ ALTER TABLE eval_records
     ADD COLUMN IF NOT EXISTS baseline_prob_estimates JSONB NOT NULL DEFAULT '{}'::jsonb,
     ADD COLUMN IF NOT EXISTS baseline_brier_scores JSONB NOT NULL DEFAULT '{}'::jsonb,
     ADD COLUMN IF NOT EXISTS edge_at_decision DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    ADD COLUMN IF NOT EXISTS spread_bps_at_decision INTEGER;
+    ADD COLUMN IF NOT EXISTS spread_bps_at_decision INTEGER,
+    ADD COLUMN IF NOT EXISTS calibration_prob_estimate DOUBLE PRECISION;
 
 CREATE TABLE IF NOT EXISTS quote_eval_records (
     fill_id TEXT NOT NULL,

@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
+from dataclasses import dataclass, field
 
 from pms.artifact_path_safety import (
     require_path_outside_working_tree,
     require_private_parent,
 )
-from pms.config import PMSSettings
+from pms.config import LLMSettings, PMSSettings
 from pms.controller.calibrators.netcal import NetcalCalibrator
 from pms.controller.factor_snapshot import (
     FactorSnapshotReader,
@@ -16,6 +17,7 @@ from pms.controller.factor_snapshot import (
 )
 from pms.controller.forecasters.llm import (
     LLMForecaster,
+    durable_spend_ledger_path,
     validate_llm_runtime_dependencies,
 )
 from pms.controller.forecasters.flb import FlbForecaster
@@ -131,14 +133,31 @@ def _build_forecaster(
             prior_strength=2.0 if prior_strength is None else float(prior_strength),
         )
     if name == "llm":
-        if raw_params:
-            msg = (
-                "LLMForecaster does not yet accept per-strategy params: "
-                f"{raw_params!r}"
+        allowed = {"model", "provider", "prompt_version", "max_tokens"}
+        unknown = set(params) - allowed
+        if unknown:
+            raise ValueError(
+                "LLMForecaster does not yet accept per-strategy params "
+                f"{sorted(unknown)!r}"
             )
-            raise ValueError(msg)
-        validate_llm_runtime_dependencies(settings.llm)
-        return LLMForecaster(config=settings.llm)
+        updates: dict[str, object] = {
+            key: value for key, value in params.items() if key in allowed
+        }
+        if "max_tokens" in updates:
+            updates["max_tokens"] = int(cast(str, updates["max_tokens"]))
+        llm_payload = {**settings.llm.model_dump(), **updates}
+        if llm_payload.get("spend_ledger_path") is None:
+            # Keep the restart-safe ledger scoped to the configured database,
+            # rather than placing a process/environment-shared file in HOME.
+            # API keys are deliberately excluded from this identity.
+            llm_payload["spend_ledger_path"] = durable_spend_ledger_path(
+                database_dsn=settings.database.dsn,
+                data_path=settings.live_emergency_audit_path,
+                scope=settings.mode.value,
+            )
+        llm_config = LLMSettings.model_validate(llm_payload)
+        validate_llm_runtime_dependencies(llm_config)
+        return LLMForecaster(config=llm_config)
     if name == "flb":
         if raw_params:
             msg = (

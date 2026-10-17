@@ -54,6 +54,17 @@ def _payload_value(value: Any) -> Any:
         if payload.get("yes_price_max") is None:
             del payload["yes_price_max"]
         return _payload_value(payload)
+    if isinstance(value, EvalSpec):
+        payload = asdict(value, dict_factory=_sorted_dict_factory)
+        for key, default in (
+            ("min_brier_samples", 20),
+            ("min_slippage_samples", 20),
+            ("min_win_rate_samples", 20),
+        ):
+            configured = getattr(value, key, default)
+            if configured != default:
+                payload[key] = configured
+        return _payload_value(payload)
     if is_dataclass(value) and not isinstance(value, type):
         return _payload_value(asdict(value, dict_factory=_sorted_dict_factory))
     if isinstance(value, dict):
@@ -123,6 +134,7 @@ def _strategy_payload(
     market_selection: MarketSelectionSpec,
     calibration: CalibrationSpec | None = None,
     include_factor_definition_versions: bool = True,
+    llm_identity: tuple[str | None, str, str] | None = None,
 ) -> dict[str, Any]:
     payload = {
         "config": _payload_value(config),
@@ -141,6 +153,8 @@ def _strategy_payload(
         factor_versions = _factor_definition_versions(config)
         if factor_versions:
             payload["factor_definition_versions"] = factor_versions
+    if llm_identity is not None:
+        payload["llm_identity"] = list(llm_identity)
     return payload
 
 
@@ -165,6 +179,7 @@ def serialize_strategy_config_json(
     forecaster: ForecasterSpec,
     market_selection: MarketSelectionSpec,
     calibration: CalibrationSpec | None = None,
+    llm_identity: tuple[str | None, str, str] | None = None,
 ) -> str:
     return json.dumps(
         _strategy_payload(
@@ -174,6 +189,7 @@ def serialize_strategy_config_json(
             forecaster=forecaster,
             market_selection=market_selection,
             calibration=calibration,
+            llm_identity=llm_identity,
         ),
         sort_keys=True,
         separators=(",", ":"),
@@ -188,6 +204,7 @@ def compute_strategy_version_id(
     forecaster: ForecasterSpec,
     market_selection: MarketSelectionSpec,
     calibration: CalibrationSpec | None = None,
+    llm_identity: tuple[str | None, str, str] | None = None,
 ) -> str:
     canonical_payload = _normalize_value(
         _strategy_payload(
@@ -197,6 +214,7 @@ def compute_strategy_version_id(
             forecaster=forecaster,
             market_selection=market_selection,
             calibration=calibration,
+            llm_identity=llm_identity,
         )
     )
     canonical_json = json.dumps(

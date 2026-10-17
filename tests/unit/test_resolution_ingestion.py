@@ -155,6 +155,11 @@ class FakeResolutionSource:
         return dict(self.resolutions)
 
 
+class FailingResolutionStore:
+    async def upsert(self, *_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("resolution persistence unavailable")
+
+
 class RecordingEvalSpool:
     def __init__(
         self,
@@ -270,6 +275,25 @@ async def test_sweep_routes_resolved_fill_through_eval_spool_and_hooks() -> None
     # The post-append hook fired: the Evaluator->Controller feedback edge
     # stays live for swept records.
     assert feedback_generator.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_resolution_persistence_failure_continues_sweep() -> None:
+    sweeper = _sweeper(
+        fill_store=FakeResolutionFillStore([_fill()]),
+        eval_spool=RecordingEvalSpool(),
+        source=FakeResolutionSource({"0xmarket-1": 1.0}),
+        decisions={
+            "d-res-1": _StoredDecision(
+                decision=_decision(),
+                decision_evidence={},
+            )
+        },
+    )
+    sweeper.resolution_store = cast(Any, FailingResolutionStore())
+    result = await sweeper.sweep_once()
+    assert result.persistence_failures == 1
+    assert result.fills_resolved == 1
 
 
 class _CallLogEvalStore(InMemoryEvalStore):
@@ -657,6 +681,30 @@ async def test_gamma_resolution_source_parses_settled_closed_markets() -> None:
         "0xstill-open",
         "0xnon-binary",
     ]
+
+
+@pytest.mark.asyncio
+async def test_gamma_resolution_source_retains_resolution_timestamp() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    **_gamma_market_row("0xresolved-at", closed=True),
+                    "resolvedAt": "2026-03-01T00:00:00Z",
+                }
+            ],
+        )
+
+    async with _gamma_client(handler) as client:
+        source = GammaResolutionSource(http_client=client)
+        assert await source.fetch_resolutions(["0xresolved-at"]) == {
+            "0xresolved-at": 1.0
+        }
+    assert source.resolved_at_by_market["0xresolved-at"] == datetime(
+        2026, 3, 1, tzinfo=UTC
+    )
 
 
 @pytest.mark.asyncio

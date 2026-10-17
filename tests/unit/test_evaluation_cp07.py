@@ -760,6 +760,8 @@ async def test_eval_spool_generates_deduped_feedback_from_runtime_metrics() -> N
                     max_brier_score=0.30,
                     slippage_threshold_bps=50.0,
                     min_win_rate=0.50,
+                        min_slippage_samples=1,
+                        min_win_rate_samples=1,
                 ),
             )
             for key, snapshot in snapshots.items()

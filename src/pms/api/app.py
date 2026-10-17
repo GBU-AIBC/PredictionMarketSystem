@@ -636,7 +636,10 @@ def create_app(
     async def strategies() -> dict[str, Any]:
         if active_runner.pg_pool is None:
             raise HTTPException(status_code=503, detail="Runner PostgreSQL pool is not initialized")
-        return await list_strategies_items(active_runner.pg_pool)
+        return await list_strategies_items(
+            active_runner.pg_pool,
+            settings=active_runner.config,
+        )
 
     @app.get("/strategies/metrics", dependencies=[Depends(require_api_token)])
     async def strategy_metrics(
@@ -649,6 +652,7 @@ def create_app(
             active_runner.pg_pool,
             since=since,
             until=until,
+            settings=active_runner.config,
         )
 
     @app.get(

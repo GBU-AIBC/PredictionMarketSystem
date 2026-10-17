@@ -21,6 +21,36 @@ class EvalStore:
         async with self._pool().acquire() as connection:
             return await insert_eval_record_row(connection, record)
 
+    async def replace(self, record: EvalRecord) -> bool:
+        """Replace one decision's score with its latest fill snapshot."""
+        async with self._pool().acquire() as connection:
+            result = await connection.execute(
+                _UPDATE_EVAL_RECORD_QUERY,
+                record.decision_id,
+                record.market_id,
+                record.prob_estimate,
+                record.resolved_outcome,
+                record.brier_score,
+                record.fill_status,
+                record.recorded_at,
+                json.dumps(record.citations),
+                record.baseline_prob_estimate,
+                record.baseline_brier_score,
+                json.dumps(dict(record.baseline_prob_estimates), allow_nan=False),
+                json.dumps(dict(record.baseline_brier_scores), allow_nan=False),
+                record.category,
+                record.model_id,
+                record.pnl,
+                record.slippage_bps,
+                record.filled,
+                record.strategy_id,
+                record.strategy_version_id,
+                record.edge_at_decision,
+                record.spread_bps_at_decision,
+                record.calibration_prob_estimate,
+            )
+        return cast(str, result).rsplit(" ", maxsplit=1)[-1] == "1"
+
     async def all(self) -> list[EvalRecord]:
         if self.pool is None:
             return []
@@ -79,10 +109,11 @@ async def insert_eval_record_row(
             strategy_id,
             strategy_version_id,
             edge_at_decision,
-            spread_bps_at_decision
+            spread_bps_at_decision,
+            calibration_prob_estimate
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12::jsonb,
-            $13, $14, $15, $16, $17, $18, $19, $20, $21
+            $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
         )
         ON CONFLICT (decision_id) DO NOTHING
         """,
@@ -107,8 +138,36 @@ async def insert_eval_record_row(
         record.strategy_version_id,
         record.edge_at_decision,
         record.spread_bps_at_decision,
+        record.calibration_prob_estimate,
     )
     return cast(str, result).rsplit(" ", maxsplit=1)[-1] == "1"
+
+
+_UPDATE_EVAL_RECORD_QUERY = """
+UPDATE eval_records
+SET market_id = $2,
+    prob_estimate = $3,
+    resolved_outcome = $4,
+    brier_score = $5,
+    fill_status = $6,
+    recorded_at = $7,
+    citations = $8::jsonb,
+    baseline_prob_estimate = $9,
+    baseline_brier_score = $10,
+    baseline_prob_estimates = $11::jsonb,
+    baseline_brier_scores = $12::jsonb,
+    category = $13,
+    model_id = $14,
+    pnl = $15,
+    slippage_bps = $16,
+    filled = $17,
+    strategy_id = $18,
+    strategy_version_id = $19,
+    edge_at_decision = $20,
+    spread_bps_at_decision = $21,
+    calibration_prob_estimate = $22
+WHERE decision_id = $1
+"""
 
 
 _SELECT_ALL_QUERY = """
@@ -133,7 +192,8 @@ SELECT
     slippage_bps,
     filled,
     edge_at_decision,
-    spread_bps_at_decision
+    spread_bps_at_decision,
+    calibration_prob_estimate
 FROM eval_records
 ORDER BY recorded_at ASC, decision_id ASC
 """
@@ -161,7 +221,8 @@ SELECT
     slippage_bps,
     filled,
     edge_at_decision,
-    spread_bps_at_decision
+    spread_bps_at_decision,
+    calibration_prob_estimate
 FROM eval_records
 WHERE strategy_id = $1 AND strategy_version_id = $2
 ORDER BY recorded_at ASC, decision_id ASC
@@ -215,6 +276,10 @@ def _eval_record_from_row(row: asyncpg.Record) -> EvalRecord:
         spread_bps_at_decision=cast(
             int | None,
             _row_value(row, "spread_bps_at_decision", None),
+        ),
+        calibration_prob_estimate=cast(
+            float | None,
+            _row_value(row, "calibration_prob_estimate", None),
         ),
     )
 

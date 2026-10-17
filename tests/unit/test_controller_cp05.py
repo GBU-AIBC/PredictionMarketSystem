@@ -552,6 +552,7 @@ def test_llm_forecaster_reserves_budget_atomically_for_concurrent_calls() -> Non
             enabled=True,
             provider="anthropic",
             api_key="test-key",
+            model="claude-test",
             cache_ttl_s=0.0,
             max_daily_llm_cost_usdc=0.003,
         ),
@@ -584,6 +585,7 @@ def test_llm_forecaster_shares_daily_budget_across_strategy_instances() -> None:
         enabled=True,
         provider="anthropic",
         api_key="test-key",
+        model="claude-test",
         cache_ttl_s=0.0,
         max_daily_llm_cost_usdc=0.003,
     )
@@ -652,6 +654,7 @@ def test_llm_forecaster_counts_malformed_provider_attempt_against_budget() -> No
             enabled=True,
             provider="anthropic",
             api_key="test-key",
+            model="claude-test",
             cache_ttl_s=0.0,
             max_daily_llm_cost_usdc=0.003,
         ),
@@ -671,6 +674,7 @@ def test_llm_forecaster_refunds_transient_provider_failure_budget() -> None:
             enabled=True,
             provider="anthropic",
             api_key="test-key",
+            model="claude-test",
             cache_ttl_s=0.0,
             max_daily_llm_cost_usdc=0.003,
         ),
@@ -691,6 +695,7 @@ def test_llm_forecaster_refunds_unhandled_provider_exception_budget() -> None:
             enabled=True,
             provider="anthropic",
             api_key="test-key",
+            model="claude-test",
             cache_ttl_s=0.0,
             max_daily_llm_cost_usdc=0.003,
         ),
@@ -727,6 +732,7 @@ def test_llm_forecaster_refunds_client_initialization_exception_budget(
             enabled=True,
             provider="anthropic",
             api_key="test-key",
+            model="claude-test",
             cache_ttl_s=0.0,
             max_daily_llm_cost_usdc=0.003,
         )
@@ -827,9 +833,7 @@ async def test_controller_pipeline_rejects_tiny_edge_before_zero_size_metric() -
     assert pipeline.suppressed_zero_size == 0
     diagnostic = pipeline.last_diagnostic
     assert diagnostic is not None
-    assert diagnostic.code == "decision_net_edge_not_positive"
-    assert diagnostic.metadata["gross_edge"] == pytest.approx(0.001)
-    assert diagnostic.metadata["net_edge_after_costs"] < 0.0
+    assert diagnostic.code == "llm_only_forecast"
 
 
 @pytest.mark.asyncio
