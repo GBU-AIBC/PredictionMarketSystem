@@ -41,6 +41,9 @@ class Strategy:
         calibration: CalibrationSpec | None = None,
     ) -> None:
         self._config = self._require_projection("config", config)
+        from .economics import validate_strategy_economics
+
+        validate_strategy_economics(self._config.metadata)
         validate_composition(self._config.factor_composition)
         self._risk = self._require_projection("risk", risk)
         self._eval_spec = self._require_projection("eval_spec", eval_spec)

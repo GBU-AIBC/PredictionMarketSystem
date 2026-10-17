@@ -20,10 +20,24 @@ def upgrade() -> None:
             ADD COLUMN IF NOT EXISTS definition_version TEXT NOT NULL DEFAULT '1'
         """
     )
+    connection.exec_driver_sql(
+        """
+        DROP INDEX IF EXISTS idx_factor_values_factor_param_market_ts;
+        CREATE UNIQUE INDEX idx_factor_values_factor_param_market_ts
+            ON factor_values(factor_id, param, market_id, ts DESC, definition_version)
+        """
+    )
 
 
 def downgrade() -> None:
     connection: Connection = op.get_bind()
     connection.exec_driver_sql(
         "ALTER TABLE factor_values DROP COLUMN IF EXISTS definition_version"
+    )
+    connection.exec_driver_sql(
+        """
+        DROP INDEX IF EXISTS idx_factor_values_factor_param_market_ts;
+        CREATE UNIQUE INDEX idx_factor_values_factor_param_market_ts
+            ON factor_values(factor_id, param, market_id, ts DESC)
+        """
     )

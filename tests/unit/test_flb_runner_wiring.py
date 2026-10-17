@@ -249,6 +249,18 @@ def test_runner_flb_module_uses_versioned_time_in_force() -> None:
     assert getattr(module.source, "time_in_force").value == "IOC"
 
 
+def test_runner_flb_module_rejects_mismatched_strategy_version() -> None:
+    runner = Runner(config=_settings())
+
+    with pytest.raises(ValueError, match="runtime strategy projection"):
+        runner.build_flb_strategy_module(
+            strategy_id="h1_flb",
+            strategy_version_id="mismatched-version",
+            market_ids=("market-flb-1",),
+            market_reader=_StaticFlbMarketReader(_market()),
+        )
+
+
 def test_runner_rejects_configured_flb_calibration_without_provenance(
     tmp_path: Path,
 ) -> None:

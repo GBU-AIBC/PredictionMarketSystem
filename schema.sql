@@ -159,7 +159,7 @@ ALTER TABLE factor_values
     ADD COLUMN IF NOT EXISTS definition_version TEXT NOT NULL DEFAULT '1';
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_factor_values_factor_param_market_ts
-    ON factor_values(factor_id, param, market_id, ts DESC);
+    ON factor_values(factor_id, param, market_id, ts DESC, definition_version);
 
 CREATE TABLE IF NOT EXISTS market_relations (
     id SERIAL PRIMARY KEY,

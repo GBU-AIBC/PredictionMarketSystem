@@ -9,6 +9,73 @@ from pms.config import RiskSettings
 from .projections import ActiveStrategy
 
 
+class StrategyEconomicsError(ValueError):
+    """Raised when hashed strategy economics are malformed or out of domain."""
+
+
+def validate_strategy_economics(metadata: tuple[tuple[str, str], ...]) -> None:
+    values = dict(metadata)
+    bounded_rates = {"fee_rate", "fee_rate_fallback"}
+    non_negative = {
+        "max_slippage_bps",
+        "entry_execution_cost_bps",
+        "prior_strength",
+        "decay_window_hours",
+    }
+    positive = {"min_expected_edge", "min_divergence"}
+    probabilities = {
+        "min_confidence",
+        "longshot_yes_threshold",
+        "favorite_yes_threshold",
+    }
+    for key in bounded_rates:
+        if key in values:
+            _require_float(values[key], key, minimum=0.0, maximum=1.0)
+    for key in non_negative:
+        if key in values:
+            _require_float(values[key], key, minimum=0.0)
+    for key in positive:
+        if key in values:
+            _require_float(values[key], key, minimum=0.0, strict_minimum=True)
+    for key in probabilities:
+        if key in values:
+            _require_float(values[key], key, minimum=0.0, maximum=1.0)
+    time_in_force = values.get("time_in_force")
+    if time_in_force is not None and (
+        not isinstance(time_in_force, str)
+        or time_in_force.upper() not in {"GTC", "IOC", "FOK"}
+    ):
+        raise StrategyEconomicsError(
+            f"invalid strategy economic value 'time_in_force': {time_in_force!r}"
+        )
+
+
+def _require_float(
+    raw: str,
+    key: str,
+    *,
+    minimum: float,
+    maximum: float | None = None,
+    strict_minimum: bool = False,
+) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise StrategyEconomicsError(
+            f"invalid strategy economic value {key!r}: {raw!r}"
+        ) from exc
+    if not isfinite(value):
+        raise StrategyEconomicsError(
+            f"invalid strategy economic value {key!r}: {raw!r}"
+        )
+    minimum_failed = value <= minimum if strict_minimum else value < minimum
+    if minimum_failed or (maximum is not None and value > maximum):
+        raise StrategyEconomicsError(
+            f"strategy economic value {key!r} is out of range: {value!r}"
+        )
+    return value
+
+
 def strategy_metadata(strategy: ActiveStrategy | None) -> dict[str, str]:
     if strategy is None:
         return {}

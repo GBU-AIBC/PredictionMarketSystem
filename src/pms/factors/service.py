@@ -38,9 +38,14 @@ async def persist_factor_value(
         value,
         definition_version
     ) VALUES ($1, $2, $3, $4, $5, $6)
-    ON CONFLICT (factor_id, param, market_id, ts) DO UPDATE
-    SET value = EXCLUDED.value,
-        definition_version = EXCLUDED.definition_version
+    ON CONFLICT (
+        factor_id,
+        param,
+        market_id,
+        ts,
+        definition_version
+    ) DO UPDATE
+    SET value = EXCLUDED.value
     """
     async with pool.acquire() as connection:
         await connection.execute(

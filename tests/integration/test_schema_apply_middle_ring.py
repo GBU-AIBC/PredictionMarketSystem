@@ -158,6 +158,7 @@ async def test_schema_sql_applies_middle_ring_tables() -> None:
             """,
         )
         assert "CREATE UNIQUE INDEX" in unique_index_result.stdout
+        assert "definition_version" in unique_index_result.stdout
 
         connection = await asyncpg.connect(temp_database_url)
         try:

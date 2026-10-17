@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import importlib
-from dataclasses import FrozenInstanceError, fields, is_dataclass
+from dataclasses import FrozenInstanceError, fields, is_dataclass, replace
 from typing import Any, get_args, get_origin, get_type_hints
 
 import pytest
@@ -347,4 +347,39 @@ def test_active_strategy_rejects_identity_mismatch() -> None:
                 resolution_time_max_horizon_days=7,
                 volume_min_usdc=500.0,
             ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("fee_rate", "-0.01"),
+        ("fee_rate", "nan"),
+        ("max_slippage_bps", "-1"),
+        ("max_slippage_bps", "nan"),
+        ("entry_execution_cost_bps", "-1"),
+        ("min_expected_edge", "0"),
+        ("time_in_force", "BAD"),
+    ],
+)
+def test_strategy_rejects_malformed_hashed_economics(key: str, value: str) -> None:
+    from pms.strategies.aggregate import Strategy
+    from pms.strategies.flb.projection import build_h1_flb_strategy
+
+    strategy = build_h1_flb_strategy()
+    metadata = dict(strategy.config.metadata)
+    metadata[key] = value
+    malformed = replace(
+        strategy.config,
+        metadata=tuple(metadata.items()),
+    )
+
+    with pytest.raises(ValueError, match="strategy economic"):
+        Strategy(
+            config=malformed,
+            risk=strategy.risk,
+            eval_spec=strategy.eval_spec,
+            forecaster=strategy.forecaster,
+            market_selection=strategy.market_selection,
+            calibration=strategy.calibration,
         )
