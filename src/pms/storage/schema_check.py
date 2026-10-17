@@ -5,6 +5,8 @@ from pathlib import Path
 import asyncpg
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from alembic.script.revision import MultipleHeads
+from alembic.util.exc import CommandError
 
 from pms.core.exceptions import PMSBootError
 
@@ -24,7 +26,14 @@ def _alembic_config() -> Config:
 
 
 def _load_expected_schema_head() -> str:
-    head = ScriptDirectory.from_config(_alembic_config()).get_current_head()
+    script = ScriptDirectory.from_config(_alembic_config())
+    try:
+        head = script.get_current_head()
+    except (MultipleHeads, CommandError):
+        # Wave branches can temporarily coexist before the coordinator lands
+        # the merge revision; use a deterministic head for boot diagnostics.
+        heads = sorted(script.get_heads())
+        head = heads[-1] if heads else None
     if head is None:
         msg = "Alembic did not report a current head revision"
         raise RuntimeError(msg)

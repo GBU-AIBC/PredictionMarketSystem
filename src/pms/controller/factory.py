@@ -9,7 +9,7 @@ from pms.artifact_path_safety import (
     require_path_outside_working_tree,
     require_private_parent,
 )
-from pms.config import LLMSettings, PMSSettings, RiskSettings
+from pms.config import LLMSettings, PMSSettings
 from pms.controller.calibrators.netcal import NetcalCalibrator
 from pms.controller.factor_snapshot import (
     FactorSnapshotReader,

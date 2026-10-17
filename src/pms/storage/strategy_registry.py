@@ -599,10 +599,14 @@ def _strategy_from_versioned_config_json(
             f"row={strategy_id!r}, payload={strategy.config.strategy_id!r}"
         )
         raise ValueError(msg)
-    expected_version_id = compute_strategy_version_id(
-        *strategy.snapshot(),
-        llm_identity=_llm_identity_from_config_json(raw_value),
-    )
+    llm_identity = _llm_identity_from_config_json(raw_value)
+    if llm_identity is None:
+        expected_version_id = compute_strategy_version_id(*strategy.snapshot())
+    else:
+        expected_version_id = compute_strategy_version_id(
+            *strategy.snapshot(),
+            llm_identity=llm_identity,
+        )
     if (
         strategy_version_id != _LEGACY_BOOTSTRAP_STRATEGY_VERSION_ID
         and expected_version_id != strategy_version_id
