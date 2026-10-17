@@ -78,6 +78,41 @@ def test_invalid_run_mode_is_treated_as_unknown_provenance() -> None:
     assert _run_mode_from_anomaly_flags(["run_mode=live"]) == "live"
 
 
+@pytest.mark.asyncio
+async def test_incomplete_fill_summary_filters_before_report_limit() -> None:
+    connection = _RecordingConnection()
+    connection.fetch_rows = [
+        {
+            "fill_id": f"fill-summary-{index:02d}",
+            "fill_quantity": 1.0,
+            "fill_notional_usdc": 0.5,
+            "payload": {
+                "side": "BUY",
+                "venue": "polymarket",
+                "token_id": "token-summary",
+                "fill_price": 0.5,
+                "fees": 0.0,
+                "anomaly_flags": ["run_mode=live"],
+            },
+        }
+        for index in range(22)
+    ]
+    cast(dict[str, object], connection.fetch_rows[-1])["payload"] = {
+        "side": "HOLD",
+        "venue": "polymarket",
+        "token_id": "token-summary",
+        "fill_price": 0.5,
+        "fees": 0.0,
+        "anomaly_flags": ["run_mode=live"],
+    }
+    store = FillStore(cast(asyncpg.Pool, _RecordingPool(connection)))
+
+    ids, total = await store.incomplete_fill_summary(run_mode="live", limit=20)
+
+    assert ids == ["fill-summary-21"]
+    assert total == 1
+
+
 def _order_state() -> OrderState:
     return OrderState(
         order_id="order-unit-cp10-1",

@@ -607,6 +607,50 @@ async def test_missing_sidecar_provenance_tag_requires_economics_reconcile(
         live.bind_pg_pool(pool)
         with pytest.raises(RuntimeError, match="reconcile-fill-economics"):
             await live._reconcile_portfolio_from_db()  # noqa: SLF001
+        assert await store.reconcile_fill_economics(
+            fill_id,
+            side="BUY",
+            venue="polymarket",
+            token_id="legacy-provenance-r7-token",
+            fill_price=0.5,
+            executed_at=filled_at,
+            operator="r7-operator",
+            evidence="legacy-sidecar-economics",
+        )
+        assert await store.mark_fill_economics_audited(fill_id)
+        assert not await store.reconcile_fill_economics(
+            fill_id,
+            side="BUY",
+            venue="polymarket",
+            token_id="legacy-provenance-r7-token",
+            fill_price=0.4,
+            executed_at=filled_at,
+            operator="r7-operator",
+            evidence="unexpected-overwrite",
+        )
+        assert await store.reconcile_fill_economics(
+            fill_id,
+            side="BUY",
+            venue="polymarket",
+            token_id="legacy-provenance-r7-token",
+            fill_price=0.5,
+            executed_at=filled_at,
+            operator="r7-operator",
+            evidence="approved-overwrite",
+            override=True,
+        )
+        assert await store.mark_fill_economics_audited(fill_id)
+        assert await store.reconcile_fee(
+            fill_id,
+            fees=0.0,
+            fee_bps=0,
+            slippage_bps=0.0,
+            reconciled_by="r7-operator",
+            evidence="legacy-sidecar-fee",
+            audit_pending=False,
+        )
+        await live._reconcile_portfolio_from_db()  # noqa: SLF001
+        await live._reconcile_risk_from_db()  # noqa: SLF001
     finally:
         async with pool.acquire() as connection:
             await connection.execute(

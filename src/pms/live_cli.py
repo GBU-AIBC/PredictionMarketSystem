@@ -144,6 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     economics.add_argument("--executed-at", required=True)
     economics.add_argument("--operator", required=True)
     economics.add_argument("--evidence", required=True)
+    economics.add_argument("--override", action="store_true")
     economics.add_argument("--database-url")
     provenance = subparsers.add_parser(
         "tag-fill-provenance",
@@ -407,6 +408,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 executed_at=executed_at,
                 operator=operator,
                 evidence=evidence,
+                override=bool(args.override),
             )
             if updated:
                 try:
@@ -421,6 +423,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                         executed_at=executed_at,
                         operator=operator,
                         evidence=evidence,
+                        override=bool(args.override),
                     )
                     if not await store.mark_fill_economics_audited(
                         cast(str, args.fill_id)

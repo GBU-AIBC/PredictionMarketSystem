@@ -3263,7 +3263,7 @@ class Runner:
                         len(legacy_fill_ids),
                         ", ".join(legacy_fill_ids),
                     )
-                incomplete_fill_ids = await self.fill_store.incomplete_fill_ids(
+                incomplete_fill_ids, incomplete_total = await self.fill_store.incomplete_fill_summary(
                     run_mode=self.config.mode.value
                 )
                 if incomplete_fill_ids and self.config.mode == RunMode.LIVE:
@@ -3271,6 +3271,7 @@ class Runner:
                         "LIVE portfolio reconciliation found economically incomplete "
                         "fills: "
                         + ", ".join(incomplete_fill_ids)
+                        + (f" (+{incomplete_total - len(incomplete_fill_ids)} more)" if incomplete_total > len(incomplete_fill_ids) else "")
                         + "; run pms-live reconcile-fill-economics --fill-id <fill-id> "
                         "with verified ledger fields"
                     )

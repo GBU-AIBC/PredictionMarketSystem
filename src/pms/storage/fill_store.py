@@ -11,6 +11,12 @@ from typing import Any, cast
 
 import asyncpg
 
+from pms.core.enums import Side
+from pms.core.validation import (
+    validate_notional,
+    validate_positive,
+    validate_price,
+)
 from pms.core.models import FillRecord, Position, Venue
 
 
@@ -306,11 +312,24 @@ class FillStore:
         run_mode: str | None = None,
         limit: int = 20,
     ) -> list[str]:
+        ids, _ = await self.incomplete_fill_summary(run_mode=run_mode, limit=limit)
+        return ids
+
+    async def incomplete_fill_summary(
+        self,
+        *,
+        run_mode: str | None = None,
+        limit: int = 20,
+    ) -> tuple[list[str], int]:
         async with self._pool().acquire() as connection:
             await _ensure_fill_payloads_table(connection)
             rows = await connection.fetch(
                 """
-                SELECT fills.fill_id, fills.fill_quantity, fill_payloads.payload
+                SELECT
+                    fills.fill_id,
+                    fills.fill_quantity,
+                    fills.fill_notional_usdc,
+                    fill_payloads.payload
                 FROM fills
                 LEFT JOIN fill_payloads ON fill_payloads.fill_id = fills.fill_id
                 WHERE ($1::text IS NULL OR EXISTS (
@@ -321,17 +340,16 @@ class FillStore:
                     WHERE flag = 'run_mode=' || $1
                 ))
                 ORDER BY fills.ts ASC, fills.fill_id ASC
-                LIMIT $2
                 """,
                 run_mode,
-                limit,
             )
-        return [
+        ids = [
             str(row["fill_id"])
             for row in rows
             if not _row_has_fill_economics(row)
             or _json_object(row["payload"]).get("economics_audit_pending") is True
         ]
+        return ids[:limit], len(ids)
 
     async def tag_fill_provenance(
         self,
@@ -450,14 +468,16 @@ class FillStore:
         executed_at: datetime,
         operator: str,
         evidence: str,
+        override: bool = False,
     ) -> bool:
         if not fill_id.strip() or not token_id.strip() or not venue.strip():
             raise ValueError("fill_id, venue, and token_id are required")
         normalized_side = side.strip().upper()
         if normalized_side not in {"BUY", "SELL"}:
             raise ValueError("side must be BUY or SELL")
-        if not math.isfinite(fill_price) or fill_price <= 0:
-            raise ValueError("fill_price must be finite and positive")
+        fill_price = validate_price(fill_price, field_name="fill_price")
+        if venue.strip().lower() not in {"polymarket", "kalshi"}:
+            raise ValueError("venue must be a supported venue")
         if executed_at.tzinfo is None:
             raise ValueError("executed_at must include a timezone")
         if not operator.strip() or not evidence.strip():
@@ -477,8 +497,16 @@ class FillStore:
                 if row is None:
                     return False
                 payload = _json_object(row["payload"])
+                if _payload_has_fill_economics(payload) and not override:
+                    return False
                 payload.update(
                     {
+                        # A legacy fills row has no decision sidecar; these
+                        # explicit synthetic links keep replay idempotent.
+                        "trade_id": payload.get("trade_id", f"reconciled:{fill_id}"),
+                        "decision_id": payload.get(
+                            "decision_id", f"reconciled:{fill_id}"
+                        ),
                         "side": normalized_side,
                         "venue": venue.strip(),
                         "token_id": token_id.strip(),
@@ -488,6 +516,7 @@ class FillStore:
                         "economics_reconciled_by": operator.strip(),
                         "economics_reconcile_evidence": evidence.strip(),
                         "economics_audit_pending": True,
+                        "economics_override": override,
                     }
                 )
                 await connection.execute(
@@ -1105,23 +1134,41 @@ def _row_has_fill_economics(row: asyncpg.Record) -> bool:
         return False
     try:
         payload = _json_object(payload_value)
+        if not _payload_has_fill_economics(payload):
+            return False
+        validate_positive(
+            _optional_row_value(row, "fill_quantity"), field_name="fill_quantity"
+        )
+        validate_positive(
+            _optional_row_value(row, "fill_notional_usdc"),
+            field_name="fill_notional_usdc",
+        )
+        return True
+    except (RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _payload_has_fill_economics(payload: dict[str, Any]) -> bool:
+    try:
         side = payload.get("side")
         venue = payload.get("venue")
         token_id = payload.get("token_id")
-        fill_price = payload.get("fill_price")
-        quantity = _decimal_or_none(_optional_row_value(row, "fill_quantity"))
-        return (
-            isinstance(side, str)
-            and bool(side.strip())
-            and isinstance(venue, str)
-            and bool(venue.strip())
-            and isinstance(token_id, str)
-            and bool(token_id.strip())
-            and fill_price is not None
-            and math.isfinite(float(fill_price))
-            and quantity is not None
-            and quantity > 0
-        )
+        if not isinstance(side, str) or side.strip().upper() not in {
+            Side.BUY.value,
+            Side.SELL.value,
+        }:
+            return False
+        if not isinstance(venue, str) or venue.strip().lower() not in {
+            "polymarket",
+            "kalshi",
+        }:
+            return False
+        if not isinstance(token_id, str) or not token_id.strip():
+            return False
+        validate_price(payload["fill_price"], field_name="fill_price")
+        if "fees" in payload and payload["fees"] is not None:
+            validate_notional(payload["fees"], field_name="fees")
+        return True
     except (RuntimeError, TypeError, ValueError, json.JSONDecodeError):
         return False
 

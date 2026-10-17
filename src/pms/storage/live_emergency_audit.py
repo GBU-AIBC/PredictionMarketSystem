@@ -116,12 +116,15 @@ class LiveEmergencyAuditWriter:
         executed_at: datetime,
         operator: str,
         evidence: str,
+        override: bool = False,
     ) -> None:
         record = {
             "timestamp": datetime.now(tz=UTC).isoformat(),
             "phase": "live_fill_economics_reconcile",
             "event": "fill_economics_reconciled",
+            "override": override,
             "fill_id": fill_id,
+            "linkage": f"reconciled:{fill_id}",
             "side": side,
             "venue": venue,
             "token_id": token_id,
