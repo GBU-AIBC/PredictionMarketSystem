@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from pms.api.auth import principal, require_any_scope, require_scope
+from pms.api.auth import authenticate, principal, require_any_scope, require_scope
 from pms.api.health import health_payload, readiness_payload
 from pms.api.routes.decisions import (
     AcceptDecisionRequest,
@@ -331,6 +331,15 @@ def _require_stop_scope(request: Request, mode: RunMode) -> None:
     request.state.auth_scope = required
 
 
+def _live_audit_actor_allowed(path: str, auth: Any) -> bool:
+    if auth is None:
+        return False
+    scopes: frozenset[str] = getattr(auth, "scopes", frozenset())
+    if path in {"/run/stop", "/run/kill"}:
+        return bool({"kill", "live_admin"}.intersection(scopes))
+    return "live_admin" in scopes
+
+
 class SubscriptionStateResponse(BaseModel):
     asset_ids: list[str]
     count: int
@@ -454,7 +463,26 @@ def create_app(
             active_runner.config.mode,
             request_body=request_body,
         )
-        if live_control and pool is not None and hasattr(pool, "fetchval"):
+        preflight_principal = None
+        if live_control and (
+            active_runner.config.api_token or active_runner.config.api_tokens
+        ):
+            try:
+                preflight_principal = authenticate(request)
+            except HTTPException:
+                preflight_principal = None
+        live_actor_allowed = _live_audit_actor_allowed(
+            request.url.path,
+            preflight_principal,
+        )
+        if (
+            live_control
+            and live_actor_allowed
+            and pool is None
+            and active_runner.config.api_tokens
+        ):
+            return JSONResponse(status_code=503, content={"detail": "Request audit unavailable."})
+        if live_control and live_actor_allowed and pool is not None and hasattr(pool, "fetchval"):
             try:
                 await append_request_audit(
                     pool,
@@ -815,6 +843,10 @@ def create_app(
         request: Request,
     ) -> Any:
         _require_mode_scope(request, active_runner.config.mode)
+        logger.info(
+            "decision.accept.request",
+            extra={"token_id": getattr(request.state, "token_id", None), "decision_id": decision_id},
+        )
         try:
             payload = await accept_decision_item(
                 cast(Any, active_runner.decision_store),
@@ -1115,6 +1147,7 @@ def create_app(
     )
     async def reconcile_submission_unknown(
         payload: SubmissionUnknownReconcileRequest,
+        request: Request,
     ) -> dict[str, Any]:
         if active_runner.pg_pool is None:
             raise HTTPException(status_code=503, detail="Runner PostgreSQL pool is not initialized")
@@ -1158,6 +1191,10 @@ def create_app(
                 status_code=404,
                 detail="submission_unknown incident not found",
             )
+        logger.info(
+            "live.reconcile_submission_unknown",
+            extra={"token_id": getattr(request.state, "token_id", None), "decision_id": decision_id},
+        )
         return {
             "status": "reconciled",
             "decision_id": decision_id,

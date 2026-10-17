@@ -752,6 +752,8 @@ def _require_live_api_control_plane_auth(settings: PMSSettings) -> None:
 
     if api_token is not None and api_token.strip() != "":
         return
+    if any("live_admin" in token.scopes for token in settings.api_tokens):
+        return
     msg = (
         "LIVE mode requires PMS_API_TOKEN before real-money startup, including "
         "loopback control-plane binds"

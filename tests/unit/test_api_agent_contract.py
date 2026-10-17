@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from pms.api.app import create_app
 from pms.config import PMSSettings
+from pms.config import _require_live_api_control_plane_auth
 from pms.core.enums import RunMode, Side, TimeInForce, Venue
 from pms.core.models import TradeDecision
 from pms.runner import Runner
@@ -99,6 +100,15 @@ def test_token_settings_reject_invalid_configuration(monkeypatch: pytest.MonkeyP
         PMSSettings(api_tokens=cast(Any, [{"token_id": "a", "secret": "DUP_SECRET", "scopes": ["bogus"]}]))
     with pytest.raises(ValidationError):
         PMSSettings(api_tokens=cast(Any, [{"token_id": "a", "secret": "", "scopes": ["read"]}]))
+
+
+def test_scoped_live_admin_token_satisfies_live_control_plane_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LIVE_ADMIN_SECRET", "live-admin-secret")
+    settings = PMSSettings(
+        mode=RunMode.LIVE,
+        api_tokens=cast(Any, [{"token_id": "admin", "secret": "LIVE_ADMIN_SECRET", "scopes": ["live_admin"]}]),
+    )
+    _require_live_api_control_plane_auth(settings)
 
 
 @pytest.mark.asyncio
