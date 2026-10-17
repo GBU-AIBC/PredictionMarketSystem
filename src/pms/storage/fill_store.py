@@ -162,14 +162,16 @@ class FillStore:
         self,
         fill_id: str,
         *,
-        fees: float,
+        fees: float | None,
         fee_bps: int | None = None,
         slippage_bps: float | None = None,
+        reconciled_by: str | None = None,
+        evidence: str | None = None,
     ) -> bool:
         """Record verified venue fee telemetry for an unresolved fill once."""
         if not fill_id.strip():
             raise ValueError("fill_id is required")
-        if not math.isfinite(fees) or fees < 0.0:
+        if fees is not None and (not math.isfinite(fees) or fees < 0.0):
             raise ValueError("fees must be finite and non-negative")
         if fee_bps is not None and (
             isinstance(fee_bps, bool)
@@ -179,6 +181,12 @@ class FillStore:
             raise ValueError("fee_bps must be a non-negative integer")
         if slippage_bps is not None and not math.isfinite(slippage_bps):
             raise ValueError("slippage_bps must be finite")
+        if (reconciled_by is None) != (evidence is None):
+            raise ValueError("reconciled_by and evidence must be provided together")
+        if reconciled_by is not None and not reconciled_by.strip():
+            raise ValueError("reconciled_by is required")
+        if evidence is not None and not evidence.strip():
+            raise ValueError("evidence is required")
         async with self._pool().acquire() as connection:
             await _ensure_fill_payloads_table(connection)
             async with connection.transaction():
@@ -194,10 +202,17 @@ class FillStore:
                 if row is None:
                     return False
                 payload = _json_object(row["payload"])
-                if payload.get("fees") is not None:
+                existing_fees = payload.get("fees")
+                if existing_fees is not None and slippage_bps is None:
                     return False
-                payload["fees"] = fees
-                payload["fee_bps"] = fee_bps
+                if existing_fees is None and fees is None:
+                    raise ValueError("fees are required for an unresolved fee")
+                if fees is not None:
+                    payload["fees"] = fees
+                    payload["fee_bps"] = fee_bps
+                if reconciled_by is not None and evidence is not None:
+                    payload["fee_reconciled_by"] = reconciled_by.strip()
+                    payload["fee_reconcile_evidence"] = evidence.strip()
                 flags = [
                     flag
                     for flag in _string_list(payload.get("anomaly_flags"))
@@ -208,7 +223,9 @@ class FillStore:
                         or not flag.startswith("execution_slippage_bps=")
                     )
                 ]
-                flags.append("fee_reconciled")
+                flags.append(
+                    "fee_reconciled" if existing_fees is None else "slippage_reconciled"
+                )
                 if slippage_bps is not None:
                     flags.append(f"execution_slippage_bps={slippage_bps:.9f}")
                 payload["anomaly_flags"] = flags
@@ -342,7 +359,11 @@ class FillStore:
                 LEFT JOIN markets
                     ON markets.condition_id = fills.market_id
                 WHERE ($1::timestamptz IS NULL OR fills.ts < $1)
-                ORDER BY fills.ts DESC, fills.fill_id DESC
+                ORDER BY
+                    fills.ts ASC,
+                    fill_payloads.payload->>'executed_at' ASC NULLS LAST,
+                    fills.order_id ASC,
+                    fills.fill_id ASC
                 LIMIT $2
                 OFFSET $3
                 """,
@@ -350,11 +371,13 @@ class FillStore:
                 limit,
                 offset,
             )
-        return [
-            _trade_from_row(row)
-            for row in rows
-            if row["payload"] is not None
-        ]
+        return [_trade_from_row(row) for row in rows]
+
+    async def count_trades(self) -> int:
+        """Return the complete durable fill count for replay truncation checks."""
+        async with self._pool().acquire() as connection:
+            row = await connection.fetchrow("SELECT COUNT(*) AS fill_count FROM fills")
+        return int(row["fill_count"])
 
     def _pool(self) -> asyncpg.Pool:
         if self.pool is None:
@@ -684,7 +707,13 @@ def _float_or_none(value: object | None) -> float | None:
 
 
 def _trade_from_row(row: asyncpg.Record) -> StoredTradeRow:
-    payload = _json_object(row["payload"])
+    fill_id = str(row["fill_id"])
+    try:
+        payload = _json_object(row["payload"])
+    except (RuntimeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"fill {fill_id} has missing or malformed fill_payloads sidecar"
+        ) from error
     return StoredTradeRow(
         trade_id=cast(str, payload["trade_id"]),
         fill_id=cast(str, row["fill_id"]),

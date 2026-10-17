@@ -449,7 +449,7 @@ async def test_fill_store_read_positions_keeps_netting_when_risk_group_metadata_
 
 
 @pytest.mark.asyncio
-async def test_fill_store_read_trades_maps_joined_market_rows_and_skips_missing_payloads() -> None:
+async def test_fill_store_read_trades_fails_closed_on_missing_payloads() -> None:
     connection = _RecordingConnection()
     connection.fetch_rows = [
         {
@@ -491,32 +491,8 @@ async def test_fill_store_read_trades_maps_joined_market_rows_and_skips_missing_
     ]
     store = FillStore(cast(asyncpg.Pool, _RecordingPool(connection)))
 
-    trades = await store.read_trades(limit=10)
-
-    assert trades == [
-        StoredTradeRow(
-            trade_id="trade-unit-cp10-1",
-            fill_id="fill-unit-cp10-1",
-            order_id="order-unit-cp10-1",
-            decision_id="decision-unit-cp10-1",
-            market_id="market-unit-cp10-1",
-            question="Will CP10 fill rows persist?",
-            token_id="token-unit-cp10-1",
-            venue="polymarket",
-            side="yes",
-            fill_price=0.25,
-            fill_notional_usdc=100.0,
-            fill_quantity=400.0,
-            executed_at=datetime(2026, 4, 21, 10, 0, tzinfo=UTC),
-            filled_at=datetime(2026, 4, 21, 10, 0, tzinfo=UTC),
-            status="filled",
-            strategy_id="default",
-            strategy_version_id="default-v2",
-            fee_bps=10,
-            fees=0.1,
-            risk_group_id="event:unit-cp10",
-        )
-    ]
+    with pytest.raises(RuntimeError, match="fill-unit-cp10-2"):
+        await store.read_trades(limit=10)
     assert connection.fetch_calls[0][1] == (None, 10, 0)
 
 

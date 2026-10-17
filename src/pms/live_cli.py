@@ -118,7 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fee_reconcile.add_argument("--config")
     fee_reconcile.add_argument("--fill-id", required=True)
-    fee_reconcile.add_argument("--fees", required=True, type=float)
+    fee_reconcile.add_argument("--fees", type=float)
     fee_reconcile.add_argument("--fee-bps", type=int)
     fee_reconcile.add_argument("--slippage-bps", type=float)
     fee_reconcile.add_argument("--reconciled-by", required=True)
@@ -330,8 +330,8 @@ async def _main_async(args: argparse.Namespace) -> int:
                 cast(str, args.reconciled_by)
             )
             evidence = _normalize_fee_reconcile_evidence(cast(str, args.evidence))
-            fees = float(args.fees)
-            if not math.isfinite(fees) or fees < 0.0:
+            fees = None if args.fees is None else float(args.fees)
+            if fees is not None and (not math.isfinite(fees) or fees < 0.0):
                 raise ValueError("fees must be finite and non-negative")
             fee_bps = cast(int | None, args.fee_bps)
             if fee_bps is not None and (isinstance(fee_bps, bool) or fee_bps < 0):
@@ -339,6 +339,8 @@ async def _main_async(args: argparse.Namespace) -> int:
             slippage_bps = cast(float | None, args.slippage_bps)
             if slippage_bps is not None and not math.isfinite(slippage_bps):
                 raise ValueError("slippage_bps must be finite")
+            if fees is None and slippage_bps is None:
+                raise ValueError("fees or slippage_bps is required")
         except (TypeError, ValueError) as exc:
             _print_fee_reconcile_failure(args, exc)
             return 1
@@ -354,6 +356,7 @@ async def _main_async(args: argparse.Namespace) -> int:
             _print_fee_reconcile_failure(args, exc, settings=settings)
             return 1
         updated = False
+        audit_error: Exception | None = None
         try:
             try:
                 await ensure_schema_current(pool)
@@ -362,23 +365,41 @@ async def _main_async(args: argparse.Namespace) -> int:
                     fees=fees,
                     fee_bps=fee_bps,
                     slippage_bps=slippage_bps,
+                    reconciled_by=reconciled_by,
+                    evidence=evidence,
                 )
                 if updated:
-                    await LiveEmergencyAuditWriter(
-                        Path(settings.live_emergency_audit_path)
-                    ).append_fee_reconcile(
-                        fill_id=fill_id,
-                        fees=fees,
-                        fee_bps=fee_bps,
-                        slippage_bps=slippage_bps,
-                        reconciled_by=reconciled_by,
-                        evidence=evidence,
-                    )
+                    try:
+                        await LiveEmergencyAuditWriter(
+                            Path(settings.live_emergency_audit_path)
+                        ).append_fee_reconcile(
+                            fill_id=fill_id,
+                            fees=fees,
+                            fee_bps=fee_bps,
+                            slippage_bps=slippage_bps,
+                            reconciled_by=reconciled_by,
+                            evidence=evidence,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        audit_error = exc
             except Exception as exc:  # noqa: BLE001
                 _print_fee_reconcile_failure(args, exc, settings=settings)
                 return 1
         finally:
             await pool.close()
+        if audit_error is not None:
+            print(
+                json.dumps(
+                    {
+                        "updated": True,
+                        "audit_persisted": False,
+                        "fill_id": fill_id,
+                        "error": redact_live_error(str(audit_error), settings),
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 1
         if not updated:
             _print_fee_reconcile_failure(
                 args,
@@ -392,6 +413,7 @@ async def _main_async(args: argparse.Namespace) -> int:
             json.dumps(
                 {
                     "updated": True,
+                    "audit_persisted": True,
                     "fill_id": fill_id,
                     "fees": fees,
                     "fee_bps": fee_bps,
@@ -862,6 +884,11 @@ def _normalize_fee_reconcile_evidence(evidence: str) -> str:
         raise ValueError("evidence is required")
     if any(character in normalized for character in ("\n", "\r")):
         raise ValueError("evidence must not contain newlines")
+    if any(
+        marker in normalized.lower()
+        for marker in ("placeholder", "todo", "fill_in", "<", ">")
+    ):
+        raise ValueError("evidence must not contain a placeholder")
     return normalized
 
 

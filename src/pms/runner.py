@@ -135,7 +135,7 @@ from pms.storage.dedup_store import InMemoryDedupStore, PgDedupStore
 from pms.storage.decision_store import DecisionStore
 from pms.storage.eval_store import EvalStore
 from pms.storage.feedback_store import FeedbackStore
-from pms.storage.fill_store import FillStore
+from pms.storage.fill_store import FillStore, StoredTradeRow
 from pms.storage.live_emergency_audit import (
     LiveEmergencyAuditWriter,
     read_active_halt,
@@ -2926,15 +2926,20 @@ class Runner:
     async def clear_live_halt(self, *, cleared_by: str) -> HaltState | None:
         if self.config.mode != RunMode.LIVE:
             raise RuntimeError("halt clear is only available in LIVE mode")
-        await LiveEmergencyAuditWriter(
+        audit_writer = LiveEmergencyAuditWriter(
             Path(self.config.live_emergency_audit_path)
-        ).append_halt_clear(cleared_by=cleared_by)
+        )
+        await audit_writer.append_halt_clear(cleared_by=cleared_by)
         self.actuator_executor.risk.clear_halt(preserve_open_orders=True)
         self.portfolio = replace(self.portfolio, max_drawdown_pct=None)
         self._risk_peak_equity = _portfolio_equity(self.portfolio)
         self._persisted_halt_triggered_at = None
         remaining = self.actuator_executor.risk.check_auto_halt(self.portfolio)
-        return remaining if remaining.halted else None
+        if not remaining.halted:
+            return None
+        await audit_writer.append_halt(remaining)
+        self._persisted_halt_triggered_at = remaining.triggered_at
+        return remaining
 
     async def _hard_halt_live_persistence_failure(
         self,
@@ -3302,7 +3307,32 @@ class Runner:
             # sentinel _pg_pool for lifecycle tests without durable fills.
             return
         try:
-            trades = await self.fill_store.read_trades(limit=100_000)
+            page_size = 10_000
+            expected_count = await self.fill_store.count_trades()
+            trades: list[StoredTradeRow] = []
+            offset = 0
+            while offset < expected_count:
+                page = await self.fill_store.read_trades(
+                    limit=page_size,
+                    offset=offset,
+                )
+                if not page:
+                    raise RuntimeError(
+                        "durable fill replay truncated before expected row count "
+                        f"({len(trades)} of {expected_count})"
+                    )
+                trades.extend(page)
+                offset += len(page)
+                if len(page) < page_size and offset < expected_count:
+                    raise RuntimeError(
+                        "durable fill replay returned a short page before expected "
+                        f"row count ({offset} of {expected_count})"
+                    )
+            if len(trades) != expected_count:
+                raise RuntimeError(
+                    "durable fill replay row count mismatch "
+                    f"({len(trades)} of {expected_count})"
+                )
         except Exception as error:  # noqa: BLE001
             if self.config.mode == RunMode.LIVE:
                 detail = _runtime_error_detail(error, self.config)
@@ -3317,9 +3347,9 @@ class Runner:
         if risk_manager is None or not callable(getattr(risk_manager, "active_halt", None)):
             return
         positions: dict[tuple[str, str | None, str, str, str], tuple[float, float, str]] = {}
-        cumulative_pnl = 0.0
-        peak_equity = self.portfolio.total_usdc
-        max_drawdown_pct = self.portfolio.max_drawdown_pct or 0.0
+        cumulative_pnl = Decimal("0")
+        peak_equity = Decimal(str(self.portfolio.total_usdc))
+        max_drawdown_pct = Decimal(str(self.portfolio.max_drawdown_pct or 0.0))
         clear_cutoff = read_last_halt_clear(
             Path(self.config.live_emergency_audit_path)
         )
@@ -3343,8 +3373,9 @@ class Runner:
                     "LIVE risk telemetry has unresolved fills: "
                     + ", ".join(shown)
                     + suffix
-                    + "; reconcile venue fees with: pms-live "
-                    "reconcile-live-fee --fill-id <fill-id> --fees <venue-fee> "
+                    + "; reconcile telemetry with: pms-live "
+                    "reconcile-live-fee --fill-id <fill-id> "
+                    "[--fees <venue-fee>] "
                     "[--slippage-bps <execution-slippage-bps>] "
                     "--reconciled-by <operator> --evidence <venue-evidence>"
                 )
@@ -3358,7 +3389,15 @@ class Runner:
             if clear_cutoff is not None
             else None
         )
-        for trade in sorted(trades, key=lambda item: item.filled_at):
+        for trade in sorted(
+            trades,
+            key=lambda item: (
+                item.filled_at,
+                item.executed_at,
+                item.order_id,
+                item.fill_id,
+            ),
+        ):
             include_risk_telemetry = (
                 clear_day_start is None or trade.filled_at >= clear_day_start
             )
@@ -3372,29 +3411,29 @@ class Runner:
             shares, avg_price, side = positions.get(key, (0.0, 0.0, trade.side))
             if shares > 1e-9 and side != trade.side:
                 closing = min(shares, trade.fill_quantity)
-                direction = 1.0 if side.upper() == "BUY" else -1.0
-                pnl = direction * (trade.fill_price - avg_price) * closing - (
-                    trade.fees or 0.0
+                direction = Decimal("1") if side.upper() == "BUY" else Decimal("-1")
+                pnl = (
+                    direction
+                    * (Decimal(str(trade.fill_price)) - Decimal(str(avg_price)))
+                    * Decimal(str(closing))
+                    - Decimal(str(trade.fees or 0.0))
                 )
                 if include_risk_telemetry:
                     risk_manager.record_trade_result(
                         RiskTradeResult(
-                            pnl=pnl,
+                            pnl=float(pnl),
                             slippage_bps=trade.slippage_bps or 0.0,
                             filled_at=trade.filled_at,
                             trace_id=trade.trade_id,
                         )
                     )
                     cumulative_pnl += pnl
-                    peak_equity = max(
-                        peak_equity,
-                        self.portfolio.total_usdc + cumulative_pnl,
-                    )
-                    equity = self.portfolio.total_usdc + cumulative_pnl
-                    if peak_equity > 0.0:
+                    equity = Decimal(str(self.portfolio.total_usdc)) + cumulative_pnl
+                    peak_equity = max(peak_equity, equity)
+                    if peak_equity > 0:
                         max_drawdown_pct = max(
                             max_drawdown_pct,
-                            (peak_equity - equity) / peak_equity * 100.0,
+                            (peak_equity - equity) / peak_equity * Decimal("100"),
                         )
                 shares -= closing
                 if shares <= 1e-9:
@@ -3414,10 +3453,10 @@ class Runner:
                     avg_price * shares + trade.fill_price * trade.fill_quantity
                 ) / total_shares
                 positions[key] = (total_shares, avg_price, side)
-        if max_drawdown_pct > 0.0:
+        if max_drawdown_pct > 0:
             self.portfolio = replace(
                 self.portfolio,
-                max_drawdown_pct=max_drawdown_pct,
+                max_drawdown_pct=float(max_drawdown_pct),
             )
         self._risk_peak_equity = _portfolio_equity(self.portfolio)
 
@@ -4683,26 +4722,31 @@ def _risk_trade_result_from_fill(
     contracts = min(closing.shares_held, fill.fill_quantity)
     if contracts <= 1e-9:
         return None
-    direction = 1.0 if closing.side.upper() == "BUY" else -1.0
-    fees = fill.fees or 0.0
-    pnl = direction * (fill.fill_price - closing.avg_entry_price) * contracts - fees
-    slippage_bps = 0.0
+    direction = Decimal("1") if closing.side.upper() == "BUY" else Decimal("-1")
+    contracts_decimal = Decimal(str(contracts))
+    pnl_decimal = (
+        direction
+        * (Decimal(str(fill.fill_price)) - Decimal(str(closing.avg_entry_price)))
+        * contracts_decimal
+        - Decimal(str(fill.fees or 0.0))
+    )
+    slippage_decimal = Decimal("0")
     if decision is not None and decision.limit_price > 0.0:
         if fill.side.upper() == "BUY":
-            slippage_bps = (
-                (fill.fill_price - decision.limit_price)
-                / decision.limit_price
-                * 10_000.0
+            slippage_decimal = (
+                (Decimal(str(fill.fill_price)) - Decimal(str(decision.limit_price)))
+                / Decimal(str(decision.limit_price))
+                * Decimal("10000")
             )
         else:
-            slippage_bps = (
-                (decision.limit_price - fill.fill_price)
-                / decision.limit_price
-                * 10_000.0
+            slippage_decimal = (
+                (Decimal(str(decision.limit_price)) - Decimal(str(fill.fill_price)))
+                / Decimal(str(decision.limit_price))
+                * Decimal("10000")
             )
     return RiskTradeResult(
-        pnl=pnl,
-        slippage_bps=slippage_bps,
+        pnl=float(pnl_decimal),
+        slippage_bps=float(slippage_decimal),
         filled_at=fill.filled_at,
         trace_id=fill.trade_id,
     )

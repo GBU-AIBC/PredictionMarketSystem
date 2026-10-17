@@ -136,6 +136,78 @@ async def test_submission_unknown_filled_reconciles_idempotent_fill(
         restart_runner.bind_pg_pool(pool)
         await restart_runner._reconcile_risk_from_db()  # noqa: SLF001
 
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO fills (
+                    fill_id, order_id, market_id, ts, fill_notional_usdc,
+                    fill_quantity, strategy_id, strategy_version_id
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                "legacy-r4-witness",
+                "legacy-r4-order",
+                "legacy-r4-market",
+                filled_at,
+                5.0,
+                10.0,
+                "lane-1a-strategy",
+                "lane-1a-v1",
+            )
+        legacy_runner = Runner(config=live_settings)
+        legacy_runner.bind_pg_pool(pool)
+        with pytest.raises(RuntimeError, match="legacy-r4-witness"):
+            await legacy_runner._reconcile_risk_from_db()  # noqa: SLF001
+        async with pool.acquire() as connection:
+            await connection.execute(
+                "DELETE FROM fills WHERE fill_id = $1",
+                "legacy-r4-witness",
+            )
+
+        legacy_fee_fill = FillRecord(
+            trade_id="legacy-fee-no-slippage",
+            order_id="legacy-fee-order",
+            decision_id="legacy-fee-decision",
+            market_id="legacy-fee-market",
+            token_id="legacy-fee-token",
+            venue="polymarket",
+            side="BUY",
+            fill_price=0.5,
+            fill_notional_usdc=5.0,
+            fill_quantity=10.0,
+            executed_at=filled_at,
+            filled_at=filled_at,
+            status="filled",
+            anomaly_flags=[],
+            strategy_id="lane-1a-strategy",
+            strategy_version_id="lane-1a-v1",
+            fees=0.01,
+            fee_bps=20,
+        )
+        legacy_store = FillStore(pool)
+        await legacy_store.insert(legacy_fee_fill)
+        legacy_fee_runner = Runner(config=live_settings)
+        legacy_fee_runner.bind_pg_pool(pool)
+        with pytest.raises(RuntimeError, match="legacy-fee-no-slippage"):
+            await legacy_fee_runner._reconcile_risk_from_db()  # noqa: SLF001
+        assert await legacy_store.reconcile_fee(
+            legacy_fee_fill.trade_id,
+            fees=None,
+            slippage_bps=0.0,
+        )
+        await LiveEmergencyAuditWriter(
+            Path(live_settings.live_emergency_audit_path)
+        ).append_fee_reconcile(
+            fill_id=legacy_fee_fill.trade_id,
+            fees=None,
+            fee_bps=None,
+            slippage_bps=0.0,
+            reconciled_by="operator",
+            evidence="legacy-venue-trade-43",
+        )
+        legacy_recovered_runner = Runner(config=live_settings)
+        legacy_recovered_runner.bind_pg_pool(pool)
+        await legacy_recovered_runner._reconcile_risk_from_db()  # noqa: SLF001
+
         unresolved = FillRecord(
             trade_id="lane-1a-unresolved-trade",
             order_id="lane-1a-unresolved-order",

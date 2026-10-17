@@ -222,8 +222,17 @@ async def test_live_fee_reconcile_cli_updates_store_and_audits(
             fees: float,
             fee_bps: int | None,
             slippage_bps: float | None,
+            reconciled_by: str | None = None,
+            evidence: str | None = None,
         ) -> bool:
-            calls["fee"] = (fill_id, fees, fee_bps, slippage_bps)
+            calls["fee"] = (
+                fill_id,
+                fees,
+                fee_bps,
+                slippage_bps,
+                reconciled_by,
+                evidence,
+            )
             return True
 
     class Audit:
@@ -267,7 +276,14 @@ async def test_live_fee_reconcile_cli_updates_store_and_audits(
     )
 
     assert await live_cli._main_async(args) == 0
-    assert calls["fee"] == ("fill-live-1", 0.12, 15, None)
+    assert calls["fee"] == (
+        "fill-live-1",
+        0.12,
+        15,
+        None,
+        "operator",
+        "venue-trade-1",
+    )
     assert calls["audit"] == {
         "fill_id": "fill-live-1",
         "fees": 0.12,
@@ -277,6 +293,59 @@ async def test_live_fee_reconcile_cli_updates_store_and_audits(
         "evidence": "venue-trade-1",
     }
     assert json.loads(capsys.readouterr().out)["updated"] is True
+    bad_args = live_cli.build_parser().parse_args(
+        [
+            "reconcile-live-fee",
+            "--fill-id",
+            "fill-live-1",
+            "--fees",
+            "0.13",
+            "--reconciled-by",
+            "operator",
+            "--evidence",
+            "TODO paste venue trade id",
+            "--database-url",
+            "postgres://test",
+        ]
+    )
+    assert await live_cli._main_async(bad_args) == 1
+    assert calls["fee"] == (
+        "fill-live-1",
+        0.12,
+        15,
+        None,
+        "operator",
+        "venue-trade-1",
+    )
+    assert "placeholder" in json.loads(capsys.readouterr().out)["error"]
+
+
+@pytest.mark.asyncio
+async def test_same_day_daily_loss_clear_rewrites_durable_halt(tmp_path: Path) -> None:
+    path = tmp_path / "daily-halt.jsonl"
+    settings = PMSSettings(
+        mode=RunMode.LIVE,
+        live_emergency_audit_path=str(path),
+        risk=RiskSettings(max_daily_loss_usdc=5.0),
+    )
+    runner = Runner(config=settings)
+    now = datetime.now(tz=UTC)
+    risk = runner.actuator_executor.risk
+    risk.record_trade_result(
+        RiskTradeResult(pnl=-10.0, slippage_bps=0.0, filled_at=now)
+    )
+    state = risk.check_auto_halt(runner.portfolio, now=now)
+    assert state.trigger_kind == "daily_loss_limit"
+    writer = LiveEmergencyAuditWriter(path)
+    await writer.append_halt(state)
+
+    remaining = await runner.clear_live_halt(cleared_by="operator")
+
+    assert remaining is not None
+    assert remaining.trigger_kind == "daily_loss_limit"
+    persisted = read_active_halt(path)
+    assert persisted is not None
+    assert persisted.trigger_kind == "daily_loss_limit"
 
 
 def test_unreadable_halt_audit_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -838,9 +907,17 @@ async def test_risk_replay_keeps_pre_clear_inventory_basis_for_post_clear_loss(
     class Store:
         pool = object.__new__(asyncpg.Pool)
 
-        async def read_trades(self, *, limit: int) -> list[StoredTradeRow]:
-            assert limit == 100_000
-            return trades
+        async def count_trades(self) -> int:
+            return len(trades)
+
+        async def read_trades(
+            self,
+            *,
+            limit: int,
+            offset: int = 0,
+        ) -> list[StoredTradeRow]:
+            assert limit == 10_000
+            return trades[offset : offset + limit]
 
     settings = PMSSettings(
         mode=RunMode.LIVE,
@@ -863,6 +940,106 @@ async def test_risk_replay_keeps_pre_clear_inventory_basis_for_post_clear_loss(
     )
     assert halt.halted is True
     assert halt.trigger_kind == "daily_loss_limit"
+
+
+@pytest.mark.asyncio
+async def test_risk_replay_paginates_history_before_recording_loss(tmp_path: Path) -> None:
+    timestamp = datetime(2026, 10, 18, 1, 0, tzinfo=UTC)
+
+    def trade(
+        *,
+        trade_id: str,
+        market_id: str,
+        side: str,
+        price: float,
+        filled_at: datetime,
+    ) -> StoredTradeRow:
+        return StoredTradeRow(
+            trade_id=trade_id,
+            fill_id=trade_id,
+            order_id=f"order-{trade_id}",
+            decision_id=f"decision-{trade_id}",
+            market_id=market_id,
+            question=market_id,
+            token_id=f"token-{market_id}",
+            venue="polymarket",
+            side=side,
+            fill_price=price,
+            fill_notional_usdc=price * 100.0,
+            fill_quantity=100.0,
+            executed_at=filled_at,
+            filled_at=filled_at,
+            status="filled",
+            strategy_id="lane-1a-strategy",
+            strategy_version_id="lane-1a-v1",
+            fees=0.0,
+            slippage_bps=0.0,
+        )
+
+    trades = [
+        trade(
+            trade_id="old-open",
+            market_id="history-market",
+            side="BUY",
+            price=0.50,
+            filled_at=timestamp,
+        )
+    ]
+    trades.extend(
+        trade(
+            trade_id=f"filler-{index}",
+            market_id=f"filler-market-{index}",
+            side="BUY",
+            price=0.50,
+            filled_at=timestamp,
+        )
+        for index in range(9_999)
+    )
+    trades.append(
+        trade(
+            trade_id="new-close",
+            market_id="history-market",
+            side="SELL",
+            price=0.40,
+            filled_at=timestamp.replace(hour=2),
+        )
+    )
+
+    class Store:
+        pool = object.__new__(asyncpg.Pool)
+
+        async def count_trades(self) -> int:
+            return len(trades)
+
+        async def read_trades(
+            self,
+            *,
+            limit: int,
+            offset: int = 0,
+        ) -> list[StoredTradeRow]:
+            # Model the old bounded query: the 100,000-row request silently
+            # omitted the final close, while page-sized requests are complete.
+            if limit > 10_000:
+                return trades[:10_000]
+            return trades[offset : offset + limit]
+
+    settings = PMSSettings(
+        mode=RunMode.LIVE,
+        live_emergency_audit_path=str(tmp_path / "replay-audit.jsonl"),
+        risk=RiskSettings(max_daily_loss_usdc=5.0),
+    )
+    runner = Runner(config=settings)
+    risk = RiskManager(settings.risk)
+    runner.actuator_executor = cast(Any, type("Executor", (), {"risk": risk})())
+    runner.fill_store = cast(Any, Store())
+    runner._pg_pool = cast(Any, object())  # noqa: SLF001
+
+    await runner._reconcile_risk_from_db()  # noqa: SLF001
+    assert risk._daily_trades[-1].trace_id == "new-close"  # noqa: SLF001
+    assert risk._daily_trades[-1].pnl == pytest.approx(-10.0)  # noqa: SLF001
+    assert risk.check_auto_halt(
+        Portfolio(100.0, 100.0, 0.0, []), now=timestamp.replace(hour=3)
+    ).trigger_kind == "daily_loss_limit"
 
 
 @pytest.mark.asyncio

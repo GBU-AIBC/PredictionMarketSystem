@@ -44,7 +44,7 @@ class LiveEmergencyAuditWriter:
         self,
         *,
         fill_id: str,
-        fees: float,
+        fees: float | None,
         fee_bps: int | None,
         slippage_bps: float | None,
         reconciled_by: str,
@@ -52,7 +52,7 @@ class LiveEmergencyAuditWriter:
     ) -> None:
         if not fill_id.strip():
             raise ValueError("fill_id is required")
-        if not math.isfinite(fees) or fees < 0.0:
+        if fees is not None and (not math.isfinite(fees) or fees < 0.0):
             raise ValueError("fees must be finite and non-negative")
         if fee_bps is not None and (
             isinstance(fee_bps, bool)
