@@ -84,29 +84,7 @@ async def insert_eval_record_row(
             $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12::jsonb,
             $13, $14, $15, $16, $17, $18, $19, $20, $21
         )
-        /* ON CONFLICT (decision_id) DO NOTHING was replaced with an upsert so
-           aggregate partial fills update the durable evaluation row. */
-        ON CONFLICT (decision_id) DO UPDATE SET
-            market_id = EXCLUDED.market_id,
-            prob_estimate = EXCLUDED.prob_estimate,
-            resolved_outcome = EXCLUDED.resolved_outcome,
-            brier_score = EXCLUDED.brier_score,
-            fill_status = EXCLUDED.fill_status,
-            recorded_at = EXCLUDED.recorded_at,
-            citations = EXCLUDED.citations,
-            baseline_prob_estimate = EXCLUDED.baseline_prob_estimate,
-            baseline_brier_score = EXCLUDED.baseline_brier_score,
-            baseline_prob_estimates = EXCLUDED.baseline_prob_estimates,
-            baseline_brier_scores = EXCLUDED.baseline_brier_scores,
-            category = EXCLUDED.category,
-            model_id = EXCLUDED.model_id,
-            pnl = EXCLUDED.pnl,
-            slippage_bps = EXCLUDED.slippage_bps,
-            filled = EXCLUDED.filled,
-            strategy_id = EXCLUDED.strategy_id,
-            strategy_version_id = EXCLUDED.strategy_version_id,
-            edge_at_decision = EXCLUDED.edge_at_decision,
-            spread_bps_at_decision = EXCLUDED.spread_bps_at_decision
+        ON CONFLICT (decision_id) DO NOTHING
         """,
         record.decision_id,
         record.market_id,

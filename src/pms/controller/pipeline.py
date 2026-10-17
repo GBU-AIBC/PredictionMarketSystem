@@ -334,17 +334,24 @@ class ControllerPipeline:
                 continue
             if result is None:
                 if isinstance(forecaster, LLMForecaster):
+                    failure_reason = forecaster.last_failure_reason or "no_output"
                     self._set_drop_diagnostic(
                         signal,
-                        code="llm_budget_exhausted",
-                        message="LLM forecaster produced no usable forecast.",
+                        code=f"llm_{failure_reason}",
+                        message=(
+                            "LLM forecaster produced no usable forecast: "
+                            f"{failure_reason}."
+                        ),
                         severity="info",
                     )
                 continue
             model_id = _model_id(result, forecaster)
             model_ids.append(model_id)
             probabilities.append(float(result[0]))
-            confidence_weights.append(max(0.0, min(1.0, float(result[1]))))
+            confidence_weight = max(0.0, min(1.0, float(result[1])))
+            if isinstance(forecaster, LLMForecaster):
+                confidence_weight = min(confidence_weight, 0.25)
+            confidence_weights.append(confidence_weight)
             if result[2]:
                 rationales.append(f"{model_id}:{result[2]}")
             runtime_factor_id = _runtime_factor_id(

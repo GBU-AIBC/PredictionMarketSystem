@@ -43,7 +43,7 @@ CREATE INDEX IF NOT EXISTS idx_markets_price_updated_at
     ON markets (price_updated_at DESC)
     WHERE price_updated_at IS NOT NULL;
 
-CREATE TABLE market_resolutions (
+CREATE /* idempotent */ TABLE IF NOT EXISTS market_resolutions (
     market_id TEXT PRIMARY KEY REFERENCES markets(condition_id) ON DELETE CASCADE,
     resolved_outcome DOUBLE PRECISION NOT NULL
         CHECK (resolved_outcome >= 0.0 AND resolved_outcome <= 1.0),

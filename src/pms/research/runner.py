@@ -115,6 +115,7 @@ class _StrategySliceAccumulator:
     decision_count: int = 0
     fill_count: int = 0
     fills_with_resolution: int = 0
+    decisions_with_resolution: int = 0
     brier_scores: list[Decimal] = field(default_factory=list)
     slippage_bps_values: list[Decimal] = field(default_factory=list)
     cumulative_pnl: Decimal = Decimal("0")
@@ -131,6 +132,7 @@ class _StrategySliceAccumulator:
         self.decision_count += 1
         resolved_outcome = _resolved_outcome(signal)
         if resolved_outcome is not None:
+            self.decisions_with_resolution += 1
             prob_estimate = _yes_probability(decision)
             resolved = Decimal(str(resolved_outcome))
             self.brier_scores.append((prob_estimate - resolved) ** 2)
@@ -252,6 +254,7 @@ class _StrategyAccumulator:
     # contribute real P&L; when this stays zero we must not publish a
     # spurious 0.0 pnl_cum (see `as_insert_args`).
     fills_with_resolution: int = 0
+    decisions_with_resolution: int = 0
     brier_scores: list[Decimal] = field(default_factory=list)
     slippage_bps_values: list[Decimal] = field(default_factory=list)
     cumulative_pnl: Decimal = Decimal("0")
@@ -291,6 +294,7 @@ class _StrategyAccumulator:
             )
         resolved_outcome = _resolved_outcome(signal)
         if resolved_outcome is not None:
+            self.decisions_with_resolution += 1
             prob_estimate = _yes_probability(decision)
             resolved = Decimal(str(resolved_outcome))
             self.brier_scores.append((prob_estimate - resolved) ** 2)
@@ -571,7 +575,7 @@ class BacktestRunner:
             accumulator.strategy_id
             for accumulator in accumulators
             if accumulator.decision_count > 0
-            and accumulator.fills_with_resolution == 0
+            and accumulator.decisions_with_resolution == 0
         ]
         if missing_labels:
             raise ValueError(
@@ -646,7 +650,7 @@ class BacktestRunner:
                 )
                 for slice_descriptor in slice_descriptors:
                     accumulator.record_slice_fill(
-                        signal=signal,
+                        signal=scoring_signal,
                         decision=decision_for_fill,
                         fill=fill,
                         slice_descriptor=slice_descriptor,
@@ -699,7 +703,7 @@ class BacktestRunner:
             fill = _fill_from_order(
                 order_state,
                 decision=cast(TradeDecision, decision),
-                signal=signal,
+                signal=scoring_signal,
                 prior_filled_notional_usdc=prior_notional,
                 prior_filled_quantity=prior_quantity,
                 execution_model=spec.execution_model,
@@ -713,13 +717,13 @@ class BacktestRunner:
                 continue
             portfolio = _portfolio_with_fill(portfolio, fill)
             accumulator.record_fill(
-                signal=signal,
+                signal=scoring_signal,
                 decision=decision,
                 fill=fill,
             )
             for slice_descriptor in slice_descriptors:
                 accumulator.record_slice_fill(
-                    signal=signal,
+                    signal=scoring_signal,
                     decision=decision,
                     fill=fill,
                     slice_descriptor=slice_descriptor,

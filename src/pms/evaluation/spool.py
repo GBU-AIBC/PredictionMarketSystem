@@ -4,7 +4,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import timedelta
 from math import isfinite
 from typing import Protocol, cast
@@ -58,7 +58,7 @@ class EvalSpool:
         default_factory=asyncio.Queue,
     )
     _task: asyncio.Task[None] | None = None
-    _fills_by_decision: dict[str, FillRecord] = field(default_factory=dict)
+    _seen_fill_keys: set[str] = field(default_factory=set)
     _scored_record_count: int = 0
     _last_feedback_record_count: int = 0
 
@@ -111,10 +111,8 @@ class EvalSpool:
                 decision_evidence,
             )
             return False
-        fill = self._aggregate_fill(fill)
-        if fill.status == "partial":
-            # Hold partial execution until the terminal fill arrives so the
-            # durable row is written once with the decision's full quantity.
+        fill_key = fill.fill_id or fill.trade_id
+        if fill_key in self._seen_fill_keys:
             return False
         scored_record = self.scorer.score(
             fill,
@@ -131,6 +129,7 @@ class EvalSpool:
         # ON CONFLICT-deduped store append) is safe: the sink's calibrator
         # dedups per (model_id, decision_id).
         inserted = await self.store.append(scored_record)
+        self._seen_fill_keys.add(fill_key)
         if inserted:
             self._scored_record_count += 1
         if self.calibration_sink is not None:
@@ -144,37 +143,9 @@ class EvalSpool:
             logger.exception("feedback generation failed in evaluator spool")
         return inserted
 
-    def _aggregate_fill(self, fill: FillRecord) -> FillRecord:
-        """Coalesce partial fills so one decision is scored on total execution."""
-        prior = self._fills_by_decision.get(fill.decision_id)
-        if prior is None:
-            self._fills_by_decision[fill.decision_id] = fill
-            return fill
-        total_notional = prior.fill_notional_usdc + fill.fill_notional_usdc
-        total_quantity = prior.fill_quantity + fill.fill_quantity
-        if total_quantity <= 0.0:
-            return prior
-        weighted_price = (
-            prior.fill_price * prior.fill_quantity
-            + fill.fill_price * fill.fill_quantity
-        ) / total_quantity
-        fees = (prior.fees or 0.0) + (fill.fees or 0.0)
-        aggregated = replace(
-            fill,
-            fill_price=weighted_price,
-            fill_notional_usdc=total_notional,
-            fill_quantity=total_quantity,
-            fees=fees,
-            fee_bps=fill.fee_bps or prior.fee_bps,
-            status=(
-                fill.status
-                if fill.status == "matched" or prior.status != "matched"
-                else prior.status
-            ),
-            trade_id=f"{prior.trade_id},{fill.trade_id}",
-        )
-        self._fills_by_decision[fill.decision_id] = aggregated
-        return aggregated
+    async def flush_feedback(self) -> None:
+        """Run one final feedback batch at the end of a resolution sweep."""
+        await self._generate_feedback(force=True)
 
     async def _run(self) -> None:
         while True:
@@ -195,13 +166,13 @@ class EvalSpool:
             finally:
                 self._queue.task_done()
 
-    async def _generate_feedback(self) -> None:
+    async def _generate_feedback(self, *, force: bool = False) -> None:
         if self.feedback_generator is None or self.metrics_provider is None:
             return
         # Keep the first two updates responsive for operator feedback, then
         # batch later updates so a resolution sweep does not reload every row
         # once per fill (the previous O(N²) behavior).
-        if (
+        if not force and (
             self._scored_record_count > 2
             and self._scored_record_count - self._last_feedback_record_count < 20
         ):

@@ -173,11 +173,18 @@ class ResolutionSweeper:
         resolutions = await self.resolution_source.fetch_resolutions(condition_ids)
         if self.resolution_store is not None:
             for market_id, label in resolutions.items():
-                await self.resolution_store.upsert(
-                    market_id,
-                    resolved_outcome=label,
-                    source="gamma",
-                )
+                try:
+                    await self.resolution_store.upsert(
+                        market_id,
+                        resolved_outcome=label,
+                        source="gamma",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "could not persist market resolution for %s",
+                        market_id,
+                        exc_info=True,
+                    )
         fills_resolved = 0
         eval_records_appended = 0
         fills_failed = 0
@@ -199,6 +206,10 @@ class ResolutionSweeper:
                 fills_resolved += 1
             if outcome.eval_record_appended:
                 eval_records_appended += 1
+        flush_feedback = getattr(self.eval_spool, "flush_feedback", None)
+        scored_count = getattr(self.eval_spool, "_scored_record_count", 0)
+        if callable(flush_feedback) and scored_count > 2:
+            await flush_feedback()
         return ResolutionSweepResult(
             unresolved_fills=len(unresolved),
             fills_resolved=fills_resolved,

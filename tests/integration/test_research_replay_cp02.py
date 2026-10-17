@@ -15,6 +15,13 @@ from pms.research.specs import (
     ExecutionModel,
     RiskPolicy,
 )
+from pms.research.execution import BacktestExecutionSimulator
+from pms.research.runner import (
+    _StrategyAccumulator,
+    _fill_from_order,
+    _signal_with_replay_resolution,
+)
+from pms.storage.market_resolution_store import MarketResolutionStore
 from pms.storage.market_data_store import PostgresMarketDataStore
 from tests.integration.test_market_data_store import (
     _level,
@@ -158,6 +165,81 @@ async def test_market_universe_replay_engine_streams_ordered_market_signals(
     }
     assert signals[1].yes_price == pytest.approx(0.5)
     assert signals[2].yes_price == pytest.approx(0.52)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_real_replay_ioc_fill_scores_brier_and_pnl_from_market_resolution(
+    pg_pool: asyncpg.Pool,
+) -> None:
+    """Replay labels join only for scoring, including immediate IOC fills."""
+    from types import SimpleNamespace
+    from pms.core.enums import TimeInForce
+    from pms.core.models import TradeDecision
+    from pms.research.replay import MarketUniverseReplayEngine
+
+    market_id = "market-replay-resolution-c1"
+    token_id = "token-replay-resolution-c1"
+    store = PostgresMarketDataStore(pg_pool)
+    await _seed_replay_rows(store, market_id=market_id, token_id=token_id)
+    await MarketResolutionStore(pg_pool).upsert(
+        market_id,
+        resolved_outcome=1.0,
+        source="test",
+    )
+    spec = _spec(market_id=market_id)
+    engine = MarketUniverseReplayEngine(pool=pg_pool)
+    signal = (await _collect_signals(
+        engine,
+        spec,
+        BacktestExecutionConfig(chunk_days=7),
+    ))[0]
+    scoring_signal = _signal_with_replay_resolution(signal, engine)
+    decision = TradeDecision(
+        decision_id="decision-replay-resolution-c1",
+        market_id=market_id,
+        token_id=token_id,
+        venue="polymarket",
+        side="BUY",
+        notional_usdc=10.0,
+        order_type="limit",
+        max_slippage_bps=50,
+        stop_conditions=[],
+        prob_estimate=0.7,
+        expected_edge=0.2,
+        time_in_force=TimeInForce.IOC,
+        opportunity_id="opportunity-replay-resolution-c1",
+        strategy_id="alpha",
+        strategy_version_id="v1",
+        limit_price=0.6,
+    )
+    order_state = await BacktestExecutionSimulator(replay_engine=engine).execute(
+        signal=signal,
+        decision=decision,
+        execution_model=spec.execution_model,
+    )
+    fill = _fill_from_order(
+        order_state,
+        decision=decision,
+        signal=scoring_signal,
+        prior_filled_notional_usdc=0.0,
+        prior_filled_quantity=0.0,
+        execution_model=spec.execution_model,
+    )
+    assert fill is not None
+    accumulator = _StrategyAccumulator(
+        strategy_id="alpha",
+        strategy_version_id="v1",
+        execution_model=spec.execution_model,
+    )
+    accumulator.record_decision(
+        signal=scoring_signal,
+        opportunity=SimpleNamespace(side="yes"),
+        decision=decision,
+    )
+    accumulator.record_fill(signal=scoring_signal, decision=decision, fill=fill)
+    args = accumulator.as_insert_args(run_id="run-replay-resolution-c1")
+    assert args[8] is not None
+    assert args[9] is not None
 
 
 @pytest.mark.asyncio(loop_scope="session")

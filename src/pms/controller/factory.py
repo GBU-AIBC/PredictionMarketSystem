@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from hashlib import sha256
+from pathlib import Path
 from typing import cast
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,7 +11,7 @@ from pms.artifact_path_safety import (
     require_path_outside_working_tree,
     require_private_parent,
 )
-from pms.config import PMSSettings
+from pms.config import LLMSettings, PMSSettings, RiskSettings
 from pms.controller.calibrators.netcal import NetcalCalibrator
 from pms.controller.factor_snapshot import (
     FactorSnapshotReader,
@@ -144,7 +146,17 @@ def _build_forecaster(
         }
         if "max_tokens" in updates:
             updates["max_tokens"] = int(cast(str, updates["max_tokens"]))
-        llm_config = settings.llm.model_copy(update=updates)
+        llm_payload = {**settings.llm.model_dump(), **updates}
+        if llm_payload.get("spend_ledger_path") is None:
+            identity = "|".join(
+                str(llm_payload.get(key, ""))
+                for key in ("provider", "model", "api_key")
+            )
+            digest = sha256(identity.encode()).hexdigest()[:24]
+            llm_payload["spend_ledger_path"] = str(
+                Path.home() / ".cache" / "pms" / f"llm-spend-{digest}.json"
+            )
+        llm_config = LLMSettings.model_validate(llm_payload)
         validate_llm_runtime_dependencies(llm_config)
         return LLMForecaster(config=llm_config)
     if name == "flb":
