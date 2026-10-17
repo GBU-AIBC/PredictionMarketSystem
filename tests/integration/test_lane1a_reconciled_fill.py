@@ -304,6 +304,92 @@ async def test_submission_unknown_filled_reconciles_idempotent_fill(
     reason="set PMS_RUN_INTEGRATION=1 to run integration tests",
 )
 @pytest.mark.asyncio
+async def test_live_portfolio_reconciliation_rejects_notional_mismatch(
+    tmp_path: Path,
+) -> None:
+    dsn = os.environ.get("PMS_TEST_DATABASE_URL")
+    if not dsn:
+        pytest.skip("PMS_TEST_DATABASE_URL is required")
+    pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=2)
+    fill_id = "lane-1a-notional-mismatch"
+    executed_at = datetime.now(tz=UTC)
+    payload = {
+        "trade_id": fill_id,
+        "decision_id": f"decision:{fill_id}",
+        "token_id": "lane-1a-notional-token",
+        "venue": "polymarket",
+        "side": "BUY",
+        "fill_price": 0.5,
+        "executed_at": executed_at.isoformat(),
+        "status": "filled",
+        "anomaly_flags": ["run_mode=live"],
+        "fees": 0.0,
+    }
+    try:
+        async with pool.acquire() as connection:
+            await connection.execute(
+                "DELETE FROM fill_payloads WHERE fill_id = $1", fill_id
+            )
+            await connection.execute("DELETE FROM fills WHERE fill_id = $1", fill_id)
+            await connection.execute(
+                """
+                INSERT INTO fills (
+                    fill_id, order_id, market_id, ts, fill_notional_usdc,
+                    fill_quantity, strategy_id, strategy_version_id
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                fill_id,
+                f"order:{fill_id}",
+                "lane-1a-notional-market",
+                executed_at,
+                0.1,
+                1_000.0,
+                "lane-1a-strategy",
+                "lane-1a-v1",
+            )
+            await connection.execute(
+                "INSERT INTO fill_payloads (fill_id, payload) VALUES ($1, $2::jsonb)",
+                fill_id,
+                json.dumps(payload),
+            )
+
+        settings = PMSSettings(
+            mode=RunMode.LIVE,
+            live_emergency_audit_path=str(tmp_path / "live-audit.jsonl"),
+            risk=RiskSettings(max_daily_loss_usdc=20.0),
+        )
+        runner = Runner(config=settings)
+        runner.bind_pg_pool(pool)
+        with pytest.raises(RuntimeError, match=fill_id):
+            await runner._reconcile_portfolio_from_db()  # noqa: SLF001
+
+        async with pool.acquire() as connection:
+            await connection.execute(
+                "UPDATE fills SET fill_notional_usdc = $2 WHERE fill_id = $1",
+                fill_id,
+                500.01,
+            )
+        await runner._reconcile_portfolio_from_db()  # noqa: SLF001
+        assert any(
+            position.market_id == "lane-1a-notional-market"
+            and position.shares_held == pytest.approx(1_000.0)
+            for position in runner.portfolio.open_positions
+        )
+    finally:
+        async with pool.acquire() as connection:
+            await connection.execute(
+                "DELETE FROM fill_payloads WHERE fill_id = $1", fill_id
+            )
+            await connection.execute("DELETE FROM fills WHERE fill_id = $1", fill_id)
+        await pool.close()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("PMS_RUN_INTEGRATION") != "1",
+    reason="set PMS_RUN_INTEGRATION=1 to run integration tests",
+)
+@pytest.mark.asyncio
 async def test_live_reconciliation_partitions_fill_provenance(
     tmp_path: Path,
 ) -> None:

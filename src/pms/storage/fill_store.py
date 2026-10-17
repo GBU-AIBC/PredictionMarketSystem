@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import json
 import logging
 import math
@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS fill_payloads (
 """
 
 logger = logging.getLogger(__name__)
+
+_NOTIONAL_TOLERANCE_USDC = Decimal("0.01")
+_NOTIONAL_TOLERANCE_RATIO = Decimal("0.005")
 
 
 @dataclass
@@ -210,7 +213,7 @@ class FillStore:
                     """,
                     fill_id,
                 )
-                if row is None:
+                if row is None or row["payload"] is None:
                     return False
                 payload = _json_object(row["payload"])
                 existing_fees = payload.get("fees")
@@ -487,18 +490,29 @@ class FillStore:
             async with connection.transaction():
                 row = await connection.fetchrow(
                     """
-                    SELECT payload
-                    FROM fill_payloads
-                    WHERE fill_id = $1
-                    FOR UPDATE
+                    SELECT fills.fill_quantity, fills.fill_notional_usdc,
+                           fill_payloads.payload
+                    FROM fills
+                    LEFT JOIN fill_payloads
+                        ON fill_payloads.fill_id = fills.fill_id
+                    WHERE fills.fill_id = $1
+                    FOR UPDATE OF fills
                     """,
                     fill_id,
                 )
-                if row is None:
+                if row is None or row["payload"] is None:
                     return False
                 payload = _json_object(row["payload"])
                 if _payload_has_fill_economics(payload) and not override:
                     return False
+                if not _notional_matches_price(
+                    quantity=row["fill_quantity"],
+                    notional=row["fill_notional_usdc"],
+                    price=fill_price,
+                ):
+                    raise ValueError(
+                        "fill_notional_usdc does not match fill_quantity * fill_price"
+                    )
                 payload.update(
                     {
                         # A legacy fills row has no decision sidecar; these
@@ -1136,14 +1150,18 @@ def _row_has_fill_economics(row: asyncpg.Record) -> bool:
         payload = _json_object(payload_value)
         if not _payload_has_fill_economics(payload):
             return False
-        validate_positive(
+        quantity = validate_positive(
             _optional_row_value(row, "fill_quantity"), field_name="fill_quantity"
         )
-        validate_positive(
+        notional = validate_notional(
             _optional_row_value(row, "fill_notional_usdc"),
             field_name="fill_notional_usdc",
         )
-        return True
+        return _notional_matches_price(
+            quantity=quantity,
+            notional=notional,
+            price=payload["fill_price"],
+        )
     except (RuntimeError, TypeError, ValueError, json.JSONDecodeError):
         return False
 
@@ -1171,6 +1189,39 @@ def _payload_has_fill_economics(payload: dict[str, Any]) -> bool:
         return True
     except (RuntimeError, TypeError, ValueError, json.JSONDecodeError):
         return False
+
+
+def _notional_matches_price(
+    *, quantity: object, notional: object, price: object
+) -> bool:
+    """Check persisted notional against quantity × execution price.
+
+    The absolute floor covers cent-level rounding while the relative bound
+    keeps tolerance proportional for larger fills. Decimal arithmetic avoids
+    binary float drift at this trust boundary.
+    """
+    try:
+        quantity_dec = Decimal(
+            str(validate_positive(quantity, field_name="fill_quantity"))
+        )
+        notional_dec = Decimal(
+            str(validate_notional(notional, field_name="fill_notional_usdc"))
+        )
+        price_dec = Decimal(str(validate_price(price, field_name="fill_price")))
+    except (
+        InvalidOperation,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return False
+    expected = quantity_dec * price_dec
+    tolerance = max(
+        _NOTIONAL_TOLERANCE_USDC,
+        abs(expected) * _NOTIONAL_TOLERANCE_RATIO,
+    )
+    return abs(notional_dec - expected) <= tolerance
 
 
 def _trade_from_row(row: asyncpg.Record) -> StoredTradeRow:

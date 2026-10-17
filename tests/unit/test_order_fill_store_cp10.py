@@ -7,7 +7,11 @@ import asyncpg
 import pytest
 
 from pms.core.models import FillRecord, OrderState, Position
-from pms.storage.fill_store import FillStore, _json_object as fill_json_object
+from pms.storage.fill_store import (
+    FillStore,
+    _json_object as fill_json_object,
+    _row_has_fill_economics,
+)
 from pms.storage.fill_store import _run_mode_from_anomaly_flags, _string_list
 from pms.storage.order_store import OrderStore, _json_object as order_json_object
 
@@ -111,6 +115,25 @@ async def test_incomplete_fill_summary_filters_before_report_limit() -> None:
 
     assert ids == ["fill-summary-21"]
     assert total == 1
+
+
+def test_fill_economics_rejects_persisted_notional_mismatch() -> None:
+    row = {
+        "fill_id": "fill-mismatch",
+        "fill_quantity": 1_000.0,
+        "fill_notional_usdc": 0.1,
+        "payload": {
+            "side": "BUY",
+            "venue": "polymarket",
+            "token_id": "token-mismatch",
+            "fill_price": 0.5,
+            "fees": 0.0,
+        },
+    }
+    assert not _row_has_fill_economics(cast(asyncpg.Record, row))
+
+    row["fill_notional_usdc"] = 500.0 + 0.01
+    assert _row_has_fill_economics(cast(asyncpg.Record, row))
 
 
 def _order_state() -> OrderState:
