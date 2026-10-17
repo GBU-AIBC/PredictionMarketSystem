@@ -31,8 +31,6 @@ def upgrade() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_agent_evidence_market_captured
             ON agent_evidence (market_id, captured_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_agent_evidence_current
-            ON agent_evidence (market_id, captured_at DESC, expires_at);
 
         CREATE TABLE IF NOT EXISTS agent_factor_provenance (
             factor_id TEXT NOT NULL,

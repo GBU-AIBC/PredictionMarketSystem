@@ -22,6 +22,7 @@ from typing import Literal
 from weakref import ReferenceType, ref
 
 from pms.config import LLMSettings
+from pms.artifact_path_safety import require_path_outside_working_tree, require_private_parent
 from pms.core.models import MarketSignal
 from pms.metrics import (
     LLM_BUDGET_EXHAUSTED_TOTAL_METRIC,
@@ -90,10 +91,9 @@ def durable_record_replay_path(
 ) -> str:
     database_digest = sha256(database_dsn.encode("utf-8")).hexdigest()[:24]
     scope_digest = sha256(scope.encode("utf-8")).hexdigest()[:8]
-    return str(
-        Path(data_path).expanduser().parent
-        / f"llm-replay-{database_digest}-{scope_digest}.json"
-    )
+    del data_path
+    base_dir = Path.home() / ".pms" / "llm-replay"
+    return str(base_dir / f"llm-replay-{database_digest}-{scope_digest}.json")
 
 
 class _LLMClient(Protocol):
@@ -118,6 +118,10 @@ class LLMParseError(RuntimeError):
 
 class LLMReplayCacheMissError(RuntimeError):
     """Raised when deterministic research replay lacks a recorded response."""
+
+
+class LLMReplayCacheCorruptError(LLMReplayCacheMissError):
+    """Raised when a replay cache cannot be decoded safely."""
 
 
 class LLMForecastResult(tuple[float, float, str]):
@@ -314,15 +318,36 @@ class LLMForecaster:
             return
         with self._cache_lock:
             path.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(path.parent, 0o700)
+            require_path_outside_working_tree(path, label="LLM replay cache")
+            require_private_parent(path, label="LLM replay cache")
             with _replay_lock(path, exclusive=True):
                 try:
                     payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-                except (OSError, json.JSONDecodeError):
-                    payload = {}
+                except json.JSONDecodeError as exc:
+                    logger.error("LLM replay cache is corrupt; refusing to overwrite %s", path)
+                    raise LLMReplayCacheCorruptError(
+                        f"LLM replay cache is corrupt: {path}"
+                    ) from exc
+                except OSError as exc:
+                    raise LLMReplayCacheCorruptError(
+                        f"LLM replay cache cannot be read: {path}"
+                    ) from exc
                 entries = payload.get("entries") if isinstance(payload, dict) else None
                 if not isinstance(entries, dict):
                     entries = {}
                 entries["|".join(key)] = row
+                if len(entries) > 10_000:
+                    entries = dict(
+                        sorted(
+                            entries.items(),
+                            key=lambda item: str(
+                                item[1].get("recorded_at", "")
+                            )
+                            if isinstance(item[1], dict)
+                            else "",
+                        )[-10_000:]
+                    )
                 encoded = json.dumps({"entries": entries}, sort_keys=True, separators=(",", ":"))
                 temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
                 with temporary.open("w", encoding="utf-8") as file:
@@ -330,12 +355,13 @@ class LLMForecaster:
                     file.flush()
                     os.fsync(file.fileno())
                 os.replace(temporary, path)
+                os.chmod(path, 0o600)
 
     def _replay_path(self) -> Path | None:
         configured = self.replay_cache_path
         if configured is None and self.config is not None:
             configured = self.config.record_replay_path
-        return None if configured is None else Path(configured).expanduser()
+        return None if configured is None else Path(configured).expanduser().resolve()
 
     async def forecast(self, signal: MarketSignal) -> float:
         import asyncio

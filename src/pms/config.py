@@ -461,7 +461,9 @@ class PMSSettings(BaseSettings):
     live_trading_enabled: bool = False
     agent_strategy_runtime_enabled: bool = False
     auto_migrate_default_v2: bool = True
-    paper_soak_strategy_id: Literal["paper_multi_factor_v1", "h1_flb"] | None = None
+    paper_soak_strategy_id: Literal[
+        "paper_multi_factor_v1", "paper_agent_probability_v1", "h1_flb"
+    ] | None = None
     paper_soak_archive_default: bool = False
     enforce_schema_check: bool | None = None
     factor_cadence_s: float = 1.0

@@ -148,6 +148,21 @@ FACTOR_CATALOG_ROWS: tuple[FactorCatalogEntry, ...] = (
     ),
 )
 
+AGENT_FACTOR_IDS = frozenset(
+    entry.factor_id for entry in FACTOR_CATALOG_ROWS if entry.owner.startswith("agent:")
+)
+
+
+def catalog_entry(factor_id: str) -> FactorCatalogEntry | None:
+    return next(
+        (entry for entry in FACTOR_CATALOG_ROWS if entry.factor_id == factor_id),
+        None,
+    )
+
+
+def is_agent_factor(factor_id: str) -> bool:
+    return factor_id in AGENT_FACTOR_IDS
+
 
 class _AsyncAcquireContext(Protocol):
     async def __aenter__(self) -> object: ...

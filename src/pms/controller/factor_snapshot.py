@@ -133,8 +133,20 @@ class PostgresFactorSnapshotReader:
                         ON required.factor_id = fv.factor_id
                        AND required.param = fv.param
                        AND required.definition_version = fv.definition_version
+                    INNER JOIN factors AS catalog
+                        ON catalog.factor_id = fv.factor_id
+                    LEFT JOIN agent_factor_provenance AS provenance
+                        ON provenance.factor_id = fv.factor_id
+                       AND provenance.param = fv.param
+                       AND provenance.market_id = fv.market_id
+                       AND provenance.ts = fv.ts
+                       AND provenance.definition_version = fv.definition_version
                     WHERE fv.market_id = $1
                       AND fv.ts <= $2
+                      AND (
+                          catalog.owner NOT LIKE 'agent:%'
+                          OR provenance.created_at <= $2
+                      )
                     ORDER BY fv.factor_id ASC, fv.param ASC, fv.ts DESC
                 )
                 SELECT

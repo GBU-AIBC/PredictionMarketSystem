@@ -10,7 +10,7 @@ from pms.controller.factor_snapshot import (
     NullFactorSnapshotReader,
 )
 from pms.core.models import MarketSignal
-from pms.factors.catalog import FACTOR_CATALOG_ROWS
+from pms.factors.catalog import catalog_entry
 from pms.strategies.projections import FactorCompositionStep
 
 ForecastResult = tuple[float, float, str]
@@ -107,10 +107,8 @@ def _rule_delta(
 
 
 def _catalog_output_type(factor_id: str) -> str | None:
-    for entry in FACTOR_CATALOG_ROWS:
-        if entry.factor_id == factor_id:
-            return entry.output_type
-    return None
+    entry = catalog_entry(factor_id)
+    return None if entry is None else entry.output_type
 
 
 def _bounded_probability(value: float) -> float:

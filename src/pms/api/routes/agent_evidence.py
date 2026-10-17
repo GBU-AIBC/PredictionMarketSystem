@@ -13,6 +13,7 @@ from pms.storage.agent_evidence_store import (
     AgentEvidence,
     AgentEvidenceStore,
 )
+from pms.api.routes.agent_common import pool_from_request, token_id_from_request
 
 
 router = APIRouter(tags=["agent"])
@@ -30,6 +31,7 @@ class AgentEvidenceRequest(BaseModel):
     content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     captured_at: datetime
     expires_at: datetime | None = None
+    evidence_id: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class AgentEvidenceResponse(BaseModel):
@@ -76,7 +78,7 @@ async def submit_evidence(
             now=now,
         )
     except (ValueError, asyncpg.ForeignKeyViolationError) as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
     except asyncpg.UniqueViolationError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="evidence_id already exists") from exc
     return _evidence_response(row)
@@ -99,8 +101,8 @@ async def list_evidence(
 
 @router.post("/evidence", response_model=AgentEvidenceResponse, status_code=201)
 async def post_evidence(request: Request, body: AgentEvidenceRequest) -> AgentEvidenceResponse:
-    pool = _pool_from_request(request)
-    token_id = _token_id_from_request(request)
+    pool = pool_from_request(request)
+    token_id = token_id_from_request(request)
     return await submit_evidence(pool, body, submitted_by_token_id=token_id)
 
 
@@ -110,7 +112,7 @@ async def get_evidence(
     market_id: str = Query(min_length=1, max_length=256),
     limit: int = Query(default=100, ge=1, le=1000),
 ) -> AgentEvidenceListResponse:
-    return await list_evidence(_pool_from_request(request), market_id=market_id, limit=limit)
+    return await list_evidence(pool_from_request(request), market_id=market_id, limit=limit)
 
 
 def _evidence_response(row: AgentEvidence) -> AgentEvidenceResponse:
@@ -128,20 +130,3 @@ def _evidence_response(row: AgentEvidence) -> AgentEvidenceResponse:
         submitted_by_token_id=row.submitted_by_token_id,
         created_at=row.created_at,
     )
-
-
-def _pool_from_request(request: Request) -> asyncpg.Pool:
-    runner = getattr(request.app.state, "runner", None)
-    pool = getattr(runner, "pg_pool", None)
-    if pool is None:
-        raise HTTPException(status_code=503, detail="PostgreSQL pool is not initialized")
-    return pool
-
-
-def _token_id_from_request(request: Request) -> str:
-    for attribute in ("token_id", "auth_token_id", "api_token_id"):
-        token_id = getattr(request.state, attribute, None)
-        if isinstance(token_id, str) and token_id:
-            return token_id
-    raise HTTPException(status_code=401, detail="Authenticated token identity is required")
-    evidence_id: str | None = Field(default=None, min_length=1, max_length=256)

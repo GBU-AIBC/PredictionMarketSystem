@@ -147,6 +147,10 @@ row is owned by `agent:llm`, so observations are accepted only through the
 agent factor route and are read at the signal's point in time. Its metadata
 sets `live_allowed=false`; the controller loader also rejects any
 agent-owned factor in LIVE mode, so this flag is enforced at startup.
+Set `paper_soak_strategy_id=paper_agent_probability_v1` to install and activate
+this version through the normal Runner strategy registry; the Runner's
+`build_agent_evidence_source()` provides the point-in-time observation source
+against the same PostgreSQL store for plugin consumers.
 
 ### 3.2 Write `build_imbalance_with_prior_strategy()`
 

@@ -25,7 +25,7 @@ from pms.controller.forecasters.flb import FlbForecaster
 from pms.controller.forecasters.paper_canary import PaperCanaryForecaster
 from pms.controller.forecasters.rules import RulesForecaster
 from pms.controller.forecasters.statistical import StatisticalForecaster
-from pms.factors.catalog import FACTOR_CATALOG_ROWS
+from pms.factors.catalog import is_agent_factor
 from pms.core.enums import RunMode
 from pms.controller.outcome_tokens import (
     NullOutcomeTokenResolver,
@@ -161,10 +161,9 @@ def _build_forecaster(
             llm_payload["record_replay_path"] = durable_record_replay_path(
                 database_dsn=settings.database.dsn,
                 data_path=settings.live_emergency_audit_path,
-                scope=settings.mode.value,
+                scope="paper-research",
             )
         llm_config = LLMSettings.model_validate(llm_payload)
-        validate_llm_runtime_dependencies(llm_config)
         replay_mode = cast(
             Literal["off", "record", "replay"],
             {
@@ -173,6 +172,10 @@ def _build_forecaster(
             RunMode.LIVE: "off",
             }[mode],
         )
+        # Replay must be provider-free: a recorded response is sufficient and
+        # the optional SDK/credentials may not exist in research environments.
+        if replay_mode != "replay":
+            validate_llm_runtime_dependencies(llm_config)
         return LLMForecaster(config=llm_config, record_replay_mode=replay_mode)
     if name == "flb":
         if raw_params:
@@ -264,10 +267,7 @@ def _live_strategy_has_non_llm_forecaster(strategy: ActiveStrategy) -> bool:
 
 
 def _is_agent_factor(factor_id: str) -> bool:
-    return any(
-        entry.factor_id == factor_id and entry.owner.startswith("agent:")
-        for entry in FACTOR_CATALOG_ROWS
-    )
+    return is_agent_factor(factor_id)
 
 
 def _assert_live_strategy_metadata_ready(

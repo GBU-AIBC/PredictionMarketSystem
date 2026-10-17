@@ -202,7 +202,7 @@ class AgentEvidenceStore:
                        content_hash, captured_at, expires_at, submitted_by_token_id, created_at
                 FROM agent_evidence
                 WHERE market_id = $1
-                  AND captured_at <= $2
+                  AND GREATEST(captured_at, created_at) <= $2
                   AND (expires_at IS NULL OR expires_at > $2)
                 ORDER BY captured_at DESC, evidence_id ASC
                 LIMIT $3

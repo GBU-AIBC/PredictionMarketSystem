@@ -5,7 +5,7 @@ from math import isclose, isfinite
 from typing import Protocol
 
 from pms.core.validation import validate_finite
-from pms.factors.catalog import FACTOR_CATALOG_ROWS
+from pms.factors.catalog import FACTOR_CATALOG_ROWS, catalog_entry
 
 
 COMPOSITION_ROLES = frozenset(
@@ -331,10 +331,8 @@ def _rule_delta(
 
 
 def _catalog_output_type(factor_id: str) -> str | None:
-    for entry in FACTOR_CATALOG_ROWS:
-        if entry.factor_id == factor_id:
-            return entry.output_type
-    return None
+    entry = catalog_entry(factor_id)
+    return None if entry is None else entry.output_type
 
 
 def _first_runtime_probability(

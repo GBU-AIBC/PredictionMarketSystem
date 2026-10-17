@@ -8,12 +8,12 @@ import re
 from typing import Any
 
 import asyncpg
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from pms.core.validation import validate_finite, validate_probability
-from pms.factors.catalog import FactorCatalogEntry
-from pms.factors.catalog import FACTOR_CATALOG_ROWS
+from pms.factors.catalog import FactorCatalogEntry, catalog_entry
+from pms.api.routes.agent_common import pool_from_request, token_id_from_request
 
 
 router = APIRouter(tags=["agent"])
@@ -75,55 +75,97 @@ async def submit_agent_factor_observation(
     value = _validate_value(request.value, entry)
     if not request.model.strip() or not _HASH_RE.fullmatch(request.prompt_hash):
         raise HTTPException(status_code=422, detail="invalid provenance")
-    async with pool.acquire() as connection:
-        async with connection.transaction():
-            inserted = await connection.fetchrow(
-                """
-                INSERT INTO factor_values (
-                    factor_id, param, market_id, ts, value, definition_version
-                ) VALUES ($1, $2, $3, $4, $5, '1')
-                ON CONFLICT (factor_id, param, market_id, ts, definition_version)
-                DO NOTHING
-                RETURNING factor_id
-                """,
-                factor_id,
-                request.param,
-                request.market_id,
-                ts,
-                value,
-            )
-            if inserted is None:
-                existing = await connection.fetchrow(
+    if any(not evidence_id.strip() or len(evidence_id) > 256 for evidence_id in request.evidence_ids):
+        raise HTTPException(status_code=422, detail="invalid evidence_ids")
+    provenance_written = False
+    try:
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                inserted = await connection.fetchrow(
                     """
-                    SELECT value FROM factor_values
-                    WHERE factor_id = $1 AND param = $2 AND market_id = $3
-                      AND ts = $4 AND definition_version = '1'
+                    INSERT INTO factor_values (
+                        factor_id, param, market_id, ts, value, definition_version
+                    ) VALUES ($1, $2, $3, $4, $5, '1')
+                    ON CONFLICT (factor_id, param, market_id, ts, definition_version)
+                    DO NOTHING
+                    RETURNING factor_id
                     """,
                     factor_id,
                     request.param,
                     request.market_id,
                     ts,
+                    value,
                 )
-                if existing is None or float(existing["value"]) != value:
-                    raise HTTPException(status_code=409, detail="factor observation conflicts with existing row")
-            await connection.execute(
-                """
-                INSERT INTO agent_factor_provenance (
-                    factor_id, param, market_id, ts, definition_version,
-                    model, prompt_hash, evidence_ids, submitted_by_token_id
-                ) VALUES ($1, $2, $3, $4, '1', $5, $6, $7::jsonb, $8)
-                ON CONFLICT (factor_id, param, market_id, ts, definition_version)
-                DO NOTHING
-                """,
-                factor_id,
-                request.param,
-                request.market_id,
-                ts,
-                request.model,
-                request.prompt_hash,
-                json.dumps(request.evidence_ids, allow_nan=False),
-                submitted_by_token_id,
-            )
+                if inserted is None:
+                    existing = await connection.fetchrow(
+                        """
+                        SELECT value FROM factor_values
+                        WHERE factor_id = $1 AND param = $2 AND market_id = $3
+                          AND ts = $4 AND definition_version = '1'
+                        """,
+                        factor_id,
+                        request.param,
+                        request.market_id,
+                        ts,
+                    )
+                    if existing is None or float(existing["value"]) != value:
+                        raise HTTPException(status_code=409, detail="factor observation conflicts with existing row")
+                if request.evidence_ids:
+                    evidence_count = await connection.fetchval(
+                        """
+                        SELECT COUNT(*)
+                        FROM agent_evidence
+                        WHERE evidence_id = ANY($1::text[])
+                          AND market_id = $2
+                          AND captured_at <= $3
+                          AND (expires_at IS NULL OR expires_at > $3)
+                        """,
+                        request.evidence_ids,
+                        request.market_id,
+                        ts,
+                    )
+                    if int(evidence_count or 0) != len(set(request.evidence_ids)):
+                        raise HTTPException(
+                            status_code=422,
+                            detail="evidence_ids must reference current evidence for the market",
+                        )
+                provenance = await connection.fetchrow(
+                    """
+                    INSERT INTO agent_factor_provenance (
+                        factor_id, param, market_id, ts, definition_version,
+                        model, prompt_hash, evidence_ids, submitted_by_token_id
+                    ) VALUES ($1, $2, $3, $4, '1', $5, $6, $7::jsonb, $8)
+                    ON CONFLICT (factor_id, param, market_id, ts, definition_version)
+                    DO NOTHING
+                    RETURNING factor_id
+                    """,
+                    factor_id,
+                    request.param,
+                    request.market_id,
+                    ts,
+                    request.model,
+                    request.prompt_hash,
+                    json.dumps(request.evidence_ids, allow_nan=False),
+                    submitted_by_token_id,
+                )
+                provenance_written = provenance is not None
+                if not provenance_written:
+                    existing_provenance = await connection.fetchrow(
+                        """
+                        SELECT model, prompt_hash, evidence_ids, submitted_by_token_id
+                        FROM agent_factor_provenance
+                        WHERE factor_id = $1 AND param = $2 AND market_id = $3
+                          AND ts = $4 AND definition_version = '1'
+                        """,
+                        factor_id,
+                        request.param,
+                        request.market_id,
+                        ts,
+                    )
+                    if existing_provenance is None:
+                        raise HTTPException(status_code=409, detail="factor provenance was not persisted")
+    except asyncpg.ForeignKeyViolationError as exc:
+        raise HTTPException(status_code=422, detail="factor catalog or market does not exist") from exc
     return AgentFactorObservationResponse(
         factor_id=factor_id,
         param=request.param,
@@ -131,7 +173,7 @@ async def submit_agent_factor_observation(
         ts=ts,
         value=value,
         definition_version="1",
-        provenance_written=True,
+        provenance_written=provenance_written,
     )
 
 
@@ -181,18 +223,8 @@ async def post_agent_factor(
     request: Request,
     body: AgentFactorObservationRequest,
 ) -> AgentFactorObservationResponse:
-    pool = _pool_from_request(request)
-    token_id = next(
-        (
-            getattr(request.state, attribute)
-            for attribute in ("token_id", "auth_token_id", "api_token_id")
-            if isinstance(getattr(request.state, attribute, None), str)
-            and getattr(request.state, attribute)
-        ),
-        None,
-    )
-    if not isinstance(token_id, str):
-        raise HTTPException(status_code=401, detail="Authenticated token identity is required")
+    pool = pool_from_request(request)
+    token_id = token_id_from_request(request)
     return await submit_agent_factor_observation(
         pool,
         factor_id=factor_id,
@@ -201,8 +233,32 @@ async def post_agent_factor(
     )
 
 
+@router.get(
+    "/factors/{factor_id}/observations/provenance",
+    response_model=AgentFactorProvenanceResponse,
+    response_model_exclude_none=True,
+)
+async def get_agent_factor_provenance_route(
+    factor_id: str,
+    request: Request,
+    market_id: str = Query(min_length=1, max_length=256),
+    ts: datetime = Query(),
+    param: str = Query(default="", max_length=256),
+) -> AgentFactorProvenanceResponse:
+    row = await get_agent_factor_provenance(
+        pool_from_request(request),
+        factor_id=factor_id,
+        param=param,
+        market_id=market_id,
+        ts=ts,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="factor provenance not found")
+    return row
+
+
 def _agent_catalog_entry(factor_id: str) -> FactorCatalogEntry:
-    entry = next((item for item in FACTOR_CATALOG_ROWS if item.factor_id == factor_id), None)
+    entry = catalog_entry(factor_id)
     if entry is None or not entry.owner.startswith("agent:"):
         raise HTTPException(status_code=422, detail="factor_id is not an agent-owned catalog factor")
     return entry
@@ -222,11 +278,3 @@ def _aware(value: datetime, field: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise HTTPException(status_code=422, detail=f"{field} must be timezone-aware")
     return value.astimezone(UTC)
-
-
-def _pool_from_request(request: Request) -> asyncpg.Pool:
-    runner = getattr(request.app.state, "runner", None)
-    pool = getattr(runner, "pg_pool", None)
-    if pool is None:
-        raise HTTPException(status_code=503, detail="PostgreSQL pool is not initialized")
-    return pool

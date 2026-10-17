@@ -53,7 +53,6 @@ _DEFERRED_SCHEMA_STATEMENT_PREFIXES: Final[tuple[str, ...]] = (
     # upgrade from the pre-Wave-2 head and a fresh schema stay equivalent.
     "CREATE TABLE IF NOT EXISTS agent_evidence",
     "CREATE INDEX IF NOT EXISTS idx_agent_evidence_market_captured",
-    "CREATE INDEX IF NOT EXISTS idx_agent_evidence_current",
     "CREATE TABLE IF NOT EXISTS agent_factor_provenance",
     "CREATE INDEX IF NOT EXISTS idx_agent_factor_provenance_market_ts",
     "CREATE TABLE IF NOT EXISTS strategy_judgement_artifacts",
