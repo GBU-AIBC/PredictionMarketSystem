@@ -7,8 +7,12 @@ import asyncpg
 import pytest
 
 from pms.core.models import FillRecord, OrderState, Position
-from pms.storage.fill_store import FillStore, _json_object as fill_json_object
-from pms.storage.fill_store import StoredTradeRow, _string_list
+from pms.storage.fill_store import (
+    FillStore,
+    _json_object as fill_json_object,
+    _row_has_fill_economics,
+)
+from pms.storage.fill_store import _run_mode_from_anomaly_flags, _string_list
 from pms.storage.order_store import OrderStore, _json_object as order_json_object
 
 
@@ -44,6 +48,12 @@ class _RecordingConnection:
         self.fetch_calls.append((query, args))
         return list(self.fetch_rows)
 
+    async def fetchrow(self, query: str, *args: object) -> object:
+        del args
+        if "COUNT(*)" in query:
+            return {"fill_count": len(self.fetch_rows)}
+        return self.fetch_rows[0] if self.fetch_rows else None
+
     def transaction(self) -> _TransactionRecorder:
         return _TransactionRecorder(self)
 
@@ -65,6 +75,65 @@ class _RecordingPool:
 
     def acquire(self) -> _AcquireContext:
         return _AcquireContext(self._connection)
+
+
+def test_invalid_run_mode_is_treated_as_unknown_provenance() -> None:
+    assert _run_mode_from_anomaly_flags(["run_mode=staging"]) is None
+    assert _run_mode_from_anomaly_flags(["run_mode=live"]) == "live"
+
+
+@pytest.mark.asyncio
+async def test_incomplete_fill_summary_filters_before_report_limit() -> None:
+    connection = _RecordingConnection()
+    connection.fetch_rows = [
+        {
+            "fill_id": f"fill-summary-{index:02d}",
+            "fill_quantity": 1.0,
+            "fill_notional_usdc": 0.5,
+            "payload": {
+                "side": "BUY",
+                "venue": "polymarket",
+                "token_id": "token-summary",
+                "fill_price": 0.5,
+                "fees": 0.0,
+                "anomaly_flags": ["run_mode=live"],
+            },
+        }
+        for index in range(22)
+    ]
+    cast(dict[str, object], connection.fetch_rows[-1])["payload"] = {
+        "side": "HOLD",
+        "venue": "polymarket",
+        "token_id": "token-summary",
+        "fill_price": 0.5,
+        "fees": 0.0,
+        "anomaly_flags": ["run_mode=live"],
+    }
+    store = FillStore(cast(asyncpg.Pool, _RecordingPool(connection)))
+
+    ids, total = await store.incomplete_fill_summary(run_mode="live", limit=20)
+
+    assert ids == ["fill-summary-21"]
+    assert total == 1
+
+
+def test_fill_economics_rejects_persisted_notional_mismatch() -> None:
+    row = {
+        "fill_id": "fill-mismatch",
+        "fill_quantity": 1_000.0,
+        "fill_notional_usdc": 0.1,
+        "payload": {
+            "side": "BUY",
+            "venue": "polymarket",
+            "token_id": "token-mismatch",
+            "fill_price": 0.5,
+            "fees": 0.0,
+        },
+    }
+    assert not _row_has_fill_economics(cast(asyncpg.Record, row))
+
+    row["fill_notional_usdc"] = 500.0 + 0.01
+    assert _row_has_fill_economics(cast(asyncpg.Record, row))
 
 
 def _order_state() -> OrderState:
@@ -449,7 +518,7 @@ async def test_fill_store_read_positions_keeps_netting_when_risk_group_metadata_
 
 
 @pytest.mark.asyncio
-async def test_fill_store_read_trades_maps_joined_market_rows_and_skips_missing_payloads() -> None:
+async def test_fill_store_api_skips_missing_payloads() -> None:
     connection = _RecordingConnection()
     connection.fetch_rows = [
         {
@@ -492,31 +561,7 @@ async def test_fill_store_read_trades_maps_joined_market_rows_and_skips_missing_
     store = FillStore(cast(asyncpg.Pool, _RecordingPool(connection)))
 
     trades = await store.read_trades(limit=10)
-
-    assert trades == [
-        StoredTradeRow(
-            trade_id="trade-unit-cp10-1",
-            fill_id="fill-unit-cp10-1",
-            order_id="order-unit-cp10-1",
-            decision_id="decision-unit-cp10-1",
-            market_id="market-unit-cp10-1",
-            question="Will CP10 fill rows persist?",
-            token_id="token-unit-cp10-1",
-            venue="polymarket",
-            side="yes",
-            fill_price=0.25,
-            fill_notional_usdc=100.0,
-            fill_quantity=400.0,
-            executed_at=datetime(2026, 4, 21, 10, 0, tzinfo=UTC),
-            filled_at=datetime(2026, 4, 21, 10, 0, tzinfo=UTC),
-            status="filled",
-            strategy_id="default",
-            strategy_version_id="default-v2",
-            fee_bps=10,
-            fees=0.1,
-            risk_group_id="event:unit-cp10",
-        )
-    ]
+    assert [trade.fill_id for trade in trades] == ["fill-unit-cp10-1"]
     assert connection.fetch_calls[0][1] == (None, 10, 0)
 
 
@@ -532,3 +577,75 @@ async def test_fill_store_read_trades_uses_half_open_until_cutoff() -> None:
     assert "fills.ts < $1" in query
     assert "fills.ts <= $1" not in query
     assert args == (until, 10, 0)
+
+
+@pytest.mark.asyncio
+async def test_fill_store_read_trades_returns_newest_rows_first() -> None:
+    class PaginatedConnection(_RecordingConnection):
+        async def fetch(self, query: str, *args: object) -> list[object]:
+            self.fetch_calls.append((query, args))
+            limit = int(cast(int, args[1]))
+            offset = int(cast(int, args[2]))
+            return list(self.fetch_rows[offset : offset + limit])
+
+    connection = PaginatedConnection()
+    rows: list[dict[str, object]] = []
+    for index in range(24, -1, -1):
+        timestamp = datetime(2026, 4, 21, 10, 0, tzinfo=UTC).replace(
+            minute=index
+        )
+        rows.append(
+            {
+                "fill_id": f"fill-newest-{index}",
+                "order_id": f"order-newest-{index}",
+                "market_id": "market-newest",
+                "ts": timestamp,
+                "fill_notional_usdc": 1.0,
+                "fill_quantity": 1.0,
+                "strategy_id": "default",
+                "strategy_version_id": "default-v1",
+                "question": "newest",
+                "payload": {
+                    "trade_id": f"trade-newest-{index}",
+                    "decision_id": f"decision-newest-{index}",
+                    "token_id": "token-newest",
+                    "venue": "polymarket",
+                    "side": "BUY",
+                    "fill_price": 0.5,
+                    "executed_at": timestamp.isoformat(),
+                    "status": "filled",
+                },
+            }
+        )
+    connection.fetch_rows = cast(list[object], rows)
+    store = FillStore(cast(asyncpg.Pool, _RecordingPool(connection)))
+
+    trades = await store.read_trades(limit=20)
+
+    assert len(trades) == 20
+    assert trades[0].fill_id == "fill-newest-24"
+    assert trades[-1].fill_id == "fill-newest-5"
+    assert "fills.ts DESC" in connection.fetch_calls[0][0]
+
+
+@pytest.mark.asyncio
+async def test_fill_store_replay_fails_closed_on_missing_payloads() -> None:
+    connection = _RecordingConnection()
+    connection.fetch_rows = [
+        {
+            "fill_id": "fill-replay-missing",
+            "order_id": "order-replay-missing",
+            "market_id": "market-replay",
+            "ts": datetime(2026, 4, 21, 10, 0, tzinfo=UTC),
+            "fill_notional_usdc": 1.0,
+            "fill_quantity": 1.0,
+            "strategy_id": "default",
+            "strategy_version_id": "default-v1",
+            "question": "replay",
+            "payload": None,
+        }
+    ]
+    store = FillStore(cast(asyncpg.Pool, _RecordingPool(connection)))
+
+    with pytest.raises(RuntimeError, match="fill-replay-missing"):
+        await store.read_trades_for_replay(page_size=10)

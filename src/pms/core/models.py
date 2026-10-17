@@ -14,6 +14,7 @@ from enum import StrEnum
 from typing import Any, Literal, cast
 
 from pms.core.enums import TimeInForce
+from pms.core.validation import validate_finite, validate_price, validate_probability
 
 
 Venue = Literal["polymarket", "kalshi"]
@@ -98,14 +99,42 @@ class TradeDecision:
     calibration_prob_estimate: float | None = None
 
     def __post_init__(self) -> None:
-        if self.action is not None and self.side != self.action:
-            msg = "TradeDecision.side/action mismatch"
-            raise ValueError(msg)
-        if self.notional_usdc <= 0.0:
+        # Validate at the entity boundary before any adapter or risk arithmetic
+        # can turn NaN into an approved order (comparisons with NaN are false).
+        normalized_notional = validate_finite(
+            self.notional_usdc,
+            field_name="requested_notional_usdc",
+        )
+        if normalized_notional <= 0.0:
             msg = "TradeDecision.notional_usdc must be > 0.0"
             raise ValueError(msg)
-        if self.limit_price <= 0.0 or self.limit_price >= 1.0:
-            msg = "TradeDecision.limit_price must satisfy 0.0 < limit_price < 1.0"
+        object.__setattr__(
+            self,
+            "notional_usdc",
+            normalized_notional,
+        )
+        object.__setattr__(
+            self,
+            "limit_price",
+            validate_price(self.limit_price, field_name="TradeDecision.limit_price"),
+        )
+        object.__setattr__(
+            self,
+            "prob_estimate",
+            validate_probability(self.prob_estimate, field_name="TradeDecision.prob_estimate"),
+        )
+        object.__setattr__(
+            self,
+            "expected_edge",
+            validate_finite(self.expected_edge, field_name="TradeDecision.expected_edge"),
+        )
+        object.__setattr__(
+            self,
+            "max_slippage_bps",
+            int(validate_finite(self.max_slippage_bps, field_name="TradeDecision.max_slippage_bps")),
+        )
+        if self.action is not None and self.side != self.action:
+            msg = "TradeDecision.side/action mismatch"
             raise ValueError(msg)
         raw_time_in_force = cast(object, self.time_in_force)
         if not isinstance(raw_time_in_force, TimeInForce):

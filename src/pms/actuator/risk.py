@@ -6,7 +6,10 @@ from decimal import Decimal
 from typing import Literal
 
 from pms.config import RiskSettings
+from pms.core.enums import ReasonCode
+from pms.core.exceptions import DomainValidationError
 from pms.core.models import OrderState, Portfolio, Position, TradeDecision
+from pms.core.validation import validate_finite, validate_price, validate_probability
 
 
 class InsufficientLiquidityError(RuntimeError):
@@ -118,7 +121,36 @@ class RiskManager:
         )
 
     def check(self, decision: TradeDecision, portfolio: Portfolio) -> RiskDecision:
-        notional = decision.notional_usdc
+        try:
+            notional = validate_finite(
+                decision.notional_usdc,
+                field_name="TradeDecision.notional_usdc",
+            )
+            validate_finite(portfolio.free_usdc, field_name="Portfolio.free_usdc")
+            validate_finite(
+                portfolio.locked_usdc,
+                field_name="Portfolio.locked_usdc",
+            )
+            validate_price(decision.limit_price, field_name="TradeDecision.limit_price")
+            validate_probability(
+                decision.prob_estimate,
+                field_name="TradeDecision.prob_estimate",
+            )
+            validate_finite(
+                decision.expected_edge,
+                field_name="TradeDecision.expected_edge",
+            )
+            validate_finite(
+                decision.max_slippage_bps,
+                field_name="TradeDecision.max_slippage_bps",
+            )
+            if portfolio.max_drawdown_pct is not None:
+                validate_finite(
+                    portfolio.max_drawdown_pct,
+                    field_name="Portfolio.max_drawdown_pct",
+                )
+        except DomainValidationError:
+            return RiskDecision(False, ReasonCode.NON_FINITE.value)
         if notional <= 0.0:
             return RiskDecision(False, "non_positive_size")
 
@@ -161,9 +193,10 @@ class RiskManager:
                 return RiskDecision(False, "max_exposure_per_risk_group")
 
         if (
-            self.risk.max_drawdown_pct is not None
+            residual_notional > 0.0
+            and self.risk.max_drawdown_pct is not None
             and portfolio.max_drawdown_pct is not None
-            and portfolio.max_drawdown_pct > self.risk.max_drawdown_pct
+            and portfolio.max_drawdown_pct >= self.risk.max_drawdown_pct
         ):
             return RiskDecision(False, "drawdown_circuit_breaker")
 
@@ -196,10 +229,23 @@ class RiskManager:
         self,
         portfolio: Portfolio,
         *,
+        decision: TradeDecision | None = None,
         now: datetime | None = None,
         trace_id: str | None = None,
     ) -> HaltState:
         checked_at = _coerce_aware(now)
+        # A verified reduction is allowed to unwind risk even while an entry
+        # breaker is latched. A mixed order (close plus residual entry) still
+        # goes through the normal halt path and is therefore fail-closed.
+        if decision is not None:
+            reduction = _split_reduction_shares(portfolio, decision)
+            if reduction.reducing_shares > 0.0 and reduction.residual_shares <= 1e-9:
+                return HaltState(
+                    halted=False,
+                    reason="position_reduction_allowed",
+                    triggered_at=checked_at,
+                    trigger_kind="none",
+                )
         if self._halt_state is not None and self._halt_state.halted:
             return self._halt_state
 
@@ -215,7 +261,7 @@ class RiskManager:
         if (
             self.risk.max_drawdown_pct is not None
             and portfolio.max_drawdown_pct is not None
-            and portfolio.max_drawdown_pct > self.risk.max_drawdown_pct
+            and portfolio.max_drawdown_pct >= self.risk.max_drawdown_pct
         ):
             return self._halt(
                 trigger_kind="drawdown_circuit_breaker",
@@ -246,7 +292,7 @@ class RiskManager:
         if len(self._recent_trades) >= 10:
             last_ten = self._recent_trades[-10:]
             avg_slippage = sum(trade.slippage_bps for trade in last_ten) / len(last_ten)
-            if avg_slippage > 100.0:
+            if avg_slippage > 100.0 or last_ten[-1].slippage_bps > 100.0:
                 return self._halt(
                     trigger_kind="slippage_spike",
                     reason="avg_slippage_above_100bps",
@@ -285,8 +331,30 @@ class RiskManager:
             return self._halt_state
         return None
 
+    def restore_halt(self, state: HaltState) -> None:
+        """Restore a durable breaker during runner construction."""
+        if not state.halted:
+            return
+        event = HaltEvent(state=state)
+        self._halt_state = state
+        self._active_halt_event = event
+        self._halt_events.append(event)
+
     def record_trade_result(self, result: RiskTradeResult) -> None:
-        normalized = replace(result, filled_at=_coerce_aware(result.filled_at))
+        try:
+            pnl = validate_finite(result.pnl, field_name="RiskTradeResult.pnl")
+            slippage_bps = validate_finite(
+                result.slippage_bps,
+                field_name="RiskTradeResult.slippage_bps",
+            )
+        except DomainValidationError as exc:
+            raise ValueError("RiskTradeResult contains a non-finite value") from exc
+        normalized = replace(
+            result,
+            pnl=pnl,
+            slippage_bps=slippage_bps,
+            filled_at=_coerce_aware(result.filled_at),
+        )
         self._recent_trades.append(normalized)
         if len(self._recent_trades) > 100:
             del self._recent_trades[:-100]
@@ -327,7 +395,12 @@ class RiskManager:
         self._open_order_submitted_at.pop(order_id, None)
         self._open_order_risk_reservations.pop(order_id, None)
 
-    def clear_halt(self, *, at: datetime | None = None) -> None:
+    def clear_halt(
+        self,
+        *,
+        at: datetime | None = None,
+        preserve_open_orders: bool = False,
+    ) -> None:
         if self._halt_state is not None and self._active_halt_event is not None:
             self._halt_recovery_cycles.append(
                 HaltRecoveryCycle(
@@ -340,8 +413,9 @@ class RiskManager:
         self._credential_failure = None
         self._recent_trades.clear()
         self._recent_rate_limits.clear()
-        self._open_order_submitted_at.clear()
-        self._open_order_risk_reservations.clear()
+        if not preserve_open_orders:
+            self._open_order_submitted_at.clear()
+            self._open_order_risk_reservations.clear()
 
     def _open_order_risk_group_exposure(self, risk_group_id: str) -> float:
         return sum(

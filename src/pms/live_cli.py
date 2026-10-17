@@ -47,6 +47,8 @@ from pms.storage.fill_store import FillStore
 from pms.storage.live_emergency_audit import (
     EmergencyRestartMode,
     LiveEmergencyAuditWriter,
+    _require_operator_id,
+    _require_operator_text,
 )
 from pms.storage.live_reconciliation import (
     LiveOrderReconciliationRecord,
@@ -105,7 +107,70 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reconcile.add_argument("--reconciled-by", required=True)
     reconcile.add_argument("--note")
+    reconcile.add_argument("--fill-price", type=float)
+    reconcile.add_argument("--fill-notional-usdc", type=float)
+    reconcile.add_argument("--fill-quantity", type=float)
+    reconcile.add_argument("--filled-at")
+    reconcile.add_argument("--fees", type=float)
+    reconcile.add_argument("--fee-bps", type=int)
     reconcile.add_argument("--database-url")
+    fee_reconcile = subparsers.add_parser(
+        "reconcile-live-fee",
+        help="Record audited venue fee evidence for an unresolved LIVE fill.",
+    )
+    fee_reconcile.add_argument("--config")
+    fee_reconcile.add_argument("--fill-id", required=True)
+    fee_reconcile.add_argument("--fees", type=float)
+    fee_reconcile.add_argument("--fee-bps", type=int)
+    fee_reconcile.add_argument("--slippage-bps", type=float)
+    fee_reconcile.add_argument("--reconciled-by", required=True)
+    fee_reconcile.add_argument("--evidence", required=True)
+    fee_reconcile.add_argument(
+        "--override",
+        action="store_true",
+        help="Explicitly replace existing fee telemetry and audit the override.",
+    )
+    fee_reconcile.add_argument("--database-url")
+    economics = subparsers.add_parser(
+        "reconcile-fill-economics",
+        help="Record audited side/venue/token/price fields for an incomplete fill.",
+    )
+    economics.add_argument("--config")
+    economics.add_argument("--fill-id", required=True)
+    economics.add_argument("--side", required=True, choices=("BUY", "SELL"))
+    economics.add_argument("--venue", required=True)
+    economics.add_argument("--token-id", required=True)
+    economics.add_argument("--fill-price", required=True, type=float)
+    economics.add_argument("--executed-at", required=True)
+    economics.add_argument("--operator", required=True)
+    economics.add_argument("--evidence", required=True)
+    economics.add_argument("--override", action="store_true")
+    economics.add_argument("--database-url")
+    provenance = subparsers.add_parser(
+        "tag-fill-provenance",
+        help="Audit and tag legacy fills with PAPER or LIVE provenance.",
+    )
+    provenance.add_argument("--config")
+    provenance.add_argument("--mode", required=True, choices=("paper", "live"))
+    provenance.add_argument("--operator", required=True)
+    provenance.add_argument("--evidence", required=True)
+    provenance.add_argument(
+        "--fill-id",
+        action="append",
+        dest="fill_ids",
+        help="Explicit legacy fill id to tag; repeat for each fill.",
+    )
+    provenance.add_argument(
+        "--all",
+        action="store_true",
+        help="Tag every untagged fill (requires --confirm).",
+    )
+    provenance.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Attest that the requested bulk provenance scope was reviewed.",
+    )
+    provenance.add_argument("--database-url")
     reconcile_live_order = subparsers.add_parser(
         "reconcile-live-order",
         help=(
@@ -224,6 +289,13 @@ async def _main_async(args: argparse.Namespace) -> int:
             reconciled_by = normalize_submission_unknown_reconciled_by(
                 cast(str, args.reconciled_by)
             )
+            filled_at = (
+                datetime.fromisoformat(
+                    cast(str, args.filled_at).replace("Z", "+00:00")
+                )
+                if args.filled_at
+                else None
+            )
         except ValueError as exc:
             _print_reconcile_failure(args, exc)
             return 1
@@ -241,15 +313,40 @@ async def _main_async(args: argparse.Namespace) -> int:
         try:
             try:
                 await ensure_schema_current(pool)
+                reconcile_kwargs: dict[str, object] = {
+                    "decision_id": decision_id,
+                    "venue_order_id": venue_order_id,
+                    "status": status,
+                    "reconciled_by": reconciled_by,
+                    "note": cast(str | None, args.note),
+                }
+                if any(
+                    value is not None
+                    for value in (
+                        args.fill_price,
+                        args.fill_notional_usdc,
+                        args.fill_quantity,
+                        args.filled_at,
+                        args.fees,
+                        args.fee_bps,
+                    )
+                ):
+                    reconcile_kwargs.update(
+                        {
+                            "fill_price": cast(float | None, args.fill_price),
+                            "fill_notional_usdc": cast(
+                                float | None,
+                                args.fill_notional_usdc,
+                            ),
+                            "fill_quantity": cast(float | None, args.fill_quantity),
+                            "filled_at": filled_at,
+                            "fees": cast(float | None, args.fees),
+                            "fee_bps": cast(int | None, args.fee_bps),
+                        }
+                    )
                 updated = await SubmissionUnknownReconciliationStore(
                     pool
-                ).reconcile_submission_unknown(
-                    decision_id=decision_id,
-                    venue_order_id=venue_order_id,
-                    status=status,
-                    reconciled_by=reconciled_by,
-                    note=cast(str | None, args.note),
-                )
+                ).reconcile_submission_unknown(**reconcile_kwargs)  # type: ignore[arg-type]
             except Exception as exc:  # noqa: BLE001
                 _print_reconcile_failure(args, exc, settings=settings)
                 return 1
@@ -273,6 +370,300 @@ async def _main_async(args: argparse.Namespace) -> int:
             )
         )
         return 0 if updated else 1
+    if args.command == "reconcile-fill-economics":
+        try:
+            operator = _require_operator_id(cast(str, args.operator), "operator")
+            evidence = _require_operator_text(cast(str, args.evidence), "evidence")
+            executed_at = datetime.fromisoformat(
+                cast(str, args.executed_at).replace("Z", "+00:00")
+            )
+            if executed_at.tzinfo is None:
+                raise ValueError("executed_at must include a timezone")
+            fill_price = float(args.fill_price)
+            if not math.isfinite(fill_price) or fill_price <= 0:
+                raise ValueError("fill_price must be finite and positive")
+        except (TypeError, ValueError) as exc:
+            print(json.dumps({"updated": False, "error": str(exc)}, sort_keys=True))
+            return 1
+        try:
+            settings = _load_cli_settings(cast(str | None, args.config))
+            pool = await asyncpg.create_pool(
+                dsn=args.database_url or settings.database.dsn,
+                min_size=1,
+                max_size=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"updated": False, "error": str(exc)}, sort_keys=True))
+            return 1
+        updated = False
+        try:
+            await ensure_schema_current(pool)
+            store = FillStore(pool)
+            updated = await store.reconcile_fill_economics(
+                cast(str, args.fill_id),
+                side=cast(str, args.side),
+                venue=cast(str, args.venue),
+                token_id=cast(str, args.token_id),
+                fill_price=fill_price,
+                executed_at=executed_at,
+                operator=operator,
+                evidence=evidence,
+                override=bool(args.override),
+            )
+            if updated:
+                try:
+                    await LiveEmergencyAuditWriter(
+                        Path(settings.live_emergency_audit_path)
+                    ).append_fill_economics_reconcile(
+                        fill_id=cast(str, args.fill_id),
+                        side=cast(str, args.side),
+                        venue=cast(str, args.venue),
+                        token_id=cast(str, args.token_id),
+                        fill_price=fill_price,
+                        executed_at=executed_at,
+                        operator=operator,
+                        evidence=evidence,
+                        override=bool(args.override),
+                    )
+                    if not await store.mark_fill_economics_audited(
+                        cast(str, args.fill_id)
+                    ):
+                        raise RuntimeError(
+                            "fill economics audit marker was not persisted"
+                        )
+                except Exception as economics_audit_error:  # noqa: BLE001
+                    print(
+                        json.dumps(
+                            {
+                                "updated": True,
+                                "audit_persisted": False,
+                                "fill_id": args.fill_id,
+                                "error": str(economics_audit_error),
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                    return 1
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"updated": False, "error": str(exc)}, sort_keys=True))
+            return 1
+        finally:
+            await pool.close()
+        print(
+            json.dumps(
+                {
+                    "updated": updated,
+                    "audit_persisted": updated,
+                    "fill_id": args.fill_id,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0 if updated else 1
+    if args.command == "tag-fill-provenance":
+        try:
+            operator = _require_operator_id(cast(str, args.operator), "operator")
+            evidence = _require_operator_text(cast(str, args.evidence), "evidence")
+            explicit_fill_ids = tuple(
+                fill_id.strip()
+                for fill_id in (args.fill_ids or [])
+                if fill_id.strip()
+            )
+            if bool(explicit_fill_ids) == bool(args.all):
+                raise ValueError("provide --fill-id or --all, but not both")
+            if args.all and not args.confirm:
+                raise ValueError("--all requires --confirm")
+            if explicit_fill_ids and args.confirm:
+                raise ValueError("--confirm is only valid with --all")
+        except (TypeError, ValueError) as exc:
+            print(json.dumps({"updated": False, "error": str(exc)}, sort_keys=True))
+            return 1
+        try:
+            settings = _load_cli_settings(cast(str | None, args.config))
+            pool = await asyncpg.create_pool(
+                dsn=args.database_url or settings.database.dsn,
+                min_size=1,
+                max_size=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"updated": False, "error": str(exc)}, sort_keys=True))
+            return 1
+        try:
+            await ensure_schema_current(pool)
+            fill_store = FillStore(pool)
+            target_fill_ids = (
+                explicit_fill_ids
+                if explicit_fill_ids
+                else tuple(await fill_store.untagged_fill_ids(limit=100_000))
+            )
+            tagged_count = await fill_store.tag_fill_provenance(
+                mode=cast(str, args.mode),
+                operator=operator,
+                evidence=evidence,
+                fill_ids=target_fill_ids,
+            )
+            try:
+                await LiveEmergencyAuditWriter(
+                    Path(settings.live_emergency_audit_path)
+                ).append_provenance_tag(
+                    mode=cast(str, args.mode),
+                    tagged_count=tagged_count,
+                    operator=operator,
+                    evidence=evidence,
+                    attestation="all" if args.all else "explicit",
+                    fill_ids=target_fill_ids,
+                )
+                marked = await fill_store.mark_provenance_tag_audited(target_fill_ids)
+                if marked != tagged_count:
+                    raise RuntimeError(
+                        "provenance audit marker count did not match tagged fills"
+                    )
+            except Exception as provenance_error:  # noqa: BLE001
+                print(
+                    json.dumps(
+                        {
+                            "updated": True,
+                            "audit_persisted": False,
+                            "mode": args.mode,
+                            "tagged_count": tagged_count,
+                            "error": str(provenance_error),
+                        },
+                        sort_keys=True,
+                    )
+                )
+                return 1
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"updated": False, "error": str(exc)}, sort_keys=True))
+            return 1
+        finally:
+            await pool.close()
+        print(
+            json.dumps(
+                {
+                    "updated": True,
+                    "mode": args.mode,
+                    "tagged_count": tagged_count,
+                    "operator": operator,
+                    "audit_persisted": True,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.command == "reconcile-live-fee":
+        try:
+            fill_id = _normalize_fee_reconcile_fill_id(cast(str, args.fill_id))
+            reconciled_by = normalize_submission_unknown_reconciled_by(
+                cast(str, args.reconciled_by)
+            )
+            evidence = _normalize_fee_reconcile_evidence(cast(str, args.evidence))
+            reconciled_by = _require_operator_id(reconciled_by, "reconciled_by")
+            evidence = _require_operator_text(evidence, "evidence")
+            fees = None if args.fees is None else float(args.fees)
+            if fees is not None and (not math.isfinite(fees) or fees < 0.0):
+                raise ValueError("fees must be finite and non-negative")
+            fee_bps = cast(int | None, args.fee_bps)
+            if fee_bps is not None and (isinstance(fee_bps, bool) or fee_bps < 0):
+                raise ValueError("fee_bps must be non-negative")
+            slippage_bps = cast(float | None, args.slippage_bps)
+            if slippage_bps is not None and not math.isfinite(slippage_bps):
+                raise ValueError("slippage_bps must be finite")
+            if fees is None and slippage_bps is None:
+                raise ValueError("fees or slippage_bps is required")
+        except (TypeError, ValueError) as exc:
+            _print_fee_reconcile_failure(args, exc)
+            return 1
+        try:
+            settings = _load_cli_settings(cast(str | None, args.config))
+        except Exception as exc:  # noqa: BLE001
+            _print_fee_reconcile_failure(args, exc)
+            return 1
+        database_url = args.database_url or settings.database.dsn
+        try:
+            pool = await asyncpg.create_pool(dsn=database_url, min_size=1, max_size=1)
+        except Exception as exc:  # noqa: BLE001
+            _print_fee_reconcile_failure(args, exc, settings=settings)
+            return 1
+        updated = False
+        audit_error: Exception | None = None
+        try:
+            try:
+                await ensure_schema_current(pool)
+                updated = await FillStore(pool).reconcile_fee(
+                    fill_id,
+                    fees=fees,
+                    fee_bps=fee_bps,
+                    slippage_bps=slippage_bps,
+                    reconciled_by=reconciled_by,
+                    evidence=evidence,
+                    override=bool(args.override),
+                    audit_pending=True,
+                )
+                if updated:
+                    try:
+                        await LiveEmergencyAuditWriter(
+                            Path(settings.live_emergency_audit_path)
+                        ).append_fee_reconcile(
+                            fill_id=fill_id,
+                            fees=fees,
+                            fee_bps=fee_bps,
+                            slippage_bps=slippage_bps,
+                            reconciled_by=reconciled_by,
+                            evidence=evidence,
+                            override=bool(args.override),
+                        )
+                        audit_marked = await FillStore(pool).mark_fee_reconcile_audited(
+                            fill_id
+                        )
+                        if not audit_marked:
+                            raise RuntimeError(
+                                "fee reconciliation audit marker was not persisted"
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        audit_error = exc
+            except Exception as exc:  # noqa: BLE001
+                _print_fee_reconcile_failure(args, exc, settings=settings)
+                return 1
+        finally:
+            await pool.close()
+        if audit_error is not None:
+            print(
+                json.dumps(
+                    {
+                        "updated": True,
+                        "audit_persisted": False,
+                        "fill_id": fill_id,
+                        "error": redact_live_error(str(audit_error), settings),
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 1
+        if not updated:
+            _print_fee_reconcile_failure(
+                args,
+                RuntimeError(
+                    "fill was not found or already has reconciled fee telemetry"
+                ),
+                settings=settings,
+            )
+            return 1
+        print(
+            json.dumps(
+                {
+                    "updated": True,
+                    "audit_persisted": True,
+                    "fill_id": fill_id,
+                    "fees": fees,
+                    "fee_bps": fee_bps,
+                    "reconciled_by": reconciled_by,
+                    "override": bool(args.override),
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+
     if args.command == "reconcile-live-order":
         try:
             decision_id = normalize_submission_unknown_decision_id(
@@ -718,6 +1109,52 @@ def _containing_working_tree_root(path: Path) -> Path | None:
     return None
 
 
+def _normalize_fee_reconcile_fill_id(fill_id: str) -> str:
+    normalized = fill_id.strip()
+    if normalized == "":
+        raise ValueError("fill_id is required")
+    if any(marker in normalized.lower() for marker in ("placeholder", "todo", "fill_in", "<", ">")):
+        raise ValueError("fill_id must not contain a placeholder")
+    return normalized
+
+
+def _normalize_fee_reconcile_evidence(evidence: str) -> str:
+    normalized = evidence.strip()
+    if normalized == "":
+        raise ValueError("evidence is required")
+    if any(character in normalized for character in ("\n", "\r")):
+        raise ValueError("evidence must not contain newlines")
+    if any(
+        marker in normalized.lower()
+        for marker in ("placeholder", "todo", "fill_in", "<", ">")
+    ):
+        raise ValueError("evidence must not contain a placeholder")
+    return normalized
+
+
+def _print_fee_reconcile_failure(
+    args: argparse.Namespace,
+    exc: Exception,
+    *,
+    settings: PMSSettings | None = None,
+) -> None:
+    error = (
+        redact_database_error(str(exc))
+        if settings is None
+        else redact_live_error(str(exc), settings)
+    )
+    print(
+        json.dumps(
+            {
+                "updated": False,
+                "fill_id": cast(str, args.fill_id),
+                "error": error,
+            },
+            sort_keys=True,
+        )
+    )
+
+
 def _print_reconcile_failure(
     args: argparse.Namespace,
     exc: Exception,
@@ -1084,7 +1521,12 @@ async def _portfolio_from_fill_store(
     *,
     total_budget_usdc: float,
 ) -> Portfolio:
-    positions = await FillStore(pool).read_positions()
+    store = FillStore(pool)
+    mode_reader = getattr(store, "read_positions_for_mode", None)
+    if callable(mode_reader):
+        positions = await mode_reader("live")
+    else:
+        positions = await store.read_positions()
     open_positions = [position for position in positions if position.shares_held > 0.0]
     locked_usdc = sum(position.locked_usdc for position in open_positions)
     return Portfolio(

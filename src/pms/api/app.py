@@ -127,6 +127,16 @@ class SubmissionUnknownReconcileRequest(BaseModel):
     status: Literal["filled", "not_found", "open"]
     reconciled_by: str
     note: str | None = None
+    fill_price: float | None = None
+    fill_notional_usdc: float | None = None
+    fill_quantity: float | None = None
+    filled_at: datetime | None = None
+    fees: float | None = None
+    fee_bps: int | None = None
+
+
+class HaltClearRequest(BaseModel):
+    cleared_by: str
 
 
 def create_app(
@@ -803,6 +813,12 @@ def create_app(
                 status=payload.status,
                 reconciled_by=reconciled_by,
                 note=payload.note,
+                fill_price=payload.fill_price,
+                fill_notional_usdc=payload.fill_notional_usdc,
+                fill_quantity=payload.fill_quantity,
+                filled_at=payload.filled_at,
+                fees=payload.fees,
+                fee_bps=payload.fee_bps,
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
@@ -819,6 +835,27 @@ def create_app(
             "decision_id": decision_id,
             "resolution": payload.status,
         }
+
+    @app.post(
+        "/live/halt/clear",
+        dependencies=[Depends(require_api_token)],
+    )
+    async def clear_live_halt(payload: HaltClearRequest) -> dict[str, str]:
+        try:
+            remaining_halt = await active_runner.clear_live_halt(
+                cleared_by=payload.cleared_by
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        response = {
+            "status": "cleared" if remaining_halt is None else "clear_recorded",
+            "cleared_by": payload.cleared_by,
+        }
+        if remaining_halt is not None:
+            response["active_trigger_kind"] = remaining_halt.trigger_kind
+        return response
 
     @app.post("/config", dependencies=[Depends(require_api_token)])
     async def update_config(update: ConfigUpdate) -> dict[str, str]:

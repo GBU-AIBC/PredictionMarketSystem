@@ -2,13 +2,21 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
-from decimal import Decimal
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 import json
+import logging
+import math
 from typing import Any, cast
 
 import asyncpg
 
+from pms.core.enums import Side
+from pms.core.validation import (
+    validate_notional,
+    validate_positive,
+    validate_price,
+)
 from pms.core.models import FillRecord, Position, Venue
 
 
@@ -18,6 +26,11 @@ CREATE TABLE IF NOT EXISTS fill_payloads (
     payload JSONB NOT NULL
 )
 """
+
+logger = logging.getLogger(__name__)
+
+_NOTIONAL_TOLERANCE_USDC = Decimal("0.01")
+_NOTIONAL_TOLERANCE_RATIO = Decimal("0.005")
 
 
 @dataclass
@@ -157,7 +170,417 @@ class FillStore:
             )
         return row is not None
 
+    async def reconcile_fee(
+        self,
+        fill_id: str,
+        *,
+        fees: float | None,
+        fee_bps: int | None = None,
+        slippage_bps: float | None = None,
+        reconciled_by: str | None = None,
+        evidence: str | None = None,
+        override: bool = False,
+        audit_pending: bool = True,
+    ) -> bool:
+        """Record verified venue fee telemetry for an unresolved fill once."""
+        if not fill_id.strip():
+            raise ValueError("fill_id is required")
+        if fees is not None and (not math.isfinite(fees) or fees < 0.0):
+            raise ValueError("fees must be finite and non-negative")
+        if fee_bps is not None and (
+            isinstance(fee_bps, bool)
+            or not isinstance(fee_bps, int)
+            or fee_bps < 0
+        ):
+            raise ValueError("fee_bps must be a non-negative integer")
+        if slippage_bps is not None and not math.isfinite(slippage_bps):
+            raise ValueError("slippage_bps must be finite")
+        if (reconciled_by is None) != (evidence is None):
+            raise ValueError("reconciled_by and evidence must be provided together")
+        if reconciled_by is not None and not reconciled_by.strip():
+            raise ValueError("reconciled_by is required")
+        if evidence is not None and not evidence.strip():
+            raise ValueError("evidence is required")
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    SELECT payload
+                    FROM fill_payloads
+                    WHERE fill_id = $1
+                    FOR UPDATE
+                    """,
+                    fill_id,
+                )
+                if row is None or row["payload"] is None:
+                    return False
+                payload = _json_object(row["payload"])
+                existing_fees = payload.get("fees")
+                if existing_fees is not None:
+                    if fees is not None and not override:
+                        return False
+                    if fees is None and slippage_bps is None:
+                        return False
+                    if fees is not None and override and reconciled_by is None:
+                        raise ValueError(
+                            "fee override requires reconciled_by and evidence"
+                        )
+                if existing_fees is None and fees is None:
+                    raise ValueError("fees are required for an unresolved fee")
+                if fees is not None:
+                    payload["fees"] = fees
+                    payload["fee_bps"] = fee_bps
+                if reconciled_by is not None and evidence is not None:
+                    payload["fee_reconciled_by"] = reconciled_by.strip()
+                    payload["fee_reconcile_evidence"] = evidence.strip()
+                flags = [
+                    flag
+                    for flag in _string_list(payload.get("anomaly_flags"))
+                    if flag != "fee_unreconciled"
+                    and not flag.startswith("fee_reconciled")
+                    and (
+                        slippage_bps is None
+                        or not flag.startswith("execution_slippage_bps=")
+                    )
+                ]
+                flags.append(
+                    "fee_reconciled"
+                    if existing_fees is None
+                    else "fee_overridden"
+                    if fees is not None
+                    else "slippage_reconciled"
+                )
+                if slippage_bps is not None:
+                    flags.append(f"execution_slippage_bps={slippage_bps:.9f}")
+                payload["anomaly_flags"] = flags
+                if audit_pending:
+                    payload["fee_reconcile_audit_pending"] = True
+                await connection.execute(
+                    """
+                    UPDATE fill_payloads
+                    SET payload = $2::jsonb
+                    WHERE fill_id = $1
+                    """,
+                    fill_id,
+                    json.dumps(payload),
+                )
+        return True
+
+    async def mark_fee_reconcile_audited(self, fill_id: str) -> bool:
+        """Clear the fail-closed audit marker after the external audit append."""
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            row = await connection.fetchrow(
+                """
+                UPDATE fill_payloads
+                SET payload = payload - 'fee_reconcile_audit_pending'
+                WHERE fill_id = $1
+                  AND payload->>'fee_reconcile_audit_pending' = 'true'
+                RETURNING fill_id
+                """,
+                fill_id,
+            )
+        return row is not None
+
+    async def untagged_fill_ids(self, *, limit: int = 20) -> list[str]:
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            rows = await connection.fetch(
+                """
+                SELECT fills.fill_id
+                FROM fills
+                LEFT JOIN fill_payloads ON fill_payloads.fill_id = fills.fill_id
+                WHERE fill_payloads.payload IS NULL
+                   OR payload->>'provenance_tag_audit_pending' = 'true'
+                   OR NOT EXISTS (
+                       SELECT 1
+                       FROM jsonb_array_elements_text(
+                           COALESCE(fill_payloads.payload->'anomaly_flags', '[]'::jsonb)
+                       ) AS flag
+                       WHERE flag IN (
+                           'run_mode=backtest', 'run_mode=paper', 'run_mode=live'
+                       )
+                   )
+                ORDER BY fills.ts ASC, fills.fill_id ASC
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [str(row["fill_id"]) for row in rows]
+
+    async def incomplete_fill_ids(
+        self,
+        *,
+        run_mode: str | None = None,
+        limit: int = 20,
+    ) -> list[str]:
+        ids, _ = await self.incomplete_fill_summary(run_mode=run_mode, limit=limit)
+        return ids
+
+    async def incomplete_fill_summary(
+        self,
+        *,
+        run_mode: str | None = None,
+        limit: int = 20,
+    ) -> tuple[list[str], int]:
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            rows = await connection.fetch(
+                """
+                SELECT
+                    fills.fill_id,
+                    fills.fill_quantity,
+                    fills.fill_notional_usdc,
+                    fill_payloads.payload
+                FROM fills
+                LEFT JOIN fill_payloads ON fill_payloads.fill_id = fills.fill_id
+                WHERE ($1::text IS NULL OR EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements_text(
+                        COALESCE(fill_payloads.payload->'anomaly_flags', '[]'::jsonb)
+                    ) AS flag
+                    WHERE flag = 'run_mode=' || $1
+                ))
+                ORDER BY fills.ts ASC, fills.fill_id ASC
+                """,
+                run_mode,
+            )
+        ids = [
+            str(row["fill_id"])
+            for row in rows
+            if not _row_has_fill_economics(row)
+            or _json_object(row["payload"]).get("economics_audit_pending") is True
+        ]
+        return ids[:limit], len(ids)
+
+    async def tag_fill_provenance(
+        self,
+        *,
+        mode: str,
+        operator: str,
+        evidence: str,
+        fill_ids: Sequence[str] | None = None,
+    ) -> int:
+        normalized_mode = mode.strip().lower()
+        if normalized_mode not in {"paper", "live"}:
+            raise ValueError("mode must be paper or live")
+        if not operator.strip() or not evidence.strip():
+            raise ValueError("operator and evidence are required")
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            async with connection.transaction():
+                if fill_ids is not None:
+                    rows = await connection.fetch(
+                        """
+                        SELECT fills.fill_id, fill_payloads.payload
+                        FROM fills
+                        LEFT JOIN fill_payloads
+                            ON fill_payloads.fill_id = fills.fill_id
+                        WHERE fills.fill_id = ANY($1::text[])
+                          AND (
+                              fill_payloads.payload IS NULL
+                              OR fill_payloads.payload->>'provenance_tag_audit_pending' = 'true'
+                              OR NOT EXISTS (
+                                  SELECT 1
+                                  FROM jsonb_array_elements_text(
+                                      COALESCE(fill_payloads.payload->'anomaly_flags', '[]'::jsonb)
+                                  ) AS flag
+                                  WHERE flag IN (
+                                      'run_mode=backtest', 'run_mode=paper', 'run_mode=live'
+                                  )
+                              )
+                          )
+                        FOR UPDATE OF fills
+                        """,
+                        list(fill_ids),
+                    )
+                else:
+                    rows = await connection.fetch(
+                        """
+                        SELECT fills.fill_id, fill_payloads.payload
+                        FROM fills
+                        LEFT JOIN fill_payloads
+                            ON fill_payloads.fill_id = fills.fill_id
+                        WHERE fill_payloads.payload IS NULL
+                           OR fill_payloads.payload->>'provenance_tag_audit_pending' = 'true'
+                           OR NOT EXISTS (
+                               SELECT 1
+                               FROM jsonb_array_elements_text(
+                                   COALESCE(fill_payloads.payload->'anomaly_flags', '[]'::jsonb)
+                               ) AS flag
+                               WHERE flag IN (
+                                   'run_mode=backtest', 'run_mode=paper', 'run_mode=live'
+                               )
+                           )
+                        FOR UPDATE OF fills
+                        """
+                    )
+                for row in rows:
+                    payload = (
+                        _json_object(row["payload"])
+                        if row["payload"] is not None
+                        else {"anomaly_flags": []}
+                    )
+                    flags = [
+                        flag
+                        for flag in _string_list(payload.get("anomaly_flags"))
+                        if not flag.startswith("run_mode=")
+                    ]
+                    flags.append(f"run_mode={normalized_mode}")
+                    payload["anomaly_flags"] = flags
+                    payload["provenance_tagged_by"] = operator.strip()
+                    payload["provenance_tag_evidence"] = evidence.strip()
+                    payload["provenance_tagged_at"] = datetime.now(tz=UTC).isoformat()
+                    payload["provenance_tag_audit_pending"] = True
+                    await connection.execute(
+                        """
+                        INSERT INTO fill_payloads (fill_id, payload)
+                        VALUES ($1, $2::jsonb)
+                        ON CONFLICT (fill_id) DO UPDATE
+                        SET payload = EXCLUDED.payload
+                        """,
+                        row["fill_id"],
+                        json.dumps(payload),
+                    )
+        return len(rows)
+
+    async def mark_provenance_tag_audited(self, fill_ids: Sequence[str]) -> int:
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            rows = await connection.fetch(
+                """
+                UPDATE fill_payloads
+                SET payload = payload - 'provenance_tag_audit_pending'
+                WHERE fill_id = ANY($1::text[])
+                  AND payload->>'provenance_tag_audit_pending' = 'true'
+                RETURNING fill_id
+                """,
+                list(fill_ids),
+            )
+        return len(rows)
+
+    async def reconcile_fill_economics(
+        self,
+        fill_id: str,
+        *,
+        side: str,
+        venue: str,
+        token_id: str,
+        fill_price: float,
+        executed_at: datetime,
+        operator: str,
+        evidence: str,
+        override: bool = False,
+    ) -> bool:
+        if not fill_id.strip() or not token_id.strip() or not venue.strip():
+            raise ValueError("fill_id, venue, and token_id are required")
+        normalized_side = side.strip().upper()
+        if normalized_side not in {"BUY", "SELL"}:
+            raise ValueError("side must be BUY or SELL")
+        fill_price = validate_price(fill_price, field_name="fill_price")
+        if venue.strip().lower() not in {"polymarket", "kalshi"}:
+            raise ValueError("venue must be a supported venue")
+        if executed_at.tzinfo is None:
+            raise ValueError("executed_at must include a timezone")
+        if not operator.strip() or not evidence.strip():
+            raise ValueError("operator and evidence are required")
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    SELECT fills.fill_quantity, fills.fill_notional_usdc,
+                           fill_payloads.payload
+                    FROM fills
+                    LEFT JOIN fill_payloads
+                        ON fill_payloads.fill_id = fills.fill_id
+                    WHERE fills.fill_id = $1
+                    FOR UPDATE OF fills
+                    """,
+                    fill_id,
+                )
+                if row is None or row["payload"] is None:
+                    return False
+                payload = _json_object(row["payload"])
+                if _payload_has_fill_economics(payload) and not override:
+                    return False
+                if not _notional_matches_price(
+                    quantity=row["fill_quantity"],
+                    notional=row["fill_notional_usdc"],
+                    price=fill_price,
+                ):
+                    raise ValueError(
+                        "fill_notional_usdc does not match fill_quantity * fill_price"
+                    )
+                payload.update(
+                    {
+                        # A legacy fills row has no decision sidecar; these
+                        # explicit synthetic links keep replay idempotent.
+                        "trade_id": payload.get("trade_id", f"reconciled:{fill_id}"),
+                        "decision_id": payload.get(
+                            "decision_id", f"reconciled:{fill_id}"
+                        ),
+                        "side": normalized_side,
+                        "venue": venue.strip(),
+                        "token_id": token_id.strip(),
+                        "fill_price": fill_price,
+                        "executed_at": executed_at.isoformat(),
+                        "status": payload.get("status", "filled"),
+                        "economics_reconciled_by": operator.strip(),
+                        "economics_reconcile_evidence": evidence.strip(),
+                        "economics_audit_pending": True,
+                        "economics_override": override,
+                    }
+                )
+                await connection.execute(
+                    "UPDATE fill_payloads SET payload = $2::jsonb WHERE fill_id = $1",
+                    fill_id,
+                    json.dumps(payload),
+                )
+        return True
+
+    async def mark_fill_economics_audited(self, fill_id: str) -> bool:
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            row = await connection.fetchrow(
+                """
+                UPDATE fill_payloads
+                SET payload = payload - 'economics_audit_pending'
+                WHERE fill_id = $1
+                  AND payload->>'economics_audit_pending' = 'true'
+                RETURNING fill_id
+                """,
+                fill_id,
+            )
+        return row is not None
+
     async def read_positions(self) -> list[Position]:
+        return await self._read_positions(run_mode=None)
+
+    async def read_positions_for_mode(self, run_mode: str) -> list[Position]:
+        return await self._read_positions(run_mode=run_mode)
+
+    async def read_fee_total_for_mode(self, run_mode: str) -> float:
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            rows = await connection.fetch(
+                "SELECT payload FROM fill_payloads"
+            )
+        total = Decimal("0")
+        for row in rows:
+            payload = _json_object(row["payload"])
+            mode = _run_mode_from_anomaly_flags(payload.get("anomaly_flags"))
+            if mode != run_mode and not (
+                mode is None and run_mode in {"paper", "backtest"}
+            ):
+                continue
+            fees = _decimal_or_none(payload.get("fees"))
+            if fees is not None and fees >= 0:
+                total += fees
+        return float(total)
+
+    async def _read_positions(self, *, run_mode: str | None) -> list[Position]:
         async with self._pool().acquire() as connection:
             await _ensure_fill_payloads_table(connection)
             rows = await connection.fetch(
@@ -170,12 +593,12 @@ class FillStore:
                     fills.fill_quantity,
                     fills.strategy_id,
                     fills.strategy_version_id,
+                    fill_payloads.payload,
                     fill_payloads.payload->>'token_id' AS token_id,
                     fill_payloads.payload->>'venue' AS venue,
                     fill_payloads.payload->>'side' AS side,
                     fill_payloads.payload->>'risk_group_id' AS risk_group_id,
-                    (fill_payloads.payload->>'fill_price')::double precision
-                        AS fill_price,
+                    (fill_payloads.payload->>'fill_price')::double precision AS fill_price,
                     COALESCE(
                         clob_marks.best_bid,
                         CASE
@@ -246,6 +669,27 @@ class FillStore:
                     fills.fill_id ASC
                 """
             )
+        if run_mode is not None:
+            rows = [
+                row
+                for row in rows
+                if (
+                    _run_mode_from_anomaly_flags(
+                        _json_object(row["payload"]).get("anomaly_flags")
+                    )
+                    == run_mode
+                    or (
+                        run_mode in {"paper", "backtest"}
+                        and _run_mode_from_anomaly_flags(
+                            _json_object(row["payload"]).get("anomaly_flags")
+                        )
+                        is None
+                    )
+                )
+                and _row_has_fill_economics(row)
+            ]
+        else:
+            rows = [row for row in rows if _row_has_fill_economics(row)]
         return _positions_from_fill_rows(rows)
 
     async def read_trades(
@@ -257,38 +701,113 @@ class FillStore:
     ) -> list["StoredTradeRow"]:
         async with self._pool().acquire() as connection:
             await _ensure_fill_payloads_table(connection)
-            rows = await connection.fetch(
-                """
-                SELECT
-                    fills.fill_id,
-                    fills.order_id,
-                    fills.market_id,
-                    fills.ts,
-                    fills.fill_notional_usdc,
-                    fills.fill_quantity,
-                    fills.strategy_id,
-                    fills.strategy_version_id,
-                    fill_payloads.payload,
-                    COALESCE(markets.question, fills.market_id) AS question
-                FROM fills
-                LEFT JOIN fill_payloads
-                    ON fill_payloads.fill_id = fills.fill_id
-                LEFT JOIN markets
-                    ON markets.condition_id = fills.market_id
-                WHERE ($1::timestamptz IS NULL OR fills.ts < $1)
-                ORDER BY fills.ts DESC, fills.fill_id DESC
-                LIMIT $2
-                OFFSET $3
-                """,
-                until,
-                limit,
-                offset,
+            rows = await self._fetch_trade_rows(
+                connection, limit=limit, offset=offset, until=until, ascending=False
             )
-        return [
-            _trade_from_row(row)
-            for row in rows
-            if row["payload"] is not None
-        ]
+        return _trade_rows_for_api(rows)
+
+    async def read_trades_for_replay(
+        self,
+        *,
+        page_size: int = 10_000,
+    ) -> list["StoredTradeRow"]:
+        """Read every fill in one repeatable snapshot, oldest first.
+
+        API callers use ``read_trades`` and must retain newest-first ordering;
+        startup replay has different ordering and consistency requirements.
+        """
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            async with connection.transaction():
+                await connection.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                )
+                count_row = await connection.fetchrow(
+                    "SELECT COUNT(*) AS fill_count FROM fills"
+                )
+                expected_count = int(count_row["fill_count"])
+                rows: list[asyncpg.Record] = []
+                offset = 0
+                while offset < expected_count:
+                    page = await self._fetch_trade_rows(
+                        connection,
+                        limit=page_size,
+                        offset=offset,
+                        until=None,
+                        ascending=True,
+                    )
+                    if not page:
+                        raise RuntimeError(
+                            "durable fill replay truncated before expected row count "
+                            f"({offset} of {expected_count})"
+                        )
+                    rows.extend(page)
+                    offset += len(page)
+                    if len(page) < page_size and offset < expected_count:
+                        raise RuntimeError(
+                            "durable fill replay returned a short page before expected "
+                            f"row count ({offset} of {expected_count})"
+                        )
+                if len(rows) != expected_count:
+                    raise RuntimeError(
+                        "durable fill replay row count mismatch "
+                        f"({len(rows)} of {expected_count})"
+                    )
+                return [_trade_from_row(row) for row in rows]
+
+    async def _fetch_trade_rows(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        limit: int,
+        offset: int,
+        until: datetime | None,
+        ascending: bool,
+    ) -> list[asyncpg.Record]:
+        order = (
+            "fills.ts ASC, fill_payloads.payload->>'executed_at' ASC NULLS LAST, "
+            "fills.order_id ASC, fills.fill_id ASC"
+            if ascending
+            else "fills.ts DESC, fills.fill_id DESC"
+        )
+        return cast(
+            list[asyncpg.Record],
+            await connection.fetch(
+            f"""
+            SELECT
+                fills.fill_id,
+                fills.order_id,
+                fills.market_id,
+                fills.ts,
+                fills.fill_notional_usdc,
+                fills.fill_quantity,
+                fills.strategy_id,
+                fills.strategy_version_id,
+                fill_payloads.payload,
+                COALESCE(markets.question, fills.market_id) AS question
+            FROM fills
+            LEFT JOIN fill_payloads
+                ON fill_payloads.fill_id = fills.fill_id
+            LEFT JOIN markets
+                ON markets.condition_id = fills.market_id
+            WHERE ($1::timestamptz IS NULL OR fills.ts < $1)
+            ORDER BY {order}
+            LIMIT $2
+            OFFSET $3
+            """,
+            until,
+            limit,
+            offset,
+            ),
+        )
+
+    async def count_trades(self) -> int:
+        """Return the complete durable fill count for replay truncation checks."""
+        async with self._pool().acquire() as connection:
+            row = await connection.fetchrow("SELECT COUNT(*) AS fill_count FROM fills")
+        return int(row["fill_count"])
 
     def _pool(self) -> asyncpg.Pool:
         if self.pool is None:
@@ -318,7 +837,10 @@ class StoredTradeRow:
     strategy_version_id: str
     fee_bps: int | None = None
     fees: float | None = None
+    slippage_bps: float | None = None
     risk_group_id: str | None = None
+    run_mode: str | None = None
+    fee_reconcile_audit_pending: bool = False
 
 
 class _PositionAccumulator:
@@ -616,30 +1138,144 @@ def _float_or_none(value: object | None) -> float | None:
     return float(cast(float, value))
 
 
-def _trade_from_row(row: asyncpg.Record) -> StoredTradeRow:
-    payload = _json_object(row["payload"])
-    return StoredTradeRow(
-        trade_id=cast(str, payload["trade_id"]),
-        fill_id=cast(str, row["fill_id"]),
-        order_id=cast(str, row["order_id"]),
-        decision_id=cast(str, payload["decision_id"]),
-        market_id=cast(str, row["market_id"]),
-        question=cast(str, row["question"]),
-        token_id=cast(str | None, payload.get("token_id")),
-        venue=cast(Venue, payload["venue"]),
-        side=cast(str, payload["side"]),
-        fill_price=cast(float, payload["fill_price"]),
-        fill_notional_usdc=cast(float, row["fill_notional_usdc"]),
-        fill_quantity=cast(float, row["fill_quantity"]),
-        executed_at=datetime.fromisoformat(cast(str, payload["executed_at"])),
-        filled_at=cast(datetime, row["ts"]),
-        status=cast(str, payload["status"]),
-        strategy_id=cast(str, row["strategy_id"]),
-        strategy_version_id=cast(str, row["strategy_version_id"]),
-        fee_bps=cast(int | None, payload.get("fee_bps")),
-        fees=cast(float | None, payload.get("fees")),
-        risk_group_id=cast(str | None, payload.get("risk_group_id")),
+def _row_has_fill_economics(row: asyncpg.Record) -> bool:
+    try:
+        payload_value = row["payload"]
+    except KeyError:
+        # Narrow position-reader test doubles predate the sidecar column.
+        return True
+    if payload_value is None:
+        return False
+    try:
+        payload = _json_object(payload_value)
+        if not _payload_has_fill_economics(payload):
+            return False
+        quantity = validate_positive(
+            _optional_row_value(row, "fill_quantity"), field_name="fill_quantity"
+        )
+        notional = validate_notional(
+            _optional_row_value(row, "fill_notional_usdc"),
+            field_name="fill_notional_usdc",
+        )
+        return _notional_matches_price(
+            quantity=quantity,
+            notional=notional,
+            price=payload["fill_price"],
+        )
+    except (RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _payload_has_fill_economics(payload: dict[str, Any]) -> bool:
+    try:
+        side = payload.get("side")
+        venue = payload.get("venue")
+        token_id = payload.get("token_id")
+        if not isinstance(side, str) or side.strip().upper() not in {
+            Side.BUY.value,
+            Side.SELL.value,
+        }:
+            return False
+        if not isinstance(venue, str) or venue.strip().lower() not in {
+            "polymarket",
+            "kalshi",
+        }:
+            return False
+        if not isinstance(token_id, str) or not token_id.strip():
+            return False
+        validate_price(payload["fill_price"], field_name="fill_price")
+        if "fees" in payload and payload["fees"] is not None:
+            validate_notional(payload["fees"], field_name="fees")
+        return True
+    except (RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _notional_matches_price(
+    *, quantity: object, notional: object, price: object
+) -> bool:
+    """Check persisted notional against quantity × execution price.
+
+    The absolute floor covers cent-level rounding while the relative bound
+    keeps tolerance proportional for larger fills. Decimal arithmetic avoids
+    binary float drift at this trust boundary.
+    """
+    try:
+        quantity_dec = Decimal(
+            str(validate_positive(quantity, field_name="fill_quantity"))
+        )
+        notional_dec = Decimal(
+            str(validate_notional(notional, field_name="fill_notional_usdc"))
+        )
+        price_dec = Decimal(str(validate_price(price, field_name="fill_price")))
+    except (
+        InvalidOperation,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return False
+    expected = quantity_dec * price_dec
+    tolerance = max(
+        _NOTIONAL_TOLERANCE_USDC,
+        abs(expected) * _NOTIONAL_TOLERANCE_RATIO,
     )
+    return abs(notional_dec - expected) <= tolerance
+
+
+def _trade_from_row(row: asyncpg.Record) -> StoredTradeRow:
+    fill_id = str(row["fill_id"])
+    try:
+        payload = _json_object(row["payload"])
+        fill_quantity = float(row["fill_quantity"])
+        fill_notional = float(row["fill_notional_usdc"])
+        return StoredTradeRow(
+            trade_id=cast(str, payload["trade_id"]),
+            fill_id=cast(str, row["fill_id"]),
+            order_id=cast(str, row["order_id"]),
+            decision_id=cast(str, payload["decision_id"]),
+            market_id=cast(str, row["market_id"]),
+            question=cast(str, row["question"]),
+            token_id=cast(str, payload["token_id"]),
+            venue=cast(Venue, payload["venue"]),
+            side=cast(str, payload["side"]),
+            fill_price=cast(float, payload["fill_price"]),
+            fill_notional_usdc=fill_notional,
+            fill_quantity=fill_quantity,
+            executed_at=datetime.fromisoformat(cast(str, payload["executed_at"])),
+            filled_at=cast(datetime, row["ts"]),
+            status=cast(str, payload["status"]),
+            strategy_id=cast(str, row["strategy_id"]),
+            strategy_version_id=cast(str, row["strategy_version_id"]),
+            fee_bps=cast(int | None, payload.get("fee_bps")),
+            fees=cast(float | None, payload.get("fees")),
+            slippage_bps=_slippage_from_anomaly_flags(payload.get("anomaly_flags")),
+            risk_group_id=cast(str | None, payload.get("risk_group_id")),
+            run_mode=_run_mode_from_anomaly_flags(payload.get("anomaly_flags")),
+            fee_reconcile_audit_pending=bool(
+                payload.get("fee_reconcile_audit_pending", False)
+            ),
+        )
+    except (RuntimeError, json.JSONDecodeError, TypeError, ValueError, KeyError) as error:
+        raise RuntimeError(
+            f"fill {fill_id} has missing or malformed fill_payloads sidecar"
+        ) from error
+
+
+def _trade_rows_for_api(rows: Sequence[asyncpg.Record]) -> list[StoredTradeRow]:
+    trades: list[StoredTradeRow] = []
+    for row in rows:
+        try:
+            trades.append(_trade_from_row(row))
+        except (RuntimeError, json.JSONDecodeError, TypeError, ValueError, KeyError) as error:
+            fill_id = str(row["fill_id"])
+            logger.warning(
+                "skipping fill %s with missing or malformed fill_payloads sidecar: %s",
+                fill_id,
+                error,
+            )
+    return trades
 
 
 def _json_object(value: object) -> dict[str, Any]:
@@ -657,3 +1293,24 @@ def _string_list(value: object) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value]
     return []
+
+
+def _slippage_from_anomaly_flags(value: object) -> float | None:
+    for flag in _string_list(value):
+        prefix = "execution_slippage_bps="
+        if not flag.startswith(prefix):
+            continue
+        try:
+            return float(flag[len(prefix) :])
+        except ValueError:
+            return None
+    return None
+
+
+def _run_mode_from_anomaly_flags(value: object) -> str | None:
+    prefix = "run_mode="
+    for flag in _string_list(value):
+        if flag.startswith(prefix):
+            mode = flag[len(prefix) :].strip().lower()
+            return mode if mode in {"backtest", "paper", "live"} else None
+    return None

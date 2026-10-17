@@ -30,6 +30,7 @@ from pms.actuator.adapters.polymarket import (
     PolymarketRoutingQuoteProvider,
     PolymarketSDKClient,
     PolymarketSubmissionUnknownError,
+    PolymarketVenueRejectionError,
     PolymarketVenueAccountReconciler,
 )
 from pms.actuator.executor import (
@@ -44,7 +45,7 @@ from pms.actuator.exit_monitor import (
     mark_position_from_signal,
 )
 from pms.actuator.feedback import ActuatorFeedback
-from pms.actuator.risk import RiskManager
+from pms.actuator.risk import HaltState, RiskManager, RiskTradeResult
 from pms.config import PMSSettings, validate_live_mode_ready
 from pms.controller._price_utils import best_ask
 from pms.controller.baselines import (
@@ -85,6 +86,7 @@ from pms.core.models import (
     VenueAccountSnapshot as VenueAccountSnapshot,
     VenueCredentials,
 )
+from pms.core.validation import normalize_resolved_outcome
 from pms.artifact_path_safety import (
     require_path_outside_working_tree,
     require_private_parent,
@@ -134,8 +136,12 @@ from pms.storage.decision_store import DecisionStore
 from pms.storage.eval_store import EvalStore
 from pms.storage.feedback_store import FeedbackStore
 from pms.storage.fill_store import FillStore
+from pms.storage.live_emergency_audit import (
+    LiveEmergencyAuditWriter,
+    read_active_halt,
+    read_last_halt_clear,
+)
 from pms.storage.first_order_audit import JsonlFirstOrderAuditWriter
-from pms.storage.live_emergency_audit import LiveEmergencyAuditWriter
 from pms.storage.market_data_store import PostgresMarketDataStore
 from pms.storage.market_resolution_store import MarketResolutionStore
 from pms.storage.market_subscription_store import PostgresMarketSubscriptionStore
@@ -480,6 +486,8 @@ class Runner:
         default=None,
     )
     _live_trading_suspended_reason: str | None = field(init=False, default=None)
+    _risk_peak_equity: float = field(init=False, default=0.0)
+    _persisted_halt_triggered_at: datetime | None = field(init=False, default=None)
     _live_preflight_artifact_validated: bool = field(init=False, default=False)
     _live_preflight_active_strategies_fingerprint: str | None = field(
         init=False,
@@ -493,6 +501,8 @@ class Runner:
                 total_budget_usdc=self.config.risk.max_total_exposure,
             )
         self.state = RunnerState(mode=self.config.mode)
+        self._risk_peak_equity = self.portfolio.total_usdc
+        self._persisted_halt_triggered_at = None
         self._controller_factory = ControllerPipelineFactory(settings=self.config)
         self._evaluator_spool = EvalSpool(
             store=self.eval_store,
@@ -713,6 +723,7 @@ class Runner:
                 # default while the venue actually holds real exposure. See
                 # also `_reconcile_portfolio_from_db`.
                 await self._reconcile_portfolio_from_db()
+                await self._reconcile_risk_from_db()
                 if self.config.mode == RunMode.LIVE:
                     await self._reconcile_venue_account()
             self._active_sensors = self._build_sensors()
@@ -879,6 +890,7 @@ class Runner:
                 self.portfolio,
                 total_budget_usdc=self.config.risk.max_total_exposure,
             )
+        self._risk_peak_equity = _portfolio_equity(self.portfolio)
         self.actuator_executor = self._build_executor(new_mode)
 
     async def wait_until_idle(self) -> None:
@@ -1593,9 +1605,16 @@ class Runner:
         self.actuator_executor = self._build_executor(self.config.mode)
 
     def _build_executor(self, mode: RunMode) -> ActuatorExecutor:
+        risk = RiskManager(self.config.risk)
+        if mode == RunMode.LIVE:
+            persisted_halt = read_active_halt(
+                Path(self.config.live_emergency_audit_path)
+            )
+            if persisted_halt is not None:
+                risk.restore_halt(persisted_halt)
         return ActuatorExecutor(
             adapter=self._build_adapter(mode),
-            risk=RiskManager(self.config.risk),
+            risk=risk,
             feedback=ActuatorFeedback(self.feedback_store),
             dedup_store=self._build_dedup_store(),
             event_bus=self.event_bus,
@@ -1975,6 +1994,7 @@ class Runner:
                     dedup_acquired=work_item.dedup_acquired,
                     paper_orderbook=work_item.paper_orderbook,
                 )
+                await self._persist_active_halt_if_needed()
                 _append_bounded(self.state.orders, order_state)
                 try:
                     await self.order_store.insert(order_state)
@@ -1988,18 +2008,39 @@ class Runner:
                         )
                     logger.warning("order persistence failed: %s", error)
                 self._record_live_order_risk_reservation(order_state)
-                # LIVE fills get their real fee from venue reconciliation; for
-                # paper/backtest, model it from the configured rate so net-edge
-                # metrics are not inflated.
+                live_fill = self.config.mode == RunMode.LIVE
+                # Every LIVE adapter path must carry venue fee evidence; fee
+                # estimation is reserved for PAPER/BACKTEST and cannot be
+                # selected by adapter duck typing.
                 fill_fee_rate = (
                     None
-                    if self.config.mode == RunMode.LIVE
+                    if live_fill
                     else self._paper_fill_fee_rate(decision)
                 )
                 fill = _fill_from_order(
                     order_state, decision, signal, fee_rate=fill_fee_rate
                 )
                 if fill is not None:
+                    run_mode_flag = f"run_mode={self.config.mode.value}"
+                    if run_mode_flag not in fill.anomaly_flags:
+                        fill = replace(
+                            fill,
+                            anomaly_flags=[*fill.anomaly_flags, run_mode_flag],
+                        )
+                fee_unreconciled = bool(
+                    live_fill and fill is not None and fill.fees is None
+                )
+                if fill is not None:
+                    realized_result = _risk_trade_result_from_fill(
+                        self.portfolio,
+                        fill,
+                        decision=decision,
+                    )
+                    risk_manager = getattr(self.actuator_executor, "risk", None)
+                    if realized_result is not None and risk_manager is not None:
+                        risk_manager.record_trade_result(
+                            realized_result
+                        )
                     _append_bounded(self.state.fills, fill)
                     if _is_selection_funnel_entry_fill(fill):
                         increment_metric(SELECTION_FUNNEL_TRADED_TOTAL_METRIC)
@@ -2015,6 +2056,14 @@ class Runner:
                             )
                         logger.warning("fill persistence failed: %s", error)
                     self.portfolio = _portfolio_with_fill(self.portfolio, fill)
+                    self.portfolio = _portfolio_with_risk_drawdown(
+                        self.portfolio,
+                        peak_equity=self._risk_peak_equity,
+                    )
+                    self._risk_peak_equity = max(
+                        self._risk_peak_equity,
+                        _portfolio_equity(self.portfolio),
+                    )
                     self._record_position_exit_reentry_quarantine(fill, decision)
                     decision_evidence = work_item.decision_evidence
                     if not decision_evidence and signal is not None:
@@ -2054,6 +2103,16 @@ class Runner:
                     current_status="submitted",
                     next_status=_decision_status_from_order(order_state),
                 )
+                if fee_unreconciled:
+                    await self._hard_halt_live_persistence_failure(
+                        phase="live_fill_fee",
+                        decision=decision,
+                        order_state=order_state,
+                        error=RuntimeError(
+                            "LIVE venue fill fee is unavailable; fill persisted "
+                            "with fee_unreconciled and new risk is suspended"
+                        ),
+                    )
             except PolymarketSubmissionUnknownError as error:
                 detail = _runtime_error_detail(error, self.config)
                 self._live_trading_suspended_reason = "submission_unknown"
@@ -2092,6 +2151,32 @@ class Runner:
                 )
             except LivePersistenceFailureError:
                 raise
+            except LiveTradingDisabledError as error:
+                reason = (
+                    "operator_gate_denied"
+                    if type(error).__name__ == "OperatorApprovalRequiredError"
+                    else (
+                        "venue_rejection"
+                        if isinstance(error, PolymarketVenueRejectionError)
+                        else "live_disabled"
+                    )
+                )
+                await self._update_decision_status_if_supported(
+                    decision.decision_id,
+                    current_status="submitted",
+                    next_status=(
+                        "venue_rejected"
+                        if isinstance(error, PolymarketVenueRejectionError)
+                        else "rejected"
+                    ),
+                )
+                await self.event_bus.publish(
+                    "error",
+                    f"live decision rejected ({reason}): "
+                    f"{_runtime_error_detail(error, self.config)}",
+                    market_id=decision.market_id,
+                    decision_id=decision.decision_id,
+                )
             except Exception as error:
                 detail = _runtime_error_detail(error, self.config)
                 await self.event_bus.publish(
@@ -2822,6 +2907,47 @@ class Runner:
             )
             return False
 
+    async def _persist_active_halt_if_needed(self) -> None:
+        if self.config.mode != RunMode.LIVE:
+            return
+        risk_manager = getattr(self.actuator_executor, "risk", None)
+        if risk_manager is None or not callable(
+            getattr(risk_manager, "active_halt", None)
+        ):
+            return
+        state = risk_manager.active_halt()
+        if state is None or state.triggered_at == self._persisted_halt_triggered_at:
+            return
+        try:
+            await LiveEmergencyAuditWriter(
+                Path(self.config.live_emergency_audit_path)
+            ).append_halt(state)
+        except Exception as error:  # noqa: BLE001
+            # A halt audit failure must not clear or bypass the in-memory
+            # breaker; surface the failure and keep LIVE suspended.
+            logger.error("live halt persistence failed: %s", error)
+            self._live_trading_suspended_reason = "halt_persistence_failure"
+            return
+        self._persisted_halt_triggered_at = state.triggered_at
+
+    async def clear_live_halt(self, *, cleared_by: str) -> HaltState | None:
+        if self.config.mode != RunMode.LIVE:
+            raise RuntimeError("halt clear is only available in LIVE mode")
+        audit_writer = LiveEmergencyAuditWriter(
+            Path(self.config.live_emergency_audit_path)
+        )
+        await audit_writer.append_halt_clear(cleared_by=cleared_by)
+        self.actuator_executor.risk.clear_halt(preserve_open_orders=True)
+        self.portfolio = replace(self.portfolio, max_drawdown_pct=None)
+        self._risk_peak_equity = _portfolio_equity(self.portfolio)
+        self._persisted_halt_triggered_at = None
+        remaining = self.actuator_executor.risk.check_auto_halt(self.portfolio)
+        if not remaining.halted:
+            return None
+        await audit_writer.append_halt(remaining)
+        self._persisted_halt_triggered_at = remaining.triggered_at
+        return remaining
+
     async def _hard_halt_live_persistence_failure(
         self,
         *,
@@ -3112,7 +3238,56 @@ class Runner:
         if pool is None:
             return
         try:
-            persisted_positions = await self.fill_store.read_positions()
+            fee_reader = getattr(self.fill_store, "read_fee_total_for_mode", None)
+            if callable(fee_reader) and isinstance(
+                getattr(self.fill_store, "pool", None), asyncpg.Pool
+            ):
+                reconciled_fee_total = await fee_reader(self.config.mode.value)
+            else:
+                reconciled_fee_total = 0.0
+            mode_reader = getattr(self.fill_store, "read_positions_for_mode", None)
+            if callable(mode_reader) and isinstance(
+                getattr(self.fill_store, "pool", None), asyncpg.Pool
+            ):
+                legacy_fill_ids = await self.fill_store.untagged_fill_ids()
+                if legacy_fill_ids and self.config.mode == RunMode.LIVE:
+                    raise RuntimeError(
+                        "LIVE portfolio reconciliation found untagged legacy fills: "
+                        + ", ".join(legacy_fill_ids)
+                        + "; run pms-live tag-fill-provenance --mode live "
+                        "--operator <operator> --evidence <evidence>"
+                    )
+                if legacy_fill_ids:
+                    logger.warning(
+                        "treating %d untagged legacy fills as PAPER provenance: %s",
+                        len(legacy_fill_ids),
+                        ", ".join(legacy_fill_ids),
+                    )
+                incomplete_fill_ids, incomplete_total = await self.fill_store.incomplete_fill_summary(
+                    run_mode=self.config.mode.value
+                )
+                if incomplete_fill_ids and self.config.mode == RunMode.LIVE:
+                    raise RuntimeError(
+                        "LIVE portfolio reconciliation found economically incomplete "
+                        "fills: "
+                        + ", ".join(incomplete_fill_ids)
+                        + (f" (+{incomplete_total - len(incomplete_fill_ids)} more)" if incomplete_total > len(incomplete_fill_ids) else "")
+                        + "; run pms-live reconcile-fill-economics --fill-id <fill-id> "
+                        "with verified ledger fields"
+                    )
+                if incomplete_fill_ids:
+                    logger.warning(
+                        "excluding %d economically incomplete fills from %s portfolio: %s",
+                        len(incomplete_fill_ids),
+                        self.config.mode.value,
+                        ", ".join(incomplete_fill_ids),
+                    )
+            if callable(mode_reader) and isinstance(
+                getattr(self.fill_store, "pool", None), asyncpg.Pool
+            ):
+                persisted_positions = await mode_reader(self.config.mode.value)
+            else:
+                persisted_positions = await self.fill_store.read_positions()
         except Exception as error:  # noqa: BLE001
             if self.config.mode == RunMode.LIVE:
                 # Fail closed in LIVE: silent degradation here recreates
@@ -3143,9 +3318,10 @@ class Runner:
             self.portfolio = replace(
                 self.portfolio,
                 locked_usdc=0.0,
-                free_usdc=total_budget,
+                free_usdc=max(0.0, total_budget - reconciled_fee_total),
                 open_positions=[],
             )
+            self._risk_peak_equity = _portfolio_equity(self.portfolio)
             logger.info(
                 "Reconciled portfolio from DB: 0 positions, $0.00 locked of $%.2f total",
                 total_budget,
@@ -3162,19 +3338,217 @@ class Runner:
             )
             free_usdc = 0.0
         else:
-            free_usdc = total_budget - total_locked
+            free_usdc = max(0.0, total_budget - total_locked - reconciled_fee_total)
         self.portfolio = replace(
             self.portfolio,
             locked_usdc=total_locked,
             free_usdc=free_usdc,
             open_positions=open_positions,
         )
+        self._risk_peak_equity = _portfolio_equity(self.portfolio)
         logger.info(
             "Reconciled portfolio from DB: %d positions, $%.2f locked of $%.2f total",
             len(open_positions),
             total_locked,
             total_budget,
         )
+
+    async def _reconcile_risk_from_db(self) -> None:
+        """Rebuild realized-loss telemetry before allowing LIVE orders."""
+        if self._pg_pool is None:
+            return
+        fill_pool = getattr(self.fill_store, "pool", None)
+        if not isinstance(fill_pool, asyncpg.Pool):
+            # Test doubles and explicitly in-memory runners can carry a
+            # sentinel _pg_pool for lifecycle tests without durable fills.
+            return
+        try:
+            replay_reader = getattr(self.fill_store, "read_trades_for_replay", None)
+            if callable(replay_reader):
+                trades = await replay_reader(page_size=10_000)
+            else:
+                # Compatibility for narrow test doubles; FillStore uses the
+                # repeatable-snapshot reader above in production.
+                expected_count = await self.fill_store.count_trades()
+                trades = []
+                offset = 0
+                while offset < expected_count:
+                    page = await self.fill_store.read_trades(
+                        limit=10_000, offset=offset
+                    )
+                    if not page:
+                        raise RuntimeError(
+                            "durable fill replay truncated before expected row count "
+                            f"({len(trades)} of {expected_count})"
+                        )
+                    trades.extend(page)
+                    offset += len(page)
+        except Exception as error:  # noqa: BLE001
+            if self.config.mode == RunMode.LIVE:
+                detail = _runtime_error_detail(error, self.config)
+                raise RuntimeError(
+                    "LIVE risk telemetry reconciliation failed "
+                    f"({type(error).__name__}: {detail}); refusing to start "
+                    "without verified trade results"
+                ) from error
+            logger.warning("risk telemetry reconciliation failed: %s", error)
+            return
+        risk_manager = getattr(self.actuator_executor, "risk", None)
+        if risk_manager is None or not callable(getattr(risk_manager, "active_halt", None)):
+            return
+        positions: dict[tuple[str, str | None, str, str, str], tuple[float, float, str]] = {}
+        cumulative_pnl = Decimal("0")
+        peak_equity = Decimal(str(self.portfolio.total_usdc))
+        max_drawdown_pct = Decimal(str(self.portfolio.max_drawdown_pct or 0.0))
+        clear_cutoff = read_last_halt_clear(
+            Path(self.config.live_emergency_audit_path)
+        )
+        if self.config.mode == RunMode.LIVE:
+            unknown_provenance = [
+                trade.fill_id
+                for trade in trades
+                if trade.run_mode is None and isinstance(self.fill_store, FillStore)
+            ]
+            if unknown_provenance:
+                shown = unknown_provenance[:20]
+                omitted = len(unknown_provenance) - len(shown)
+                suffix = f"; {omitted} more" if omitted > 0 else ""
+                raise RuntimeError(
+                    "LIVE risk telemetry has fills with unknown run mode: "
+                    + ", ".join(shown)
+                    + suffix
+                    + "; backfill durable run_mode provenance before restarting"
+                )
+        if isinstance(self.fill_store, FillStore):
+            legacy_count = sum(trade.run_mode is None for trade in trades)
+            if legacy_count and self.config.mode in {RunMode.PAPER, RunMode.BACKTEST}:
+                logger.warning(
+                    "treating %d untagged legacy fills as PAPER provenance during risk replay",
+                    legacy_count,
+                )
+            trades = [
+                trade
+                for trade in trades
+                if trade.run_mode == self.config.mode.value
+                or (
+                    trade.run_mode is None
+                    and self.config.mode in {RunMode.PAPER, RunMode.BACKTEST}
+                )
+            ]
+        if self.config.mode == RunMode.LIVE:
+            unresolved_telemetry: list[str] = []
+            for trade in trades:
+                missing: list[str] = []
+                if trade.fees is None:
+                    missing.append("fee")
+                if trade.slippage_bps is None:
+                    missing.append("execution_slippage")
+                if trade.fee_reconcile_audit_pending:
+                    missing.append("fee_audit")
+                if missing:
+                    unresolved_telemetry.append(
+                        f"{trade.fill_id} ({', '.join(missing)})"
+                    )
+            if unresolved_telemetry:
+                shown = unresolved_telemetry[:20]
+                omitted = len(unresolved_telemetry) - len(shown)
+                suffix = f"; {omitted} more" if omitted > 0 else ""
+                raise RuntimeError(
+                    "LIVE risk telemetry has unresolved fills: "
+                    + ", ".join(shown)
+                    + suffix
+                    + "; reconcile telemetry with: pms-live "
+                    "reconcile-live-fee --fill-id <fill-id> "
+                    "[--fees <venue-fee>] "
+                    "[--slippage-bps <execution-slippage-bps>] "
+                    "--reconciled-by <operator> --evidence <venue-evidence> "
+                    "[--override]"
+                )
+        clear_day_start = (
+            clear_cutoff.astimezone(UTC).replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            if clear_cutoff is not None
+            else None
+        )
+        for trade in sorted(
+            trades,
+            key=lambda item: (
+                item.filled_at,
+                item.executed_at,
+                item.order_id,
+                item.fill_id,
+            ),
+        ):
+            include_risk_telemetry = (
+                clear_day_start is None or trade.filled_at >= clear_day_start
+            )
+            key = (
+                trade.market_id,
+                trade.token_id,
+                trade.venue,
+                trade.strategy_id,
+                trade.strategy_version_id,
+            )
+            shares, avg_price, side = positions.get(key, (0.0, 0.0, trade.side))
+            if shares > 1e-9 and side != trade.side:
+                closing = min(shares, trade.fill_quantity)
+                direction = Decimal("1") if side.upper() == "BUY" else Decimal("-1")
+                pnl = (
+                    direction
+                    * (Decimal(str(trade.fill_price)) - Decimal(str(avg_price)))
+                    * Decimal(str(closing))
+                    - Decimal(str(trade.fees or 0.0))
+                )
+                if include_risk_telemetry:
+                    risk_manager.record_trade_result(
+                        RiskTradeResult(
+                            pnl=float(pnl),
+                            slippage_bps=trade.slippage_bps or 0.0,
+                            filled_at=trade.filled_at,
+                            trace_id=trade.trade_id,
+                        )
+                    )
+                    cumulative_pnl += pnl
+                    equity = Decimal(str(self.portfolio.total_usdc)) + cumulative_pnl
+                    peak_equity = max(peak_equity, equity)
+                    if peak_equity > 0:
+                        max_drawdown_pct = max(
+                            max_drawdown_pct,
+                            (peak_equity - equity) / peak_equity * Decimal("100"),
+                        )
+                shares -= closing
+                if shares <= 1e-9:
+                    positions.pop(key, None)
+                else:
+                    positions[key] = (shares, avg_price, side)
+                if trade.fill_quantity <= closing + 1e-9:
+                    continue
+                trade_quantity = trade.fill_quantity - closing
+                positions[key] = (trade_quantity, trade.fill_price, trade.side)
+                continue
+            if shares <= 1e-9:
+                positions[key] = (trade.fill_quantity, trade.fill_price, trade.side)
+            else:
+                total_shares = shares + trade.fill_quantity
+                avg_price = float(
+                    (
+                        Decimal(str(avg_price)) * Decimal(str(shares))
+                        + Decimal(str(trade.fill_price))
+                        * Decimal(str(trade.fill_quantity))
+                    )
+                    / Decimal(str(total_shares))
+                )
+                positions[key] = (total_shares, avg_price, side)
+        if max_drawdown_pct > 0:
+            self.portfolio = replace(
+                self.portfolio,
+                max_drawdown_pct=float(max_drawdown_pct),
+            )
+        self._risk_peak_equity = _portfolio_equity(self.portfolio)
 
     async def _reconcile_venue_account(self) -> None:
         if self.config.mode != RunMode.LIVE:
@@ -4210,7 +4584,22 @@ def _fill_from_order(
     # synthesize over it. Formula matches ExecutionModel.compute_fee.
     fees: float | None = None
     fee_bps: int | None = None
-    if fee_rate is not None:
+    anomaly_flags: list[str] = []
+    venue_fee = order_state.pre_submit_quote.get("fees")
+    if venue_fee is not None:
+        try:
+            fees = float(venue_fee)
+        except (TypeError, ValueError):
+            fees = None
+        if fees is not None and not isfinite(fees):
+            fees = None
+        raw_fee_bps = order_state.pre_submit_quote.get("fee_bps")
+        if raw_fee_bps is not None:
+            try:
+                fee_bps = int(raw_fee_bps)
+            except (TypeError, ValueError):
+                fee_bps = None
+    if fees is None and fee_rate is not None:
         effective_fee_rate = (
             market_fee_rate_from_metadata(
                 signal.external_signal,
@@ -4225,6 +4614,25 @@ def _fill_from_order(
             * (1.0 - order_state.fill_price)
         )
         fee_bps = int(effective_fee_rate * 10_000)
+        anomaly_flags.append("fee_estimated")
+    elif fees is None:
+        anomaly_flags.append("fee_unreconciled")
+    if decision.limit_price > 0.0:
+        if (decision.action or decision.side).upper() == "BUY":
+            execution_slippage_bps = (
+                (order_state.fill_price - decision.limit_price)
+                / decision.limit_price
+                * 10_000.0
+            )
+        else:
+            execution_slippage_bps = (
+                (decision.limit_price - order_state.fill_price)
+                / decision.limit_price
+                * 10_000.0
+            )
+        anomaly_flags.append(
+            f"execution_slippage_bps={execution_slippage_bps:.9f}"
+        )
 
     return FillRecord(
         trade_id=order_state.order_id,
@@ -4240,7 +4648,7 @@ def _fill_from_order(
         executed_at=order_state.submitted_at,
         filled_at=order_state.last_updated_at,
         status=order_state.status,
-        anomaly_flags=[],
+        anomaly_flags=anomaly_flags,
         strategy_id=decision.strategy_id,
         strategy_version_id=decision.strategy_version_id,
         resolved_outcome=_resolved_outcome(signal),
@@ -4301,20 +4709,32 @@ def _is_open_order_state(order_state: OrderState) -> bool:
 
 def _portfolio_with_fill(portfolio: Portfolio, fill: FillRecord) -> Portfolio:
     positions = list(portfolio.open_positions)
-    fill_size = fill.fill_notional_usdc
+    fill_size_dec = Decimal(str(fill.fill_notional_usdc))
+    fill_fees_dec = Decimal(str(fill.fees or 0.0))
+    fill_size = float(fill_size_dec)
+    fill_fees = float(fill_fees_dec)
     contracts = _filled_contracts(fill)
     for index, position in enumerate(positions):
         if _same_position(position, fill):
-            new_shares = position.shares_held + contracts
-            avg_entry_price = (
-                position.avg_entry_price * position.shares_held
-                + fill.fill_price * contracts
-            ) / new_shares
+            new_shares_dec = Decimal(str(position.shares_held)) + Decimal(
+                str(contracts)
+            )
+            avg_entry_price = float(
+                (
+                    Decimal(str(position.avg_entry_price))
+                    * Decimal(str(position.shares_held))
+                    + Decimal(str(fill.fill_price)) * Decimal(str(contracts))
+                )
+                / new_shares_dec
+            )
+            new_shares = float(new_shares_dec)
             positions[index] = replace(
                 position,
                 shares_held=new_shares,
                 avg_entry_price=avg_entry_price,
-                locked_usdc=position.locked_usdc + fill_size,
+                locked_usdc=float(
+                    Decimal(str(position.locked_usdc)) + fill_size_dec
+                ),
                 current_price=fill.fill_price,
                 risk_group_id=position.risk_group_id or fill.risk_group_id,
             )
@@ -4336,7 +4756,7 @@ def _portfolio_with_fill(portfolio: Portfolio, fill: FillRecord) -> Portfolio:
                     )
                 return replace(
                     portfolio,
-                    free_usdc=portfolio.free_usdc + fill_size,
+                    free_usdc=portfolio.free_usdc + fill_size - fill_fees,
                     locked_usdc=max(0.0, portfolio.locked_usdc - released_locked),
                     open_positions=positions,
                 )
@@ -4359,9 +4779,82 @@ def _portfolio_with_fill(portfolio: Portfolio, fill: FillRecord) -> Portfolio:
         )
     return replace(
         portfolio,
-        free_usdc=portfolio.free_usdc - fill_size,
+        free_usdc=portfolio.free_usdc - fill_size - fill_fees,
         locked_usdc=portfolio.locked_usdc + fill_size,
         open_positions=positions,
+    )
+
+
+def _portfolio_equity(portfolio: Portfolio) -> float:
+    return portfolio.free_usdc + portfolio.locked_usdc + sum(
+        position.unrealized_pnl for position in portfolio.open_positions
+    )
+
+
+def _portfolio_with_risk_drawdown(
+    portfolio: Portfolio,
+    *,
+    peak_equity: float,
+) -> Portfolio:
+    equity = Decimal(str(_portfolio_equity(portfolio)))
+    peak = Decimal(str(peak_equity))
+    if peak <= 0:
+        return portfolio
+    drawdown_pct = max(Decimal("0"), (peak - equity) / peak * Decimal("100"))
+    prior = Decimal(str(portfolio.max_drawdown_pct or 0.0))
+    return replace(
+        portfolio,
+        max_drawdown_pct=float(max(prior, drawdown_pct)),
+    )
+
+
+def _risk_trade_result_from_fill(
+    portfolio: Portfolio,
+    fill: FillRecord,
+    *,
+    decision: TradeDecision | None = None,
+) -> RiskTradeResult | None:
+    """Return realized PnL for the closing portion of a fill, if any."""
+    closing = next(
+        (
+            position
+            for position in portfolio.open_positions
+            if _opposes_position(position, fill)
+        ),
+        None,
+    )
+    if closing is None:
+        return None
+    contracts = min(closing.shares_held, fill.fill_quantity)
+    if contracts <= 1e-9:
+        return None
+    direction = Decimal("1") if closing.side.upper() == "BUY" else Decimal("-1")
+    contracts_decimal = Decimal(str(contracts))
+    pnl_decimal = (
+        direction
+        * (Decimal(str(fill.fill_price)) - Decimal(str(closing.avg_entry_price)))
+        * contracts_decimal
+        - Decimal(str(fill.fees or 0.0))
+    )
+    slippage_decimal = Decimal("0")
+    if decision is not None and decision.limit_price > 0.0:
+        if fill.side.upper() == "BUY":
+            slippage_decimal = (
+                (Decimal(str(fill.fill_price)) - Decimal(str(decision.limit_price)))
+                / Decimal(str(decision.limit_price))
+                * Decimal("10000")
+            )
+        else:
+            slippage_decimal = (
+                (Decimal(str(decision.limit_price)) - Decimal(str(fill.fill_price)))
+                / Decimal(str(decision.limit_price))
+                * Decimal("10000")
+            )
+    return RiskTradeResult(
+        pnl=float(pnl_decimal),
+        slippage_bps=float(slippage_decimal),
+        filled_at=fill.filled_at,
+        trace_id=fill.trade_id,
     )
 
 
@@ -4406,10 +4899,7 @@ def _opposes_position(position: Position, fill: FillRecord) -> bool:
 def _resolved_outcome(signal: MarketSignal | None) -> float | None:
     if signal is None:
         return None
-    raw_outcome = signal.external_signal.get("resolved_outcome")
-    if raw_outcome is not None:
-        return min(max(float(raw_outcome), 0.0), 1.0)
-    return None
+    return normalize_resolved_outcome(signal.external_signal.get("resolved_outcome"))
 
 
 def _coerce_actuator_work_item(
