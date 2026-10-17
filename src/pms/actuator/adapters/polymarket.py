@@ -83,6 +83,10 @@ class OperatorApprovalRequiredError(LiveTradingDisabledError):
     """Raised when a required live-order operator approval is absent."""
 
 
+class PolymarketVenueRejectionError(LiveTradingDisabledError):
+    """Raised when the venue returned a definitive order rejection."""
+
+
 class PolymarketSubmissionUnknownError(RuntimeError):
     """Raised when a Polymarket order submission timed out — the order may
     have reached the venue. Operators must reconcile before retrying.
@@ -660,7 +664,7 @@ class PolymarketSDKClient:
                 "Polymarket live order submission failed "
                 f"({type(exc).__name__}); venue error redacted"
             )
-            raise LiveTradingDisabledError(msg) from None
+            raise PolymarketVenueRejectionError(msg) from None
 
         return _order_result_from_sdk_response(order, response)
 
@@ -970,6 +974,8 @@ class PolymarketActuator:
                         "operator approval consume failed after unknown submit: %s",
                         consume_error,
                     )
+                    if self.settings.polymarket.operator_approval_mode == "every_order":
+                        self._approval_state.consume_failed = True
                 await self._emit_audit(
                     event="approval_consumed",
                     preview=preview,
@@ -988,6 +994,8 @@ class PolymarketActuator:
                         "operator approval consume failed after cancelled submit: %s",
                         consume_error,
                     )
+                    if self.settings.polymarket.operator_approval_mode == "every_order":
+                        self._approval_state.consume_failed = True
                 await self._emit_audit(
                     event="approval_consumed",
                     preview=preview,
@@ -1010,7 +1018,7 @@ class PolymarketActuator:
             # failure handling below is forensic, not transactional.
             self._approval_state.approved = True
             try:
-                await self.operator_gate.consume(preview)
+                await asyncio.shield(self.operator_gate.consume(preview))
             except Exception as exc:  # noqa: BLE001
                 detail = _redacted_settings_exception_message(exc, self.settings)
                 # Record the truth: cleanup failed, the artefact may
@@ -1030,12 +1038,32 @@ class PolymarketActuator:
                     preview=preview,
                     approver_id=approver_id,
                 )
-            else:
+            except asyncio.CancelledError as exc:
+                if self.settings.polymarket.operator_approval_mode == "every_order":
+                    self._approval_state.consume_failed = True
                 await self._emit_audit(
-                    event="approval_consumed",
+                    event="approval_consume_failed",
                     preview=preview,
                     approver_id=approver_id,
                 )
+                raise PolymarketSubmissionUnknownError(
+                    "Polymarket live submission bookkeeping was cancelled; order "
+                    "status is unknown — reconcile with venue before retrying",
+                    order_state=order_state,
+                ) from exc
+            else:
+                try:
+                    await self._emit_audit(
+                        event="approval_consumed",
+                        preview=preview,
+                        approver_id=approver_id,
+                    )
+                except asyncio.CancelledError as exc:
+                    raise PolymarketSubmissionUnknownError(
+                        "Polymarket live submission bookkeeping was cancelled; "
+                        "order status is unknown — reconcile with venue before retrying",
+                        order_state=order_state,
+                    ) from exc
 
         return order_state
 
@@ -2089,27 +2117,44 @@ def _approval_payload_matches(
         return False
     if payload.get("max_slippage_bps") != preview.max_slippage_bps:
         return False
-    if not _float_close(payload.get("max_notional_usdc"), preview.max_notional_usdc):
+    approved_notional = _numeric_approval_value(payload.get("max_notional_usdc"))
+    if approved_notional is None:
         return False
-    if not _float_close(payload.get("limit_price"), preview.limit_price):
+    notional_tolerance = _approval_tolerance(approved_notional)
+    if preview.side.upper() == "BUY":
+        if not math.isclose(
+            preview.max_notional_usdc,
+            approved_notional,
+            rel_tol=0.0,
+            abs_tol=min(0.0005, notional_tolerance),
+        ):
+            return False
+    elif preview.max_notional_usdc > approved_notional + notional_tolerance:
+        return False
+    approved_price = _numeric_approval_value(payload.get("limit_price"))
+    if approved_price is None:
+        return False
+    price_tolerance = _approval_tolerance(approved_price)
+    if preview.side.upper() == "BUY":
+        if preview.limit_price > approved_price + price_tolerance:
+            return False
+    elif preview.limit_price < approved_price - price_tolerance:
         return False
     return True
 
 
-def _float_close(value: object, expected: float) -> bool:
-    # Operators copy/paste preview values into the approval JSON. Strict `==`
-    # comparison fails on harmless float representation differences (e.g.
-    # 0.1 + 0.2) and trains the operator to massage values until equality
-    # holds. `math.isclose` keeps the gate strict (rel/abs tolerances are
-    # tight) without introducing such drift.
+def _numeric_approval_value(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return False
-    # Approval is a bounded quote, not a promise that a moving mark will be
-    # byte-identical when the operator's file is consumed. Keep the bound
-    # deliberately tight (25 bps, with a half-tick floor) so stale or resized
-    # orders remain denied while ordinary rounding and one-tick movement pass.
-    tolerance = max(0.0005, abs(expected) * 0.0025)
-    return math.isclose(float(value), expected, rel_tol=0.0, abs_tol=tolerance)
+        return None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) else None
+
+
+def _approval_tolerance(expected: float) -> float:
+    # One Polymarket cent tick plus a small representation tolerance. The
+    # approval remains a one-sided ceiling/floor and cannot authorize a wider
+    # move or resize than this bounded mark window.
+    return max(0.0005, min(0.01, abs(expected) * 0.01))
 
 
 def _approval_payload_hash(payload: Mapping[str, object]) -> str:
@@ -3023,13 +3068,48 @@ def _compare_positions(
                 f"{key}: DB={db_position.shares_held:.8f} "
                 f"venue={venue_position.shares_held:.8f}"
             )
+            mismatches.extend(
+                _strategy_position_residuals(
+                    db_positions,
+                    key,
+                    venue_position.shares_held,
+                    share_tolerance,
+                )
+            )
         if abs(db_position.locked_usdc - venue_position.locked_usdc) > notional_tolerance:
             mismatches.append(
                 "position notional mismatch "
                 f"{key}: DB={db_position.locked_usdc:.8f} "
                 f"venue={venue_position.locked_usdc:.8f}"
             )
+            mismatches.extend(
+                _strategy_position_residuals(
+                    db_positions,
+                    key,
+                    venue_position.shares_held,
+                    share_tolerance,
+                )
+            )
     return mismatches
+
+
+def _strategy_position_residuals(
+    db_positions: Sequence[Position],
+    key: tuple[str, str | None, str],
+    venue_shares: float,
+    tolerance: float,
+) -> list[str]:
+    rows = [position for position in db_positions if _position_key(position) == key]
+    total = sum(position.shares_held for position in rows)
+    if len(rows) <= 1 or total <= tolerance:
+        return []
+    return [
+        "strategy position residual "
+        f"{position.strategy_id}@{position.strategy_version_id}: "
+        f"allocated={venue_shares * position.shares_held / total:.8f} "
+        f"db={position.shares_held:.8f}"
+        for position in rows
+    ]
 
 
 def _aggregate_positions_by_contract(

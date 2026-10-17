@@ -6,7 +6,10 @@ from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
-from pms.actuator.adapters.polymarket import PolymarketSubmissionUnknownError
+from pms.actuator.adapters.polymarket import (
+    PolymarketSubmissionUnknownError,
+    PolymarketVenueRejectionError,
+)
 from pms.actuator.feedback import ActuatorFeedback
 from pms.actuator.risk import InsufficientLiquidityError, RiskManager
 from pms.alerting.events import HaltEvent as AlertHaltEvent
@@ -107,6 +110,11 @@ class ActuatorExecutor:
                     final_state,
                     reason="submission_unknown",
                 )
+                raise
+            except PolymarketVenueRejectionError:
+                final_state = _rejected_order_state(decision, "venue_rejection")
+                release_outcome = "venue_rejection"
+                await self.feedback.generate(final_state, reason="venue_rejection")
                 raise
             except LiveTradingDisabledError as error:
                 # Gate failures are terminal decision outcomes, not venue
@@ -210,9 +218,6 @@ def _rejected_order_state(decision: TradeDecision, reason: str) -> OrderState:
 def _live_gate_reason(error: LiveTradingDisabledError) -> str:
     if type(error).__name__ == "OperatorApprovalRequiredError":
         return "operator_gate_denied"
-    message = str(error).lower()
-    if "disabled" in message or "mode=live" in message:
-        return "live_disabled"
     return "live_disabled"
 
 

@@ -140,6 +140,30 @@ def read_active_halt(path: Path) -> HaltState | None:
     return active
 
 
+def read_last_halt_clear(path: Path) -> datetime | None:
+    """Return the latest durable operator clear timestamp, if any."""
+    try:
+        raw_lines = path.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, OSError):
+        return None
+    latest: datetime | None = None
+    for line in raw_lines:
+        try:
+            payload = json.loads(line)
+            if not isinstance(payload, Mapping) or payload.get("phase") != "risk_halt_clear":
+                continue
+            value = datetime.fromisoformat(
+                str(payload["timestamp"]).replace("Z", "+00:00")
+            )
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=UTC)
+            if latest is None or value > latest:
+                latest = value
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return latest
+
+
 def _manual_stop_record(
     *,
     stopped_by: str,

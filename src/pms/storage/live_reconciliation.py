@@ -116,6 +116,14 @@ class SubmissionUnknownReconciliationStore:
                 fee_bps,
             )
         )
+        if status == "filled" and not has_fill_evidence and isinstance(
+            self.pool,
+            asyncpg.Pool,
+        ):
+            raise ValueError(
+                "filled reconciliation requires fill_price, "
+                "fill_notional_usdc, and fill_quantity"
+            )
         if status == "filled" and has_fill_evidence:
             if fill_price is None or fill_notional_usdc is None or fill_quantity is None:
                 raise ValueError(
@@ -367,18 +375,18 @@ async def _insert_reconciled_fill(
             fill_quantity, strategy_id, strategy_version_id
         )
         SELECT
-            $1,
-            $2,
+            $1::text,
+            $2::text,
             decision_payloads.payload->>'market_id',
-            $3,
-            $4,
-            $5,
+            $3::timestamptz,
+            $4::double precision,
+            $5::double precision,
             decisions.strategy_id,
             decisions.strategy_version_id
         FROM decisions
         LEFT JOIN decision_payloads
             ON decision_payloads.decision_id = decisions.decision_id
-        WHERE decisions.decision_id = $6
+        WHERE decisions.decision_id = $6::text
         ON CONFLICT (fill_id) DO NOTHING
         """,
         fill_id,
@@ -392,10 +400,10 @@ async def _insert_reconciled_fill(
         """
         INSERT INTO fill_payloads (fill_id, payload)
         SELECT
-            $1,
+            $1::text,
             jsonb_build_object(
-                'trade_id', $1,
-                'decision_id', $2,
+                'trade_id', $1::text,
+                'decision_id', $2::text,
                 'token_id', decision_payloads.payload->>'token_id',
                 'venue', COALESCE(decision_payloads.payload->>'venue', 'polymarket'),
                 'side', COALESCE(
@@ -403,19 +411,19 @@ async def _insert_reconciled_fill(
                     decision_payloads.payload->>'side',
                     'BUY'
                 ),
-                'fill_price', $3,
-                'executed_at', $4,
+                'fill_price', $3::double precision,
+                'executed_at', $4::text,
                 'status', 'filled',
                 'anomaly_flags', jsonb_build_array('reconciled_from_submission_unknown'),
-                'fee_bps', $5,
-                'fees', $6,
+                'fee_bps', $5::integer,
+                'fees', $6::double precision,
                 'liquidity_side', NULL,
-                'transaction_ref', $7,
+                'transaction_ref', $7::text,
                 'resolved_outcome', NULL,
-                'risk_group_id', NULL
+                'risk_group_id', decision_payloads.payload->'risk_group_id'
             )
         FROM decision_payloads
-        WHERE decision_payloads.decision_id = $2
+        WHERE decision_payloads.decision_id = $2::text
         ON CONFLICT (fill_id) DO NOTHING
         """,
         fill_id,

@@ -9,7 +9,7 @@ from pms.config import RiskSettings
 from pms.core.enums import ReasonCode
 from pms.core.exceptions import DomainValidationError
 from pms.core.models import OrderState, Portfolio, Position, TradeDecision
-from pms.core.validation import validate_finite, validate_positive
+from pms.core.validation import validate_finite, validate_price, validate_probability
 
 
 class InsufficientLiquidityError(RuntimeError):
@@ -131,6 +131,19 @@ class RiskManager:
                 portfolio.locked_usdc,
                 field_name="Portfolio.locked_usdc",
             )
+            validate_price(decision.limit_price, field_name="TradeDecision.limit_price")
+            validate_probability(
+                decision.prob_estimate,
+                field_name="TradeDecision.prob_estimate",
+            )
+            validate_finite(
+                decision.expected_edge,
+                field_name="TradeDecision.expected_edge",
+            )
+            validate_finite(
+                decision.max_slippage_bps,
+                field_name="TradeDecision.max_slippage_bps",
+            )
             if portfolio.max_drawdown_pct is not None:
                 validate_finite(
                     portfolio.max_drawdown_pct,
@@ -180,9 +193,10 @@ class RiskManager:
                 return RiskDecision(False, "max_exposure_per_risk_group")
 
         if (
-            self.risk.max_drawdown_pct is not None
+            residual_notional > 0.0
+            and self.risk.max_drawdown_pct is not None
             and portfolio.max_drawdown_pct is not None
-            and portfolio.max_drawdown_pct > self.risk.max_drawdown_pct
+            and portfolio.max_drawdown_pct >= self.risk.max_drawdown_pct
         ):
             return RiskDecision(False, "drawdown_circuit_breaker")
 
@@ -247,7 +261,7 @@ class RiskManager:
         if (
             self.risk.max_drawdown_pct is not None
             and portfolio.max_drawdown_pct is not None
-            and portfolio.max_drawdown_pct > self.risk.max_drawdown_pct
+            and portfolio.max_drawdown_pct >= self.risk.max_drawdown_pct
         ):
             return self._halt(
                 trigger_kind="drawdown_circuit_breaker",
@@ -381,7 +395,12 @@ class RiskManager:
         self._open_order_submitted_at.pop(order_id, None)
         self._open_order_risk_reservations.pop(order_id, None)
 
-    def clear_halt(self, *, at: datetime | None = None) -> None:
+    def clear_halt(
+        self,
+        *,
+        at: datetime | None = None,
+        preserve_open_orders: bool = False,
+    ) -> None:
         if self._halt_state is not None and self._active_halt_event is not None:
             self._halt_recovery_cycles.append(
                 HaltRecoveryCycle(
@@ -394,8 +413,9 @@ class RiskManager:
         self._credential_failure = None
         self._recent_trades.clear()
         self._recent_rate_limits.clear()
-        self._open_order_submitted_at.clear()
-        self._open_order_risk_reservations.clear()
+        if not preserve_open_orders:
+            self._open_order_submitted_at.clear()
+            self._open_order_risk_reservations.clear()
 
     def _open_order_risk_group_exposure(self, risk_group_id: str) -> float:
         return sum(
