@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+import json
+import time
 from types import SimpleNamespace
 from typing import cast
 
@@ -30,6 +31,7 @@ from pms.storage.agent_evidence_store import (
     AgentEvidenceStore,
     canonical_content_hash,
 )
+from pms.storage.llm_replay_store import PostgresLLMReplayStore
 from pms.runner import Runner
 from pms.research.runner import BacktestRunner
 from pms.strategies.intents import StrategyContext
@@ -447,7 +449,6 @@ async def test_posted_evidence_changes_paper_llm_prompt_but_not_before_as_of(
 @pytest.mark.asyncio(loop_scope="session")
 async def test_paper_evidence_replays_through_backtest_factory_without_provider(
     pg_pool: asyncpg.Pool,
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -510,13 +511,11 @@ async def test_paper_evidence_replays_through_backtest_factory_without_provider(
         strategy_version_id="paper-agent-v1"
     )
     strategy = replace(strategy, forecaster=ForecasterSpec(forecasters=(("llm", ()),)))
-    replay_path = str(tmp_path / "paper-research.jsonl")
     llm_settings = LLMSettings(
         enabled=True,
         provider="openai",
         api_key="test",
         model="openai-test",
-        record_replay_path=replay_path,
         cache_ttl_s=0.0,
     )
     settings = PMSSettings(
@@ -529,6 +528,7 @@ async def test_paper_evidence_replays_through_backtest_factory_without_provider(
     paper_factory = ControllerPipelineFactory(
         settings=settings,
         evidence_reader=AgentEvidenceObservationSource(AgentEvidenceStore(pg_pool)),
+        replay_store=PostgresLLMReplayStore(pg_pool),
     )
     paper_pipeline = paper_factory.build(strategy)
     assert paper_pipeline.forecasters is not None
@@ -573,3 +573,50 @@ async def test_paper_evidence_replays_through_backtest_factory_without_provider(
     )
     replayed = await replay_forecaster.apredict(signal)
     assert replayed == recorded
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_postgres_replay_store_indexed_lookup_and_first_record_wins(
+    pg_pool: asyncpg.Pool,
+) -> None:
+    recorded_at = datetime.now(tz=UTC)
+    rows = [
+        (
+            f"w2b-scale-{index}",
+            "openai-test",
+            "p" * 64,
+            f"{index:064x}",
+            json.dumps({"prob_estimate": 0.5, "confidence": 0.5, "rationale": "scale"}),
+            recorded_at,
+            "paper",
+        )
+        for index in range(100_000)
+    ]
+    async with pg_pool.acquire() as connection:
+        await connection.executemany(
+            """
+            INSERT INTO llm_replay_records (
+                replay_key, model, prompt_hash, input_hash, response,
+                recorded_at, run_mode
+            ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+            ON CONFLICT (replay_key) DO NOTHING
+            """,
+            rows,
+        )
+    store = PostgresLLMReplayStore(pg_pool)
+    started = time.monotonic()
+    result = await store.get("w2b-scale-99999")
+    assert time.monotonic() - started < 0.5
+    assert result is not None
+    await store.put(
+        replay_key="w2b-scale-99999",
+        model="openai-test",
+        prompt_hash="p" * 64,
+        input_hash="different",
+        response={"prob_estimate": 0.1},
+        recorded_at=recorded_at,
+        run_mode="paper",
+    )
+    after = await store.get("w2b-scale-99999")
+    assert after is not None
+    assert after["prob_estimate"] == 0.5

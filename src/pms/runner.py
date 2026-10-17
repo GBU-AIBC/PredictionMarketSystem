@@ -144,6 +144,7 @@ from pms.storage.live_emergency_audit import (
 from pms.storage.first_order_audit import JsonlFirstOrderAuditWriter
 from pms.storage.market_data_store import PostgresMarketDataStore
 from pms.storage.agent_evidence_store import AgentEvidenceStore
+from pms.storage.llm_replay_store import PostgresLLMReplayStore
 from pms.storage.market_resolution_store import MarketResolutionStore
 from pms.storage.market_subscription_store import PostgresMarketSubscriptionStore
 from pms.storage.opportunity_store import OpportunityStore
@@ -1584,6 +1585,7 @@ class Runner:
                 evidence_reader=AgentEvidenceObservationSource(
                     AgentEvidenceStore(self._pg_pool)
                 ),
+                replay_store=PostgresLLMReplayStore(self._pg_pool),
             )
         if isinstance(self.eval_store, EvalStore):
             self.eval_store.bind_pool(self._pg_pool)

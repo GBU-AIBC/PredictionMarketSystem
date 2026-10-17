@@ -206,6 +206,19 @@ CREATE TABLE IF NOT EXISTS agent_factor_provenance (
 CREATE INDEX IF NOT EXISTS idx_agent_factor_provenance_market_ts
     ON agent_factor_provenance (market_id, ts DESC);
 
+CREATE TABLE IF NOT EXISTS llm_replay_records (
+    replay_key TEXT PRIMARY KEY,
+    model TEXT NOT NULL,
+    prompt_hash TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    response JSONB NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL,
+    run_mode TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_replay_records_recorded_at
+    ON llm_replay_records (recorded_at);
+
 CREATE TABLE IF NOT EXISTS market_relations (
     id SERIAL PRIMARY KEY,
     market_id_a TEXT NOT NULL,

@@ -220,7 +220,6 @@ class LLMSettings(BaseModel):
     input_price_usdc_per_million_tokens: float = Field(default=0.0, ge=0.0)
     output_price_usdc_per_million_tokens: float = Field(default=0.0, ge=0.0)
     spend_ledger_path: str | None = None
-    record_replay_path: str | None = None
 
     @model_validator(mode="after")
     def _validate_when_enabled(self) -> Self:

@@ -63,10 +63,23 @@ def upgrade() -> None:
             output_type = EXCLUDED.output_type,
             direction = EXCLUDED.direction,
             owner = EXCLUDED.owner;
+
+        CREATE TABLE IF NOT EXISTS llm_replay_records (
+            replay_key TEXT PRIMARY KEY,
+            model TEXT NOT NULL,
+            prompt_hash TEXT NOT NULL,
+            input_hash TEXT NOT NULL,
+            response JSONB NOT NULL,
+            recorded_at TIMESTAMPTZ NOT NULL,
+            run_mode TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_replay_records_recorded_at
+            ON llm_replay_records (recorded_at);
         """
     )
 
 
 def downgrade() -> None:
+    op.execute("DROP TABLE IF EXISTS llm_replay_records")
     op.execute("DROP TABLE IF EXISTS agent_factor_provenance")
     op.execute("DROP TABLE IF EXISTS agent_evidence")

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import fcntl
 from hashlib import sha256
 import logging
 import math
@@ -11,8 +10,6 @@ import threading
 import time
 from math import ceil
 from collections.abc import Callable, Sequence
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
@@ -23,7 +20,6 @@ from typing import Literal
 from weakref import ReferenceType, ref
 
 from pms.config import LLMSettings
-from pms.artifact_path_safety import require_path_outside_working_tree, require_private_parent
 from pms.core.models import MarketSignal
 from pms.storage.agent_evidence_store import AgentEvidence
 from pms.metrics import (
@@ -46,7 +42,6 @@ _SYSTEM_PROMPT = (
     "prob_estimate, confidence, and rationale."
 )
 _ESTIMATED_CALL_COST_USDC = Decimal("0.002")
-_REPLAY_COMPACT_BYTES = 64 * 1024 * 1024
 _KNOWN_MODEL_PRICES: dict[str, tuple[Decimal, Decimal]] = {
     "claude-sonnet-4-6": (Decimal("3"), Decimal("15")),
     "claude-3-5-sonnet": (Decimal("3"), Decimal("15")),
@@ -86,19 +81,6 @@ def durable_spend_ledger_path(
     )
 
 
-def durable_record_replay_path(
-    *,
-    database_dsn: str,
-    data_path: str,
-    scope: str = "default",
-) -> str:
-    database_digest = sha256(database_dsn.encode("utf-8")).hexdigest()[:24]
-    scope_digest = sha256(scope.encode("utf-8")).hexdigest()[:8]
-    del data_path
-    base_dir = Path.home() / ".pms" / "llm-replay"
-    return str(base_dir / f"llm-replay-{database_digest}-{scope_digest}.json")
-
-
 class _LLMClient(Protocol):
     """Marker protocol; concrete SDK shapes are provider-specific."""
 
@@ -111,6 +93,22 @@ class EvidenceReader(Protocol):
         as_of: datetime,
         limit: int = 8,
     ) -> Sequence[AgentEvidence]: ...
+
+
+class LLMReplayStore(Protocol):
+    async def get(self, replay_key: str) -> Mapping[str, object] | None: ...
+
+    async def put(
+        self,
+        *,
+        replay_key: str,
+        model: str,
+        prompt_hash: str,
+        input_hash: str,
+        response: Mapping[str, object],
+        recorded_at: datetime,
+        run_mode: str,
+    ) -> None: ...
 
 
 class LLMTimeoutError(RuntimeError):
@@ -203,15 +201,10 @@ class LLMForecaster:
     _cache_lock: threading.Lock = field(default_factory=threading.Lock)
     _cache_response: dict[str, str] = field(default_factory=dict)
     record_replay_mode: Literal["off", "record", "replay"] = "off"
-    replay_cache_path: str | None = None
+    replay_store: LLMReplayStore | None = None
     evidence_reader: EvidenceReader | None = None
     strategy_id: str | None = None
     strategy_version_id: str | None = None
-    _replay_index: dict[str, dict[str, object]] = field(default_factory=dict, init=False)
-    _replay_index_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
-    _replay_index_stats: tuple[int, ...] | None = field(default=None, init=False)
-    _replay_index_loaded: bool = field(default=False, init=False)
-    _replay_last_compaction_size: int = field(default=0, init=False)
     last_failure_reason: str | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
@@ -228,30 +221,6 @@ class LLMForecaster:
         if self.config is None or not self.config.enabled:
             return None
         self.last_failure_reason = None
-        prompt = _prompt(signal, evidence=evidence)
-        replay_key = _replay_key(
-            self.config,
-            signal,
-            prompt,
-            evidence=evidence,
-            strategy_id=self.strategy_id,
-            strategy_version_id=self.strategy_version_id,
-        )
-        if self.record_replay_mode == "replay":
-            cached_response = self._replay_read(replay_key)
-            if cached_response.get("no_forecast") is True:
-                self.last_failure_reason = str(
-                    cached_response.get("reason", "no_forecast")
-                )
-                return None
-            try:
-                result = self._parse(cast(str, cached_response["response"]))
-            except LLMParseError as exc:
-                raise LLMReplayCacheCorruptError(
-                    "LLM replay cache contains an invalid forecast response"
-                ) from exc
-            result.provider = cast(str | None, cached_response.get("provider"))
-            return result
         # Resolve pricing before loading a client or reserving budget.  A
         # model without both token rates is unsafe to call because the result
         # cannot be accounted for after the provider has charged us.
@@ -261,21 +230,13 @@ class LLMForecaster:
             self.last_failure_reason = "budget_exhausted"
             increment_metric(LLM_BUDGET_EXHAUSTED_TOTAL_METRIC)
             self._publish_budget_metrics()
-            self._record_no_forecast(replay_key, prompt, self.last_failure_reason)
             return None
         cache_key = _cache_key(signal, evidence=evidence)
         if self._negative_cache_get(cache_key):
             self.last_failure_reason = "parse_failed"
-            self._record_no_forecast(replay_key, prompt, self.last_failure_reason)
             return None
         cached = self._cache_get(cache_key)
         if cached is not None:
-            if self.record_replay_mode == "record":
-                self._record_replay_response(
-                    replay_key,
-                    self._cache_response.get(cache_key, _result_response(cached)),
-                    prompt=prompt,
-                )
             return cached
         estimated_cost = self._estimated_call_cost_usdc(signal, evidence=evidence)
         if not self._reserve_budget(estimated_cost):
@@ -293,7 +254,6 @@ class LLMForecaster:
                     "max_daily_llm_cost_usdc": self.config.max_daily_llm_cost_usdc,
                 },
             )
-            self._record_no_forecast(replay_key, prompt, self.last_failure_reason)
             return None
         try:
             client = self._client()
@@ -306,7 +266,6 @@ class LLMForecaster:
         if client is None:
             self.last_failure_reason = "provider_unavailable"
             self._refund_budget(estimated_cost)
-            self._record_no_forecast(replay_key, prompt, self.last_failure_reason)
             return None
         try:
             response = self._call(client, signal, evidence=evidence)
@@ -316,7 +275,6 @@ class LLMForecaster:
                 self._record_cost(estimated_cost, signal)
             else:
                 self._refund_budget(estimated_cost)
-            self._record_no_forecast(replay_key, prompt, self.last_failure_reason)
             return None
         except Exception:
             if self._retain_failed_reservation():
@@ -330,7 +288,6 @@ class LLMForecaster:
             self.last_failure_reason = "budget_exhausted"
             increment_metric(LLM_BUDGET_EXHAUSTED_TOTAL_METRIC)
             self._record_cost(estimated_cost, signal)
-            self._record_no_forecast(replay_key, prompt, self.last_failure_reason)
             return None
         self._settle_budget(estimated_cost, actual_cost)
         self._record_cost(actual_cost, signal)
@@ -339,11 +296,8 @@ class LLMForecaster:
         except LLMParseError:
             self.last_failure_reason = "parse_failed"
             self._cache_put_negative(cache_key)
-            self._record_no_forecast(replay_key, prompt, self.last_failure_reason)
             return None
         self._cache_put(cache_key, result, response_text=response.text)
-        if self.record_replay_mode == "record":
-            self._record_replay_response(replay_key, response.text, prompt=prompt)
         return result
 
     async def apredict(self, signal: MarketSignal) -> LLMForecastResult | None:
@@ -363,150 +317,87 @@ class LLMForecaster:
                         "point-in-time evidence read failed during replay"
                     ) from exc
                 raise
-        return await asyncio.to_thread(self.predict, signal, evidence=evidence)
+        prompt = _prompt(signal, evidence=evidence)
+        replay_key = _replay_key(
+            self.config,
+            signal,
+            prompt,
+            evidence=evidence,
+            strategy_id=self.strategy_id,
+            strategy_version_id=self.strategy_version_id,
+        )
+        if self.record_replay_mode == "replay":
+            return await self._replay_from_store(replay_key)
+        result = await asyncio.to_thread(self.predict, signal, evidence=evidence)
+        if self.record_replay_mode == "record":
+            await self._record_store_result(replay_key, result)
+        return result
 
-    def _record_replay_response(
+    async def _replay_from_store(
         self,
         key: tuple[str, str, str],
-        response_text: str,
-        *,
-        prompt: str,
-        no_forecast: bool = False,
-        reason: str | None = None,
-    ) -> None:
-        assert self.config is not None
+    ) -> LLMForecastResult | None:
+        if self.replay_store is None:
+            raise LLMReplayCacheMissError(
+                "PostgreSQL LLM replay store is not configured"
+            )
         try:
-            self._replay_write(
-                key,
-                {
-                    "model": self.config.model,
-                    "prompt_hash": key[1],
-                    "input_hash": key[2],
-                    "prompt": prompt,
-                    "response": response_text,
-                    "no_forecast": no_forecast,
-                    "reason": reason,
-                    "provider": self.config.provider,
-                    "recorded_at": datetime.now(tz=UTC).isoformat(),
-                },
+            payload = await self.replay_store.get(_replay_key_text(key))
+        except LLMReplayCacheMissError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise LLMReplayCacheCorruptError(
+                "LLM replay row could not be read"
+            ) from exc
+        if payload is None:
+            raise LLMReplayCacheMissError(
+                "LLM replay cache miss for model/prompt/input point-in-time key"
+            )
+        if payload.get("no_forecast") is True:
+            self.last_failure_reason = str(payload.get("reason", "no_forecast"))
+            return None
+        try:
+            result = self._parse(json.dumps(payload, sort_keys=True))
+        except (LLMParseError, TypeError, ValueError) as exc:
+            raise LLMReplayCacheCorruptError(
+                "LLM replay row contains an invalid forecast response"
+            ) from exc
+        result.provider = cast(str | None, payload.get("provider"))
+        return result
+
+    async def _record_store_result(
+        self,
+        key: tuple[str, str, str],
+        result: LLMForecastResult | None,
+    ) -> None:
+        if self.replay_store is None or self.config is None:
+            return
+        response: dict[str, object]
+        if result is None:
+            response = {
+                "no_forecast": True,
+                "reason": self.last_failure_reason or "no_forecast",
+            }
+        else:
+            response = {
+                "prob_estimate": result[0],
+                "confidence": result[1],
+                "rationale": result[2],
+                "provider": result.provider,
+            }
+        try:
+            await self.replay_store.put(
+                replay_key=_replay_key_text(key),
+                model=self.config.model,
+                prompt_hash=key[1],
+                input_hash=key[2],
+                response=response,
+                recorded_at=datetime.now(tz=UTC),
+                run_mode="paper",
             )
         except Exception as error:  # noqa: BLE001
             self.last_failure_reason = "replay_record_failed"
             logger.error("LLM replay recording failed; keeping paid forecast: %s", error)
-
-    def _record_no_forecast(
-        self,
-        key: tuple[str, str, str],
-        prompt: str,
-        reason: str | None,
-    ) -> None:
-        if self.record_replay_mode != "record":
-            return
-        self._record_replay_response(
-            key,
-            "",
-            prompt=prompt,
-            no_forecast=True,
-            reason=reason,
-        )
-
-    def _replay_index_lookup(
-        self,
-        path: Path,
-    ) -> dict[str, dict[str, object]]:
-        stats = _replay_file_stats(path)
-        with self._replay_index_lock:
-            if not self._replay_index_loaded or self._replay_index_stats != stats:
-                with _replay_lock(path, exclusive=False):
-                    self._replay_index = _read_replay_entries(path)
-                    stats = _replay_file_stats(path)
-                self._replay_index_stats = stats
-                self._replay_index_loaded = True
-            return self._replay_index
-
-    def _replay_read(self, key: tuple[str, str, str]) -> dict[str, object]:
-        path = self._replay_path()
-        if path is None:
-            raise LLMReplayCacheMissError("LLM replay cache path is not configured")
-        try:
-            require_path_outside_working_tree(path, label="LLM replay cache")
-            require_private_parent(path, label="LLM replay cache")
-            entries = self._replay_index_lookup(path)
-        except (json.JSONDecodeError, OSError, ValueError) as exc:
-            raise LLMReplayCacheCorruptError(
-                f"LLM replay cache is corrupt: {path}"
-            ) from exc
-        row = entries.get("|".join(key))
-        if not isinstance(row, dict) or not isinstance(row.get("response"), str):
-            raise LLMReplayCacheMissError(
-                "LLM replay cache miss for model/prompt/input point-in-time key"
-            )
-        return row
-
-    def _replay_write(self, key: tuple[str, str, str], row: dict[str, object]) -> None:
-        path = self._replay_path()
-        if path is None:
-            return
-        require_path_outside_working_tree(path, label="LLM replay cache")
-        missing_parents: list[Path] = []
-        parent = path.parent
-        while not parent.exists():
-            missing_parents.append(parent)
-            parent = parent.parent
-        path.parent.mkdir(parents=True, exist_ok=True)
-        for created_parent in missing_parents:
-            os.chmod(created_parent, 0o700)
-        require_private_parent(path, label="LLM replay cache")
-        with _replay_lock(path, exclusive=True):
-            append_path = _replay_append_path(path)
-            _truncate_torn_tail(append_path)
-            try:
-                # Validate existing records, but never rewrite them.  A
-                # JSON object from older releases is read-only; new rows
-                # go to an append-only sidecar until that object expires.
-                _validate_replay_append_target(path)
-                _validate_replay_append_target(append_path)
-            except (json.JSONDecodeError, OSError, ValueError) as exc:
-                logger.error("LLM replay cache is corrupt; refusing to append %s", path)
-                raise LLMReplayCacheCorruptError(
-                    f"LLM replay cache is corrupt: {path}"
-                ) from exc
-            with append_path.open("a", encoding="utf-8") as file:
-                file.write(
-                    json.dumps(
-                        {"key": "|".join(key), "row": row},
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                )
-                file.write("\n")
-                file.flush()
-                os.fsync(file.fileno())
-            os.chmod(append_path, 0o600)
-            append_size = append_path.stat().st_size
-            should_compact = append_size > max(
-                _REPLAY_COMPACT_BYTES,
-                self._replay_last_compaction_size + _REPLAY_COMPACT_BYTES,
-            )
-        if should_compact:
-            with _replay_lock(path, exclusive=True):
-                compacted = _compact_replay(path)
-                compacted_size = path.stat().st_size
-            with self._replay_index_lock:
-                self._replay_index = compacted
-                self._replay_index_stats = _replay_file_stats(path)
-                self._replay_index_loaded = True
-                self._replay_last_compaction_size = compacted_size
-        elif self._replay_index_loaded:
-            with self._replay_index_lock:
-                self._replay_index["|".join(key)] = row
-                self._replay_index_stats = _replay_file_stats(path)
-
-    def _replay_path(self) -> Path | None:
-        configured = self.replay_cache_path
-        if configured is None and self.config is not None:
-            configured = self.config.record_replay_path
-        return None if configured is None else Path(configured).expanduser().resolve()
 
     async def forecast(self, signal: MarketSignal) -> float:
         result = await asyncio.to_thread(self.predict, signal)
@@ -1043,6 +934,10 @@ def _replay_key(
     return config.model, prompt_hash, input_hash
 
 
+def _replay_key_text(key: tuple[str, str, str]) -> str:
+    return "|".join(key)
+
+
 def _evidence_key(evidence: Sequence[AgentEvidence]) -> list[dict[str, str]]:
     return [
         {
@@ -1065,178 +960,6 @@ def _prompt_evidence(evidence: Sequence[AgentEvidence]) -> list[dict[str, str]]:
         }
         for row in evidence[:8]
     ]
-
-
-def _result_response(result: LLMForecastResult) -> str:
-    return json.dumps(
-        {
-            "prob_estimate": result[0],
-            "confidence": result[1],
-            "rationale": result[2],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-@contextmanager
-def _replay_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
-    lock_path = path.with_name(f".{path.name}.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-def _replay_append_path(path: Path) -> Path:
-    """Choose the append-only log, preserving read compatibility with v1 JSON."""
-    if not path.exists() or path.stat().st_size == 0:
-        return path
-    with path.open("r", encoding="utf-8") as file:
-        first_line = file.readline().lstrip()
-    if first_line.startswith('{"entries"'):
-        return path.with_name(f"{path.name}.append")
-    return path
-
-
-def _replay_file_stats(path: Path) -> tuple[int, ...]:
-    stats: list[int] = []
-    for candidate in (path, path.with_name(f"{path.name}.append")):
-        try:
-            stat = candidate.stat()
-        except FileNotFoundError:
-            stats.extend((0, 0))
-        else:
-            stats.extend((stat.st_size, stat.st_mtime_ns))
-    return tuple(stats)
-
-
-def _truncate_torn_tail(path: Path) -> None:
-    if not path.exists() or path.stat().st_size == 0:
-        return
-    with path.open("rb+") as file:
-        file.seek(-1, os.SEEK_END)
-        if file.read(1) == b"\n":
-            return
-        file.seek(0)
-        content = file.read()
-        boundary = content.rfind(b"\n")
-        if boundary < 0:
-            raise LLMReplayCacheCorruptError(
-                f"LLM replay cache has no complete record: {path}"
-            )
-        file.seek(max(boundary + 1, 0))
-        file.truncate()
-    logger.warning("discarded torn tail from LLM replay cache: %s", path)
-
-
-def _compact_replay(path: Path) -> dict[str, dict[str, object]]:
-    entries = _read_replay_entries(path)
-    temporary = path.with_name(f".{path.name}.compact-{os.getpid()}-{threading.get_ident()}")
-    with temporary.open("w", encoding="utf-8") as file:
-        for key, row in entries.items():
-            file.write(
-                json.dumps(
-                    {"key": key, "row": row},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
-            file.write("\n")
-        file.flush()
-        os.fsync(file.fileno())
-    os.replace(temporary, path)
-    append_path = path.with_name(f"{path.name}.append")
-    try:
-        append_path.unlink()
-    except FileNotFoundError:
-        pass
-    os.chmod(path, 0o600)
-    return entries
-
-
-def _validate_replay_append_target(path: Path) -> None:
-    if not path.exists() or path.stat().st_size == 0:
-        return
-    with path.open("r", encoding="utf-8") as file:
-        first_line = file.readline()
-    if not first_line.strip():
-        return
-    record = json.loads(first_line)
-    if isinstance(record, dict) and isinstance(record.get("entries"), dict):
-        return
-    if not (
-        isinstance(record, dict)
-        and isinstance(record.get("key"), str)
-        and isinstance(record.get("row"), dict)
-    ):
-        raise ValueError("replay row has invalid structure")
-
-
-def _read_replay_entries(path: Path) -> dict[str, dict[str, object]]:
-    """Read legacy JSON and append-only rows, with the latest row winning."""
-    entries: dict[str, dict[str, object]] = {}
-    if path.exists():
-        text = path.read_text(encoding="utf-8")
-        if text.strip():
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError:
-                payload = None
-                lines = text.splitlines(keepends=True)
-                for index, line in enumerate(lines):
-                    if not line.strip():
-                        continue
-                    if index == len(lines) - 1 and not line.endswith(("\n", "\r")):
-                        logger.warning("ignored torn tail in LLM replay cache: %s", path)
-                        continue
-                    record = json.loads(line)
-                    if not isinstance(record, dict):
-                        raise ValueError("replay row is not an object")
-                    key = record.get("key")
-                    row = record.get("row")
-                    if not isinstance(key, str) or not isinstance(row, dict):
-                        raise ValueError("replay row has invalid structure")
-                    entries[key] = cast(dict[str, object], row)
-            if payload is not None:
-                if isinstance(payload, dict) and isinstance(payload.get("entries"), dict):
-                    entries.update(
-                        {
-                            str(key): cast(dict[str, object], row)
-                            for key, row in payload["entries"].items()
-                            if isinstance(row, dict)
-                        }
-                    )
-                elif (
-                    isinstance(payload, dict)
-                    and isinstance(payload.get("key"), str)
-                    and isinstance(payload.get("row"), dict)
-                ):
-                    entries[payload["key"]] = cast(dict[str, object], payload["row"])
-                else:
-                    raise ValueError("replay cache has invalid structure")
-    append_path = path.with_name(f"{path.name}.append")
-    if append_path.exists():
-        append_text = append_path.read_text(encoding="utf-8")
-        append_lines = append_text.splitlines(keepends=True)
-        for index, line in enumerate(append_lines):
-            if not line.strip():
-                continue
-            if index == len(append_lines) - 1 and not line.endswith(("\n", "\r")):
-                logger.warning("ignored torn tail in LLM replay cache: %s", append_path)
-                continue
-            record = json.loads(line)
-            if not isinstance(record, dict):
-                raise ValueError("replay row is not an object")
-            key = record.get("key")
-            row = record.get("row")
-            if not isinstance(key, str) or not isinstance(row, dict):
-                raise ValueError("replay row has invalid structure")
-            entries[key] = cast(dict[str, object], row)
-    return entries
 
 
 def _provider_response(text: str, response: object) -> _ProviderResponse:

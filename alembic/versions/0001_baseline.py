@@ -55,6 +55,8 @@ _DEFERRED_SCHEMA_STATEMENT_PREFIXES: Final[tuple[str, ...]] = (
     "CREATE INDEX IF NOT EXISTS idx_agent_evidence_market_captured",
     "CREATE TABLE IF NOT EXISTS agent_factor_provenance",
     "CREATE INDEX IF NOT EXISTS idx_agent_factor_provenance_market_ts",
+    "CREATE TABLE IF NOT EXISTS llm_replay_records",
+    "CREATE INDEX IF NOT EXISTS idx_llm_replay_records_recorded_at",
     "CREATE TABLE IF NOT EXISTS strategy_judgement_artifacts",
     "CREATE TABLE IF NOT EXISTS strategy_execution_artifacts",
     "CREATE INDEX IF NOT EXISTS idx_strategy_judgement_artifacts",

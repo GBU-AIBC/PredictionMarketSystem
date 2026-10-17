@@ -18,8 +18,8 @@ from pms.controller.factor_snapshot import (
 from pms.controller.forecasters.llm import (
     EvidenceReader,
     LLMForecaster,
+    LLMReplayStore,
     durable_spend_ledger_path,
-    durable_record_replay_path,
     validate_llm_runtime_dependencies,
 )
 from pms.controller.forecasters.flb import FlbForecaster
@@ -56,6 +56,7 @@ class ControllerPipelineFactory:
     )
     direct_book_reader: DirectBookSnapshotReader | None = None
     evidence_reader: EvidenceReader | None = None
+    replay_store: LLMReplayStore | None = None
 
     def build_many(
         self,
@@ -104,6 +105,9 @@ class ControllerPipelineFactory:
                 evidence_reader=(
                     self.evidence_reader if self.settings.mode != RunMode.LIVE else None
                 ),
+                replay_store=(
+                    self.replay_store if self.settings.mode != RunMode.LIVE else None
+                ),
             )
             for name, raw_params in strategy.forecaster.forecasters
         )
@@ -120,6 +124,7 @@ def _build_forecaster(
     strategy_id: str,
     strategy_version_id: str,
     evidence_reader: EvidenceReader | None = None,
+    replay_store: LLMReplayStore | None = None,
 ) -> IForecaster:
     params = dict(raw_params)
     if name == "rules":
@@ -163,12 +168,6 @@ def _build_forecaster(
                 data_path=settings.live_emergency_audit_path,
                 scope=settings.mode.value,
             )
-        if llm_payload.get("record_replay_path") is None:
-            llm_payload["record_replay_path"] = durable_record_replay_path(
-                database_dsn=settings.database.dsn,
-                data_path=settings.live_emergency_audit_path,
-                scope="paper-research",
-            )
         llm_config = LLMSettings.model_validate(llm_payload)
         replay_mode = cast(
             Literal["off", "record", "replay"],
@@ -186,6 +185,7 @@ def _build_forecaster(
             config=llm_config,
             record_replay_mode=replay_mode,
             evidence_reader=evidence_reader,
+            replay_store=replay_store,
             strategy_id=strategy_id,
             strategy_version_id=strategy_version_id,
         )
