@@ -9,7 +9,7 @@ from typing import Protocol
 
 import asyncpg
 from pms.core.validation import validate_finite
-from pms.factors.definitions import REGISTERED
+from pms.factors.definitions import current_definition_version
 
 from pms.strategies.projections import FactorCompositionStep
 
@@ -113,12 +113,8 @@ class PostgresFactorSnapshotReader:
 
         factor_ids = [factor_id for factor_id, _ in snapshot_keys]
         params = [param for _, param in snapshot_keys]
-        current_versions = {
-            factor_cls.factor_id: factor_cls.definition_version
-            for factor_cls in REGISTERED
-        }
         definition_versions = [
-            current_versions.get(factor_id, "1") for factor_id in factor_ids
+            current_definition_version(factor_id) for factor_id in factor_ids
         ]
         async with self.pool.acquire() as connection:
             rows = await connection.fetch(
@@ -181,7 +177,7 @@ class PostgresFactorSnapshotReader:
                 continue
             ts = row["ts"]
             selected_definition_versions[key] = str(
-                row.get("definition_version", current_versions.get(key[0], "1"))
+                row.get("definition_version", current_definition_version(key[0]))
             )
             if isinstance(ts, datetime):
                 timestamps[key] = ts

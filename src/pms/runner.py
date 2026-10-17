@@ -832,6 +832,7 @@ class Runner:
         self._subscription_controller = None
         self._strategy_registry = None
         self._controller_runtimes = {}
+        self._active_strategies_by_version = {}
         self._controller_signal_queues = {}
         self._controller_pipeline_tasks = {}
         self._controller_release_cancel_point = None
@@ -3066,6 +3067,7 @@ class Runner:
         self._subscription_controller = None
         self._strategy_registry = None
         self._controller_runtimes = {}
+        self._active_strategies_by_version = {}
         self._controller_signal_queues = {}
         self._controller_pipeline_tasks = {}
         self._controller_release_cancel_point = None
@@ -3535,6 +3537,7 @@ class Runner:
             self._attach_controller_runtime(runtime)
 
     async def _build_controller_runtimes(self) -> list[StrategyControllerRuntime]:
+        self._active_strategies_by_version = {}
         if self.controller is not None:
             strategy = getattr(self.controller, "strategy", None)
             if isinstance(strategy, ActiveStrategy):

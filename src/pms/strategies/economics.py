@@ -22,37 +22,14 @@ def validate_strategy_economics(metadata: tuple[tuple[str, str], ...]) -> None:
             )
         seen.add(key)
     values = dict(metadata)
-    if "economics_version" not in values:
-        return
-    bounded_rates = {"fee_rate", "fee_rate_fallback"}
-    non_negative = {
-        "entry_execution_cost_bps",
-        "prior_strength",
-        "decay_window_hours",
-    }
-    non_negative_int = {"max_slippage_bps"}
-    positive = {"min_expected_edge", "min_divergence"}
-    probabilities = {
-        "min_confidence",
-        "source_confidence",
-        "longshot_yes_threshold",
-        "favorite_yes_threshold",
-    }
-    for key in bounded_rates:
+    runtime_bounded_rates = {"fee_rate", "fee_rate_fallback"}
+    runtime_non_negative_int = {"max_slippage_bps"}
+    for key in runtime_bounded_rates:
         if key in values:
             _require_float(values[key], key, minimum=0.0, maximum=1.0)
-    for key in non_negative:
-        if key in values:
-            _require_float(values[key], key, minimum=0.0)
-    for key in non_negative_int:
+    for key in runtime_non_negative_int:
         if key in values:
             _require_float(values[key], key, minimum=0.0, require_integer=True)
-    for key in positive:
-        if key in values:
-            _require_float(values[key], key, minimum=0.0, strict_minimum=True)
-    for key in probabilities:
-        if key in values:
-            _require_float(values[key], key, minimum=0.0, maximum=1.0)
     time_in_force = values.get("time_in_force")
     if time_in_force is not None and (
         not isinstance(time_in_force, str)
@@ -61,6 +38,29 @@ def validate_strategy_economics(metadata: tuple[tuple[str, str], ...]) -> None:
         raise StrategyEconomicsError(
             f"invalid strategy economic value 'time_in_force': {time_in_force!r}"
         )
+    if "economics_version" not in values:
+        return
+    non_negative = {
+        "entry_execution_cost_bps",
+        "prior_strength",
+        "decay_window_hours",
+    }
+    positive = {"min_expected_edge", "min_divergence"}
+    probabilities = {
+        "min_confidence",
+        "source_confidence",
+        "longshot_yes_threshold",
+        "favorite_yes_threshold",
+    }
+    for key in non_negative:
+        if key in values:
+            _require_float(values[key], key, minimum=0.0)
+    for key in positive:
+        if key in values:
+            _require_float(values[key], key, minimum=0.0, strict_minimum=True)
+    for key in probabilities:
+        if key in values:
+            _require_float(values[key], key, minimum=0.0, maximum=1.0)
 
 
 def _require_float(

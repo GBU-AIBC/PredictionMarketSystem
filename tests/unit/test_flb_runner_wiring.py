@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -19,6 +20,8 @@ from pms.runner import Runner
 from pms.strategies.flb import FlbAgent, FlbController, FlbStrategyModule, LiveFlbSource
 from pms.strategies.flb.projection import build_h1_flb_strategy
 from pms.strategies.flb.source import FlbMarketSnapshot
+from pms.strategies.ripple.source import build_ripple_strategy
+from pms.strategies.anchoring.source import build_anchoring_strategy
 from pms.strategies.intents import TradeIntent
 from pms.strategies.versioning import compute_strategy_version_id
 
@@ -291,6 +294,50 @@ def test_paper_fill_fee_uses_versioned_strategy_fee() -> None:
         time_in_force=TimeInForce.GTC,
         opportunity_id="opportunity-fee",
         strategy_id="h1_flb",
+        strategy_version_id=version_id,
+        action="BUY",
+    )
+
+    assert runner._paper_fill_fee_rate(decision) == pytest.approx(0.07)
+
+
+@pytest.mark.parametrize(
+    ("builder", "strategy_id"),
+    (
+        (build_ripple_strategy, "ripple"),
+        (build_anchoring_strategy, "h2_anchoring_lag"),
+    ),
+)
+def test_paper_fill_fee_uses_versioned_fee_for_non_h1_strategies(
+    builder: Any,
+    strategy_id: str,
+) -> None:
+    strategy = builder(strategy_id)
+    version_id = compute_strategy_version_id(*strategy.snapshot())
+    runner = Runner(
+        config=PMSSettings(
+            strategies=StrategyRuntimeSettings(flb_fee_rate=0.25),
+        )
+    )
+    runner._active_strategies_by_version[(strategy_id, version_id)] = strategy.to_active(
+        strategy_version_id=version_id
+    )
+    decision = TradeDecision(
+        decision_id=f"decision-fee-{strategy_id}",
+        market_id="market-fee",
+        token_id="token-fee",
+        venue="polymarket",
+        side="BUY",
+        limit_price=0.5,
+        notional_usdc=10.0,
+        order_type="limit",
+        max_slippage_bps=50,
+        stop_conditions=[],
+        prob_estimate=0.7,
+        expected_edge=0.2,
+        time_in_force=TimeInForce.GTC,
+        opportunity_id=f"opportunity-fee-{strategy_id}",
+        strategy_id=strategy_id,
         strategy_version_id=version_id,
         action="BUY",
     )

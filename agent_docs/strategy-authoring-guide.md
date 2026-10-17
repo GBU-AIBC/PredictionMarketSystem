@@ -752,18 +752,23 @@ Steps:
    the canonical shape.
 2. Register it in `src/pms/factors/definitions/__init__.py` — add to
    the `REGISTERED` tuple and to `__all__`.
-3. Write piecewise tests (promoted rule
+3. Add the matching `FactorCatalogEntry` to
+   `src/pms/factors/catalog.py` and include it in the catalog seed path.
+   The startup parity check intentionally fails fast with the missing factor
+   IDs if either side is absent; add the missing definition or catalog row
+   named in that error before starting the service.
+4. Write piecewise tests (promoted rule
    `domain-math-piecewise`): if your `compute()` has guards (zero
    depth → `None`, missing field → fallback, etc.), test each branch
    plus the boundaries between them.
-4. Run the gate:
+5. Run the gate:
 
    ```bash
    uv run pytest tests/unit/factors/test_<your_factor>.py -q
    uv run mypy src/pms/factors/definitions/<your_factor>.py --strict
    ```
 
-5. Only after the factor is in the registry can a strategy reference
+6. Only after the factor is registered and cataloged can a strategy reference
    its `factor_id` in `FactorCompositionStep`.
 
 Reusability test: if your factor encodes strategy-specific weights

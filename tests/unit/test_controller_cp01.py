@@ -19,6 +19,8 @@ from pms.controller.pipeline import (
 from pms.core.enums import RunMode
 from pms.core.models import EvalRecord, MarketSignal, Portfolio
 from pms.strategies.flb import H1_FLB_STRATEGY_ID, build_h1_flb_strategy
+from pms.strategies.ripple.source import build_ripple_strategy
+from pms.strategies.anchoring.source import build_anchoring_strategy
 from pms.strategies.projections import (
     EvalSpec,
     CalibrationSpec,
@@ -69,6 +71,49 @@ def _portfolio() -> Portfolio:
         locked_usdc=0.0,
         open_positions=[],
     )
+
+
+@pytest.mark.parametrize(
+    ("builder", "strategy_id"),
+    (
+        (build_ripple_strategy, "ripple"),
+        (build_anchoring_strategy, "h2_anchoring_lag"),
+    ),
+)
+def test_non_h1_strategy_fee_is_hashed_and_ignores_global_settings(
+    builder: Any,
+    strategy_id: str,
+) -> None:
+    settings_a = PMSSettings(strategies=StrategyRuntimeSettings(flb_fee_rate=0.01))
+    settings_b = PMSSettings(strategies=StrategyRuntimeSettings(flb_fee_rate=0.25))
+    strategy = builder(strategy_id)
+    active = strategy.to_active(
+        strategy_version_id=compute_strategy_version_id(*strategy.snapshot())
+    )
+    signal = _signal()
+
+    fee_a = _strategy_fee_rate(active, signal, settings_a)
+    fee_b = _strategy_fee_rate(active, signal, settings_b)
+    assert fee_a == pytest.approx(0.07)
+    assert fee_b == pytest.approx(0.07)
+    edge_a = _decision_cost_edges(
+        decision_price=0.4,
+        spread_bps=20,
+        settings=settings_a,
+        fee_rate=fee_a,
+        max_slippage_bps=50,
+    ).total_edge
+    edge_b = _decision_cost_edges(
+        decision_price=0.4,
+        spread_bps=20,
+        settings=settings_b,
+        fee_rate=fee_b,
+        max_slippage_bps=50,
+    ).total_edge
+    assert edge_a == pytest.approx(edge_b)
+
+    changed = builder(strategy_id, fee_rate=0.20)
+    assert compute_strategy_version_id(*changed.snapshot()) != active.strategy_version_id
 
 
 def test_h1_decision_economics_come_from_hashed_projection() -> None:

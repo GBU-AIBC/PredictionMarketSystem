@@ -35,13 +35,15 @@ ANCHORING_DEFAULT_MIN_DIVERGENCE = DEFAULT_MIN_DIVERGENCE
 ANCHORING_DEFAULT_MIN_CONFIDENCE = DEFAULT_MIN_CONFIDENCE
 ANCHORING_DEFAULT_MIN_EXPECTED_EDGE = DEFAULT_MIN_EXPECTED_EDGE
 ANCHORING_DEFAULT_MAX_SLIPPAGE_BPS = 50
+ANCHORING_DEFAULT_FEE_RATE = 0.07
 ANCHORING_DEFAULT_TIME_IN_FORCE = TimeInForce.GTC
 
 
 def build_anchoring_strategy(
     strategy_id: str,
     *,
-    time_in_force: str = "GTC",
+    time_in_force: str = ANCHORING_DEFAULT_TIME_IN_FORCE.value,
+    fee_rate: float = ANCHORING_DEFAULT_FEE_RATE,
 ) -> Strategy:
     """Build the immutable projection that owns H2 runtime economics."""
     return Strategy(
@@ -55,6 +57,7 @@ def build_anchoring_strategy(
                 ("min_expected_edge", str(ANCHORING_DEFAULT_MIN_EXPECTED_EDGE)),
                 ("decay_window_hours", str(DEFAULT_DECAY_WINDOW_HOURS)),
                 ("max_slippage_bps", str(ANCHORING_DEFAULT_MAX_SLIPPAGE_BPS)),
+                ("fee_rate", str(fee_rate)),
                 ("time_in_force", time_in_force.upper()),
             ),
         ),

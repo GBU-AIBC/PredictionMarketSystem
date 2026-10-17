@@ -350,6 +350,27 @@ def test_active_strategy_rejects_identity_mismatch() -> None:
         )
 
 
+def test_strategy_rejects_runtime_fee_without_economics_version() -> None:
+    from pms.strategies.aggregate import Strategy
+    from pms.strategies.flb.projection import build_h1_flb_strategy
+
+    strategy = build_h1_flb_strategy()
+    metadata = dict(strategy.config.metadata)
+    metadata.pop("economics_version")
+    metadata["fee_rate"] = "-0.5"
+    malformed = replace(strategy.config, metadata=tuple(metadata.items()))
+
+    with pytest.raises(ValueError, match="strategy economic"):
+        Strategy(
+            config=malformed,
+            risk=strategy.risk,
+            eval_spec=strategy.eval_spec,
+            forecaster=strategy.forecaster,
+            market_selection=strategy.market_selection,
+            calibration=strategy.calibration,
+        )
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [

@@ -5,7 +5,7 @@ from typing import Any
 
 import asyncpg
 from pydantic import BaseModel, field_serializer
-from pms.factors.definitions import REGISTERED
+from pms.factors.definitions import current_definition_version
 
 
 class FactorCatalogRowResponse(BaseModel):
@@ -99,7 +99,7 @@ async def list_factor_series(
             market_id,
             since,
             effective_limit,
-            _current_definition_version(factor_id),
+            current_definition_version(factor_id),
         )
     payload = FactorSeriesResponse(
         factor_id=factor_id,
@@ -114,10 +114,3 @@ async def list_factor_series(
         ],
     )
     return payload.model_dump(mode="json")
-
-
-def _current_definition_version(factor_id: str) -> str:
-    for factor_cls in REGISTERED:
-        if factor_cls.factor_id == factor_id:
-            return factor_cls.definition_version
-    return "1"
