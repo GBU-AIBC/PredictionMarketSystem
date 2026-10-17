@@ -11,6 +11,7 @@ from pms.strategies.projections import (
 )
 
 H1_FLB_STRATEGY_ID = "h1_flb"
+H1_FLB_LEGACY_VERSION_IDS = frozenset({"h1-flb-v1"})
 H1_FLB_ECONOMICS_VERSION = "h1-flb-economics-v1"
 H1_FLB_ENTRY_EXECUTION_COST_BPS = 15.0
 H1_FLB_FEE_RATE = 0.07

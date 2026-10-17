@@ -7,7 +7,7 @@ import logging
 from copy import deepcopy
 from math import isfinite
 from hashlib import sha256
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -152,6 +152,7 @@ from pms.strategies.anchoring import (
     LiveAnchoringSource,
 )
 from pms.strategies.anchoring.source import (
+    ANCHORING_LEGACY_VERSION_IDS,
     AnchoringMarketSnapshotReader,
     build_anchoring_strategy,
 )
@@ -168,6 +169,7 @@ from pms.strategies.flb.source import (
     load_flb_calibration_csv,
 )
 from pms.strategies.flb.projection import (
+    H1_FLB_LEGACY_VERSION_IDS,
     H1_FLB_STRATEGY_ID,
     build_h1_flb_strategy,
 )
@@ -194,6 +196,7 @@ from pms.strategies.ripple import (
     RippleStrategyModule,
 )
 from pms.strategies.ripple.source import (
+    RIPPLE_LEGACY_VERSION_IDS,
     RippleFactorSnapshotReader,
     RippleMarketSnapshotReader,
     build_ripple_strategy,
@@ -933,7 +936,7 @@ class Runner:
             _verify_runtime_strategy_version(
                 h1_strategy,
                 strategy_version_id,
-                legacy_ids={"h1-flb-v1"},
+                legacy_ids=H1_FLB_LEGACY_VERSION_IDS,
             )
         position_sizing_risk = self.config.risk
         if h1_strategy is not None:
@@ -1067,7 +1070,7 @@ class Runner:
         _verify_runtime_strategy_version(
             ripple_strategy,
             strategy_version_id,
-            legacy_ids={"ripple-v1"},
+            legacy_ids=RIPPLE_LEGACY_VERSION_IDS,
         )
         ripple_metadata = dict(ripple_strategy.config.metadata)
 
@@ -1150,7 +1153,7 @@ class Runner:
         _verify_runtime_strategy_version(
             anchoring_strategy,
             strategy_version_id,
-            legacy_ids={"h2-anchoring-lag-v1"},
+            legacy_ids=ANCHORING_LEGACY_VERSION_IDS,
         )
         anchoring_metadata = dict(anchoring_strategy.config.metadata)
 
@@ -4838,7 +4841,7 @@ def _verify_runtime_strategy_version(
     strategy: Strategy,
     strategy_version_id: str,
     *,
-    legacy_ids: set[str],
+    legacy_ids: Collection[str],
 ) -> str:
     expected_version_id = compute_strategy_version_id(*strategy.snapshot())
     if strategy_version_id == expected_version_id:
