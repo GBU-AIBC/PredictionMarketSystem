@@ -199,6 +199,7 @@ class MarketDataSensor:
                     OSError,
                     TimeoutError,
                     InvalidHandshake,
+                    asyncpg.InterfaceError,
                     asyncpg.PostgresError,
                     SensorDataQualityError,
                     ValueError,
@@ -210,7 +211,8 @@ class MarketDataSensor:
                             SensorDataQualityError,
                             ValueError,
                             TypeError,
-                            asyncpg.PostgresError,
+                            asyncpg.DataError,
+                            asyncpg.IntegrityConstraintViolationError,
                         ),
                     )
                     connection_had_data_error = is_data_error
@@ -238,6 +240,7 @@ class MarketDataSensor:
                     else:
                         _log_reconnectable_error(error)
                     if connection_had_data and not connection_had_data_error:
+                        self._consecutive_data_error_reconnects = 0
                         backoff = self._INITIAL_BACKOFF_S
                     await self._sleep(backoff)
                     if not connection_had_data or connection_had_data_error:

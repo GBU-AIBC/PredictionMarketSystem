@@ -811,6 +811,52 @@ async def test_market_data_sensor_survives_persistence_type_errors(
 
 
 @pytest.mark.asyncio
+async def test_market_data_sensor_recovers_after_postgres_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncpg
+
+    store = _store_mock()
+    store_mock = cast(StoreMock, store)
+    store_mock.write_book_snapshot_mock.side_effect = [
+        asyncpg.CannotConnectNowError("database starting")
+    ] * 11 + [1]
+    payload = json.dumps(
+        {
+            "event_type": "book",
+            "market": "m-db-recovery",
+            "asset_id": "asset-db-recovery",
+            "timestamp": "1757908892351",
+            "hash": "book-db-recovery",
+            "bids": [{"price": "0.48", "size": "30"}],
+            "asks": [{"price": "0.52", "size": "25"}],
+        }
+    )
+    monkeypatch.setattr(
+        "pms.sensor.adapters.market_data.connect",
+        ConnectSequence([FakeWebSocket([payload]) for _ in range(12)]),
+    )
+    sensor = MarketDataSensor(
+        store=store,
+        ws_url="ws://market-data.example.test",
+        asset_ids=["asset-db-recovery"],
+    )
+    sensor._INITIAL_BACKOFF_S = 0.0
+    async def fake_sleep(seconds: float) -> None:
+        del seconds
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(sensor, "_sleep", fake_sleep)
+    iterator = cast(Any, sensor.__aiter__())
+
+    signal = await asyncio.wait_for(anext(iterator), timeout=0.5)
+
+    assert signal.market_id == "m-db-recovery"
+    assert sensor.consecutive_data_error_reconnects == 0
+    await sensor.aclose()
+
+
+@pytest.mark.asyncio
 async def test_market_data_sensor_fails_after_repeated_persistence_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -903,6 +949,72 @@ async def test_market_data_sensor_poison_after_good_frame_keeps_backoff_and_esca
 
     assert sleeps == [0.01, 0.02, 0.04, 0.08]
     assert sensor.consecutive_data_error_reconnects == 5
+    await sensor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_isolated_bad_frames_reset_after_healthy_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store_mock()
+    store_mock = cast(StoreMock, store)
+    store_mock.write_book_snapshot_mock.side_effect = [
+        value
+        for _ in range(5)
+        for value in (TypeError("isolated poison"), 1)
+    ]
+
+    def _book_payload(hash_value: str) -> str:
+        return json.dumps(
+            {
+                "event_type": "book",
+                "market": "m-isolated",
+                "asset_id": "asset-isolated",
+                "timestamp": "1757908892351",
+                "hash": hash_value,
+                "bids": [{"price": "0.48", "size": "30"}],
+                "asks": [{"price": "0.52", "size": "25"}],
+            }
+        )
+
+    responses: list[FakeWebSocket] = []
+    for index in range(5):
+        responses.extend(
+            [
+                FakeWebSocket([_book_payload(f"bad-{index}")]),
+                FakeWebSocket([_book_payload(f"good-{index}")]),
+            ]
+        )
+    monkeypatch.setattr(
+        "pms.sensor.adapters.market_data.connect",
+        ConnectSequence(responses),
+    )
+    sensor = MarketDataSensor(
+        store=store,
+        ws_url="ws://market-data.example.test",
+        asset_ids=["asset-isolated"],
+    )
+    sensor._INITIAL_BACKOFF_S = 0.0
+    sleep_calls = 0
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        del seconds
+        if sleep_calls == 10:
+            raise asyncio.CancelledError
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(sensor, "_sleep", fake_sleep)
+    iterator = cast(Any, sensor.__aiter__())
+
+    for _ in range(5):
+        signal = await asyncio.wait_for(anext(iterator), timeout=0.5)
+        assert signal.market_id == "m-isolated"
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(anext(iterator), timeout=0.5)
+    assert sensor.consecutive_data_error_reconnects == 0
     await sensor.aclose()
 
 

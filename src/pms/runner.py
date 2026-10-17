@@ -3078,6 +3078,7 @@ class Runner:
         ]
         async with self._reselection_lock:
             if generation != self._reselection_generation:
+                self._reselection_requested.set()
                 return
             await subscription_controller.update(
                 _cap_subscription_asset_ids(
