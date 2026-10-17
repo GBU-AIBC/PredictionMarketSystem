@@ -428,8 +428,11 @@ preflight artifact check as startup.
 
 The optional `agent` extra installs the official MCP Python SDK and exposes a
 stdio server that forwards a curated, scoped tool set to the typed PMS HTTP
-API. The proxy has no trading logic and cannot start LIVE, switch mode, accept
-a live decision, clear a halt, or resolve an incident.
+API. At startup it fetches `/openapi.json`, derives each tool schema from the
+live operation, and fails closed on schema drift; Wave 2B contribution tools
+appear only after their routes are present. The proxy has no trading logic and
+cannot start LIVE, switch mode, accept a live decision, clear a halt, or
+resolve an incident.
 
 ```bash
 uv sync --extra agent
@@ -446,7 +449,7 @@ environment rather than checking it into the file):
   "mcpServers": {
     "pms": {
       "command": "uv",
-      "args": ["run", "--extra", "agent", "pms-mcp"],
+      "args": ["--directory", "/path/to/prediction-market-system", "run", "--extra", "agent", "pms-mcp"],
       "env": {
         "PMS_AGENT_API_BASE_URL": "http://127.0.0.1:8000"
       }
@@ -457,8 +460,14 @@ environment rather than checking it into the file):
 
 For Codex, add the same command as a local MCP server in its MCP settings and
 set `PMS_AGENT_API_BASE_URL` and `PMS_AGENT_TOKEN` in the environment used by
-Codex. `PMS_MCP_BASE_URL`/`PMS_MCP_TOKEN` are accepted aliases for integrations
-that already use those names.
+Codex.
+
+CI should exercise the optional SDK path explicitly:
+
+```bash
+uv sync --extra agent
+uv run pytest -q tests/unit/test_agent_mcp.py
+```
 
 ## Development
 

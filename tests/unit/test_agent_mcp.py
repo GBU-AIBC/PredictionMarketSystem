@@ -1,184 +1,212 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
-import json
-from typing import Any
+from copy import deepcopy
+from typing import Any, cast
 
 import httpx
 import pytest
 
 from pms.agent_mcp.server import (
     MCPConfig,
+    MCPError,
+    MCPStartupError,
     PMSMCPClient,
     TOOL_SPECS,
+    ToolSpec,
+    _assert_safe_tool,
+    _input_schema,
     create_server,
 )
+from pms.api.app import create_app
+from pms.config import PMSSettings
+from pms.core.enums import RunMode
+from pms.runner import Runner
 
 
-NOW = datetime(2026, 10, 18, 0, 0, tzinfo=UTC)
+def _app_openapi() -> dict[str, Any]:
+    app = create_app(Runner(config=PMSSettings(auto_migrate_default_v2=False)), auto_start=False)
+    return app.openapi()
 
 
-def _status() -> dict[str, Any]:
-    return {
-        "mode": "paper",
-        "running": True,
-        "healthy": True,
-        "workers": {},
-        "autostart_attempted": False,
-        "controller": {},
-        "actuator": {},
-        "evaluator": {},
-        "supervision": {},
-        "quality": {},
+def _add_2b_routes(document: dict[str, Any]) -> None:
+    evidence_fields = {
+        "market_id": {"type": "string"},
+        "source": {"type": "string"},
+        "model": {"type": "string"},
+        "url": {"type": "string"},
+        "summary": {"type": "string"},
+        "payload": {"type": "object"},
+        "content_hash": {"type": "string"},
+        "captured_at": {"type": "string", "format": "date-time"},
+        "expires_at": {"anyOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]},
+        "evidence_id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+    }
+    factor_fields = {
+        "market_id": {"type": "string"},
+        "param": {"type": "string", "default": ""},
+        "value": {},
+        "ts": {"type": "string", "format": "date-time"},
+        "model": {"type": "string"},
+        "prompt_hash": {"type": "string"},
+        "evidence_ids": {"type": "array", "items": {"type": "string"}, "default": []},
+    }
+
+    def operation(fields: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "parameters": [],
+            "requestBody": {
+                "required": True,
+                "content": {"application/json": {"schema": {"type": "object", "properties": fields, "required": list(fields)}}},
+            },
+            "responses": {"201": {"content": {"application/json": {"schema": {"type": "object"}}}}},
+        }
+
+    document["paths"]["/evidence"] = {"post": operation(evidence_fields)}
+    document["paths"]["/factors/{factor_id}/observations"] = {
+        "post": {
+            **operation(factor_fields),
+            "parameters": [{"name": "factor_id", "in": "path", "required": True, "schema": {"type": "string"}}],
+        }
     }
 
 
-def _market() -> dict[str, Any]:
-    return {
-        "market_id": "m1",
-        "question": "Will it happen?",
-        "venue": "polymarket",
-        "volume_24h": 1.0,
-        "updated_at": NOW.isoformat(),
-        "yes_token_id": "yes",
-        "no_token_id": "no",
-        "subscribed": False,
-    }
-
-
-def _signal() -> dict[str, Any]:
-    return {
-        "market_id": "m1",
-        "token_id": "yes",
-        "venue": "polymarket",
-        "title": "Will it happen?",
-        "yes_price": 0.5,
-        "volume_24h": 1.0,
-        "resolves_at": None,
-        "orderbook": {},
-        "external_signal": {},
-        "fetched_at": NOW.isoformat(),
-        "market_status": "open",
-    }
-
-
-def _handler(requests: list[httpx.Request]) -> Any:
-    def handle(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        path = request.url.path
-        if path == "/status":
-            return httpx.Response(200, json=_status())
-        if path == "/markets":
-            return httpx.Response(200, json={"markets": [_market()], "limit": 20, "offset": 0, "total": 1})
-        if path == "/selection/explain":
-            return httpx.Response(200, json={"market_id": "m1", "available": True})
-        if path == "/signals":
-            return httpx.Response(200, json=[_signal()])
-        if path == "/factors/catalog":
-            return httpx.Response(200, json={"catalog": []})
-        if path == "/factors":
-            return httpx.Response(200, json={"factor_id": "agent_probability", "param": "", "market_id": "m1", "points": []})
-        if path == "/evidence":
-            return httpx.Response(200, json={
-                "evidence_id": "e1", "market_id": "m1", "source": "agent", "model": "m",
-                "url": "https://example.test", "summary": "s", "payload": {}, "content_hash": "a" * 64,
-                "captured_at": NOW.isoformat(), "expires_at": None, "submitted_by_token_id": "agent",
-                "created_at": NOW.isoformat(),
-            })
-        if path == "/factors/agent_probability/observations":
-            return httpx.Response(200, json={
-                "factor_id": "agent_probability", "param": "", "market_id": "m1", "ts": NOW.isoformat(),
-                "value": 0.7, "definition_version": "1", "provenance_written": True,
-            })
-        if path == "/research/backtest":
-            return httpx.Response(200, json={"run_id": "run-1", "status": "queued"})
-        if path == "/research/backtest/run-1":
-            return httpx.Response(200, json={"run_id": "run-1", "status": "complete"})
-        if path == "/evaluation/reports/report-1":
-            return httpx.Response(200, json={
-                "report_id": "report-1", "run_id": "run-1", "ranking_metric": "brier",
-                "ranked_strategies": [], "benchmark_rows": [], "warnings": [],
-                "generated_at": NOW.isoformat(),
-            })
-        if path == "/decisions/d1/explain":
-            return httpx.Response(200, json={"decision_id": "d1", "available": False})
-        if path == "/decisions/d1/risk-check":
-            return httpx.Response(200, json={"decision_id": "d1", "approved": False, "reason": "pending"})
-        if path == "/approvals/pending":
-            return httpx.Response(200, json={"approvals": []})
-        if path == "/positions":
-            return httpx.Response(200, json={"positions": []})
-        if path == "/run/kill":
-            return httpx.Response(200, json={"status": "killed"})
-        return httpx.Response(404, json={"detail": path})
-
-    return handle
+def _client(handler: Any, *, token: str = "agent-secret", timeout: float = 1.0) -> tuple[PMSMCPClient, httpx.AsyncClient]:
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://test")
+    return PMSMCPClient(MCPConfig("http://test", token, timeout), http_client=http_client, timeout=timeout), http_client
 
 
 @pytest.mark.asyncio
-async def test_tools_forward_typed_requests_with_bearer_token() -> None:
-    requests: list[httpx.Request] = []
-    transport = httpx.MockTransport(_handler(requests))
-    http_client = httpx.AsyncClient(transport=transport, base_url="http://test")
-    client = PMSMCPClient(MCPConfig("http://test", "agent-secret"), http_client=http_client)
-    try:
-        await client.get_status()
-        await client.list_markets(q="election")
-        await client.explain_selection("m1")
-        await client.list_signals(limit=3)
-        await client.get_factor_catalog()
-        await client.get_factor_series(factor_id="agent_probability", market_id="m1")
-        await client.submit_evidence({
-            "market_id": "m1", "source": "agent", "model": "m", "url": "https://example.test",
-            "summary": "s", "payload": {}, "content_hash": "a" * 64, "captured_at": NOW,
-        })
-        await client.submit_agent_factor("agent_probability", {
-            "market_id": "m1", "value": 0.7, "ts": NOW, "model": "m", "prompt_hash": "b" * 64,
-        })
-        await client.run_backtest("sweep: []")
-        await client.get_research_report("run-1")
-        await client.get_research_report(report_id="report-1")
-        await client.explain_decision("d1")
-        await client.risk_check_decision("d1")
-        await client.list_pending_approvals()
-        await client.list_positions()
-        await client.kill_switch()
-    finally:
-        await http_client.aclose()
-
-    assert [request.method for request in requests] == [
-        "GET", "GET", "GET", "GET", "GET", "GET", "POST", "POST", "POST", "GET",
-        "GET", "GET", "POST", "GET", "GET", "POST",
-    ]
-    assert requests[0].headers["authorization"] == "Bearer agent-secret"
-    assert requests[1].url.params["q"] == "election"
-    assert json.loads(requests[6].content)["market_id"] == "m1"
-    assert json.loads(requests[7].content)["prompt_hash"] == "b" * 64
-    assert json.loads(requests[8].content) == {"sweep_yaml": "sweep: []"}
-
-
-def test_tool_specs_are_curated_and_do_not_expose_live_mutations() -> None:
-    names = {spec.name for spec in TOOL_SPECS}
-    assert len(names) == 15
-    assert "kill_switch" in names
-    forbidden = ("start", "live", "switch_mode", "accept", "clear", "resolve", "reconcile")
-    assert not any(any(word in name for word in forbidden) for name in names if name != "kill_switch")
-    assert next(spec for spec in TOOL_SPECS if spec.name == "kill_switch").scope == "kill"
-    assert {spec.name for spec in TOOL_SPECS if spec.requires_routes} == {
-        "submit_evidence",
-        "submit_agent_factor",
-    }
-
-
-@pytest.mark.asyncio
-async def test_mcp_server_registers_exact_curated_tool_list() -> None:
+async def test_openapi_drives_active_tool_schemas_and_feature_detects_2b() -> None:
     pytest.importorskip("mcp")
-    requests: list[httpx.Request] = []
-    http_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(_handler(requests)),
-        base_url="http://test",
+    without_2b = _app_openapi()
+    client, transport_client = _client(lambda request: httpx.Response(200, json={"ok": True}))
+    try:
+        server = await create_server(client, openapi=without_2b)
+        names = {tool.name for tool in await server.list_tools()}
+        assert "submit_evidence" not in names
+        assert "submit_agent_factor" not in names
+        assert len(names) == 13
+
+        with_2b = deepcopy(without_2b)
+        _add_2b_routes(with_2b)
+        server = await create_server(client, openapi=with_2b)
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        assert {name for name in tools if name.startswith("submit_")} == {"submit_evidence", "submit_agent_factor"}
+        for spec in TOOL_SPECS:
+            if spec.name not in tools:
+                continue
+            operation = with_2b["paths"][spec.path][spec.method.lower()]
+            assert tools[spec.name].inputSchema == _input_schema(spec, operation, with_2b)
+            assert tools[spec.name].outputSchema is not None
+    finally:
+        await transport_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_missing_required_operation_and_malformed_openapi_fail_closed() -> None:
+    pytest.importorskip("mcp")
+    document = _app_openapi()
+    document["paths"].pop("/status")
+    client, transport_client = _client(lambda request: httpx.Response(200, json={}))
+    try:
+        with pytest.raises(MCPStartupError, match="missing_operation"):
+            await create_server(client, openapi=document)
+        with pytest.raises(MCPStartupError, match="paths object"):
+            await client.prepare({"openapi": "3.1.0"})
+    finally:
+        await transport_client.aclose()
+
+
+def test_endpoint_guard_rejects_mutated_live_operation() -> None:
+    with pytest.raises(MCPStartupError, match="forbidden_operation"):
+        _assert_safe_tool(ToolSpec("approve_decision", "POST", "/decisions/{decision_id}/accept", "paper_operate"))
+    with pytest.raises(MCPStartupError):
+        _assert_safe_tool(ToolSpec("resume", "POST", "/run/start", "paper_operate"))
+    _assert_safe_tool(next(spec for spec in TOOL_SPECS if spec.name == "kill_switch"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "error_code", "status"),
+    [
+        (httpx.Response(200, text="not-json"), "bad_json", 200),
+        (httpx.Response(401, text="agent-secret should not be copied"), "http_error", 401),
+        (httpx.Response(403, json={"detail": "forbidden"}), "http_error", 403),
+        (httpx.Response(503, text="x" * 2000), "http_error", 503),
+    ],
+)
+async def test_typed_errors_are_bounded_and_status_aware(response: httpx.Response, error_code: str, status: int) -> None:
+    client, transport_client = _client(lambda request: response)
+    try:
+        with pytest.raises(MCPError) as raised:
+            await client.get_status()
+        assert raised.value.code == error_code
+        assert raised.value.status_code == status
+        assert len(raised.value.detail) <= 513
+        assert "agent-secret" not in str(raised.value)
+    finally:
+        await transport_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_timeout_and_owned_client_shutdown_are_typed() -> None:
+    def timeout(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("upstream timed out")
+
+    client, transport_client = _client(timeout, timeout=0.1)
+    try:
+        with pytest.raises(MCPError, match="timeout"):
+            await client.get_status()
+    finally:
+        await transport_client.aclose()
+    owned = PMSMCPClient(MCPConfig("http://test", "secret"))
+    assert not owned._client.is_closed
+    await owned.aclose()
+    assert owned._client.is_closed
+
+
+@pytest.mark.asyncio
+async def test_real_scoped_tokens_through_asgi_mcp_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("READ_SECRET", "read-secret")
+    monkeypatch.setenv("KILL_SECRET", "kill-secret")
+    settings = PMSSettings(
+        mode=RunMode.PAPER,
+        api_tokens=cast(Any, [
+            {"token_id": "read", "secret": "READ_SECRET", "scopes": ["read"]},
+            {"token_id": "kill", "secret": "KILL_SECRET", "scopes": ["kill"]},
+        ]),
+        auto_migrate_default_v2=False,
     )
-    server = create_server(PMSMCPClient(MCPConfig("http://test", "secret"), http_client=http_client))
-    tools = await server.list_tools()
-    assert {tool.name for tool in tools} == {spec.name for spec in TOOL_SPECS}
-    await http_client.aclose()
+    runner = Runner(config=settings)
+
+    async def stop(*, close_pool: bool = True) -> None:
+        del close_pool
+
+    runner.stop = stop  # type: ignore[method-assign]
+    app = create_app(runner, auto_start=False)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as read_http:
+        read_client = PMSMCPClient(MCPConfig("http://test", "read-secret"), http_client=read_http)
+        await read_client.get_status()
+        with pytest.raises(MCPError) as forbidden:
+            await read_client.kill_switch()
+        assert forbidden.value.status_code == 403
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as bad_http:
+        bad_client = PMSMCPClient(MCPConfig("http://test", "bad-secret"), http_client=bad_http)
+        with pytest.raises(MCPError) as unauthorized:
+            await bad_client.get_status()
+        assert unauthorized.value.status_code == 401
+        assert "bad-secret" not in str(unauthorized.value)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as kill_http:
+        kill_client = PMSMCPClient(MCPConfig("http://test", "kill-secret"), http_client=kill_http)
+        assert (await kill_client.kill_switch())["status"] == "killed"
+
+
+def test_env_requires_exact_nonblank_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PMS_AGENT_API_BASE_URL", " ")
+    monkeypatch.setenv("PMS_AGENT_TOKEN", "token")
+    with pytest.raises(ValueError, match="API_BASE_URL"):
+        MCPConfig.from_env()
+    monkeypatch.setenv("PMS_AGENT_API_BASE_URL", "http://test")
+    monkeypatch.setenv("PMS_AGENT_TOKEN", "  ")
+    with pytest.raises(ValueError, match="AGENT_TOKEN"):
+        MCPConfig.from_env()

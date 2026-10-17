@@ -1,707 +1,289 @@
-"""A thin Model Context Protocol proxy for the PMS typed HTTP API.
-
-The proxy deliberately owns no PMS runtime state.  Every tool is a small
-HTTP request using the configured bearer token; the API remains the only
-place that performs validation, authorization, and business decisions.
-"""
+"""A thin, OpenAPI-driven MCP proxy for the PMS HTTP API."""
 
 from __future__ import annotations
 
 import asyncio
+import inspect
+import math
 import os
-from collections.abc import Callable, Sequence
+import sys
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal, Mapping, Protocol, TypeVar, cast
+from typing import Any, Literal, cast
 from urllib.parse import quote
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import RootModel
+
+DEFAULT_TIMEOUT_SECONDS = 20.0
+MAX_ERROR_DETAIL = 512
+QueryValue = str | int | float | bool | None | Sequence[str | int | float | bool | None]
+QueryParams = Mapping[str, QueryValue]
+FORBIDDEN_OPERATIONS = frozenset({
+    ("POST", "/run/start"),
+    ("POST", "/run/stop"),
+    ("POST", "/config"),
+    ("POST", "/decisions/{decision_id}/accept"),
+})
 
 
 class MCPError(RuntimeError):
-    """An HTTP failure returned by the PMS API."""
+    """A typed proxy or API error safe to return through MCP."""
 
-    def __init__(self, status_code: int, detail: object) -> None:
-        super().__init__(f"PMS API request failed ({status_code}): {detail}")
+    def __init__(
+        self,
+        code: str,
+        detail: str,
+        *,
+        status_code: int | None = None,
+    ) -> None:
+        self.code = code
         self.status_code = status_code
-        self.detail = detail
+        self.detail = _truncate(detail)
+        super().__init__(f"{code}: {self.detail}")
+
+
+class MCPStartupError(MCPError):
+    """The API contract cannot safely back the MCP tool surface."""
 
 
 @dataclass(frozen=True, slots=True)
 class MCPConfig:
-    """Connection settings for the proxy process."""
+    """A validated, single-source MCP connection configuration."""
 
     base_url: str
     token: str
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        base_url = self.base_url.strip()
+        token = self.token.strip()
+        if not base_url:
+            raise ValueError("PMS_AGENT_API_BASE_URL must not be blank")
+        if not token:
+            raise ValueError("PMS_AGENT_TOKEN must not be blank")
+        try:
+            parsed = httpx.URL(base_url)
+        except httpx.InvalidURL as exc:
+            raise ValueError("PMS_AGENT_API_BASE_URL must be an absolute HTTP URL") from exc
+        if parsed.scheme not in {"http", "https"} or not parsed.host:
+            raise ValueError("PMS_AGENT_API_BASE_URL must be an absolute HTTP URL")
+        if not math.isfinite(self.timeout_seconds) or not 0 < self.timeout_seconds <= 60:
+            raise ValueError("MCP timeout must be between 0 and 60 seconds")
+        object.__setattr__(self, "base_url", base_url.rstrip("/"))
+        object.__setattr__(self, "token", token)
 
     @classmethod
     def from_env(cls) -> MCPConfig:
-        base_url = _first_env(
-            "PMS_AGENT_API_BASE_URL",
-            "PMS_MCP_API_BASE_URL",
-            "PMS_MCP_BASE_URL",
-            "PMS_API_BASE_URL",
-        ) or "http://127.0.0.1:8000"
-        token = _first_env(
-            "PMS_AGENT_TOKEN",
-            "PMS_AGENT_API_TOKEN",
-            "PMS_MCP_TOKEN",
-            "PMS_MCP_API_TOKEN",
-        )
-        if not token:
-            raise ValueError("PMS_AGENT_TOKEN (or PMS_MCP_TOKEN) is required")
+        base_url = os.environ.get("PMS_AGENT_API_BASE_URL")
+        token = os.environ.get("PMS_AGENT_TOKEN")
+        if base_url is None or not base_url.strip():
+            raise ValueError("PMS_AGENT_API_BASE_URL must not be blank")
+        if token is None or not token.strip():
+            raise ValueError("PMS_AGENT_TOKEN must not be blank")
         return cls(base_url=base_url, token=token)
 
 
 @dataclass(frozen=True, slots=True)
 class ToolSpec:
-    """The HTTP contract and scope for one exposed MCP tool."""
+    """Static endpoint identity; all schemas come from OpenAPI."""
 
     name: str
     method: Literal["GET", "POST"]
     path: str
     scope: str
+    query_params: tuple[str, ...] = ()
+    path_params: tuple[str, ...] = ()
+    body_fields: tuple[str, ...] = ()
     requires_routes: bool = False
 
 
 TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("get_status", "GET", "/status", "read"),
-    ToolSpec("list_markets", "GET", "/markets", "read"),
-    ToolSpec("explain_selection", "GET", "/selection/explain", "read"),
-    ToolSpec("list_signals", "GET", "/signals", "read"),
-    ToolSpec("get_factor_catalog", "GET", "/factors/catalog", "read"),
-    ToolSpec("get_factor_series", "GET", "/factors", "read"),
-    # These two routes are supplied by Wave 2B.  Keep the proxy contract in
-    # place so the tools become usable as soon as that lane lands.
-    ToolSpec("submit_evidence", "POST", "/evidence", "paper_operate|research", True),
     ToolSpec(
-        "submit_agent_factor",
-        "POST",
-        "/factors/{factor_id}/observations",
-        "paper_operate|research",
-        True,
+        "list_markets", "GET", "/markets", "read",
+        query_params=("limit", "offset", "q", "volume_min", "liquidity_min", "spread_max_bps", "yes_min", "yes_max", "resolves_within_days", "subscribed"),
     ),
-    ToolSpec("run_backtest", "POST", "/research/backtest", "research"),
-    ToolSpec("get_research_report", "GET", "/research/backtest/{run_id}", "research"),
-    ToolSpec("explain_decision", "GET", "/decisions/{decision_id}/explain", "read"),
-    ToolSpec("risk_check_decision", "POST", "/decisions/{decision_id}/risk-check", "read"),
+    ToolSpec("explain_selection", "GET", "/selection/explain", "read", query_params=("market_id",)),
+    ToolSpec("list_signals", "GET", "/signals", "read", query_params=("limit",)),
+    ToolSpec("get_factor_catalog", "GET", "/factors/catalog", "read"),
+    ToolSpec("get_factor_series", "GET", "/factors", "read", query_params=("factor_id", "market_id", "param", "since", "limit")),
+    ToolSpec("submit_evidence", "POST", "/evidence", "paper_operate|research", body_fields=("market_id", "source", "model", "url", "summary", "payload", "content_hash", "captured_at", "expires_at", "evidence_id"), requires_routes=True),
+    ToolSpec("submit_agent_factor", "POST", "/factors/{factor_id}/observations", "paper_operate|research", path_params=("factor_id",), body_fields=("market_id", "param", "value", "ts", "model", "prompt_hash", "evidence_ids"), requires_routes=True),
+    ToolSpec("run_backtest", "POST", "/research/backtest", "research", body_fields=("sweep_yaml",)),
+    ToolSpec("get_research_report", "GET", "/evaluation/reports/{report_id}", "read", path_params=("report_id",)),
+    ToolSpec("explain_decision", "GET", "/decisions/{decision_id}/explain", "read", path_params=("decision_id",)),
+    ToolSpec("risk_check_decision", "POST", "/decisions/{decision_id}/risk-check", "read", path_params=("decision_id",)),
     ToolSpec("list_pending_approvals", "GET", "/approvals/pending", "read"),
     ToolSpec("list_positions", "GET", "/positions", "read"),
     ToolSpec("kill_switch", "POST", "/run/kill", "kill"),
 )
 
 
-class APIModel(BaseModel):
-    model_config = ConfigDict(extra="allow")
+@dataclass(frozen=True, slots=True)
+class OpenAPIOperation:
+    spec: ToolSpec
+    operation: Mapping[str, Any]
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any]
 
 
-class StatusResponse(APIModel):
-    mode: str
-    runner_started_at: str | None = None
-    running: bool
-    healthy: bool
-    workers: dict[str, Any]
-    autostart_attempted: bool
-    autostart_error: str | None = None
-    runtime_continuity: Any = None
-    sensors: Any = Field(default_factory=dict)
-    controller: dict[str, Any]
-    actuator: dict[str, Any]
-    evaluator: dict[str, Any]
-    supervision: dict[str, Any]
-    quality: dict[str, Any]
-
-
-class Market(APIModel):
-    market_id: str
-    question: str
-    venue: str
-    volume_24h: float | None
-    updated_at: str
-    resolves_at: str | None = None
-    yes_token_id: str | None
-    no_token_id: str | None
-    yes_price: float | None = None
-    no_price: float | None = None
-    best_bid: float | None = None
-    best_ask: float | None = None
-    last_trade_price: float | None = None
-    liquidity: float | None = None
-    spread_bps: int | None = None
-    price_updated_at: str | None = None
-    subscription_source: str | None = None
-    subscribed: bool
-
-
-class MarketsResponse(APIModel):
-    markets: list[Market]
-    limit: int
-    offset: int
-    total: int
-
-
-class Signal(APIModel):
-    market_id: str
-    token_id: str | None
-    venue: str
-    title: str
-    yes_price: float
-    volume_24h: float | None
-    resolves_at: datetime | None
-    orderbook: dict[str, Any]
-    external_signal: dict[str, Any]
-    fetched_at: datetime
-    market_status: str
-
-
-class SelectionExplanation(APIModel):
-    market_id: str
-    available: bool
-    reason: str | None = None
-    reasons: list[str] = Field(default_factory=list)
-    strategy_ids: list[str] = Field(default_factory=list)
-    token_ids: list[str] = Field(default_factory=list)
-    pinned_token_ids: list[str] = Field(default_factory=list)
-    capped: bool = False
-    strategy_reasons: dict[str, str] = Field(default_factory=dict)
-
-
-class FactorCatalogEntry(APIModel):
-    factor_id: str
-    name: str
-    description: str
-    output_type: str
-    direction: str
-
-
-class FactorCatalogResponse(APIModel):
-    catalog: list[FactorCatalogEntry]
-
-
-class FactorPoint(APIModel):
-    ts: datetime
-    value: float
-
-
-class FactorSeriesResponse(APIModel):
-    factor_id: str
-    param: str
-    market_id: str
-    points: list[FactorPoint]
-
-
-class AgentEvidenceRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    market_id: str = Field(min_length=1, max_length=256)
-    source: str = Field(min_length=1, max_length=512)
-    model: str = Field(min_length=1, max_length=256)
-    url: str = Field(min_length=1, max_length=2048)
-    summary: str = Field(min_length=1, max_length=8192)
-    payload: dict[str, Any]
-    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
-    captured_at: datetime
-    expires_at: datetime | None = None
-    evidence_id: str | None = Field(default=None, min_length=1, max_length=256)
-
-
-class AgentEvidenceResponse(APIModel):
-    evidence_id: str
-    market_id: str
-    source: str
-    model: str
-    url: str
-    summary: str
-    payload: dict[str, Any]
-    content_hash: str
-    captured_at: datetime
-    expires_at: datetime | None
-    submitted_by_token_id: str
-    created_at: datetime
-
-
-class AgentFactorRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    market_id: str = Field(min_length=1, max_length=256)
-    param: str = Field(default="", max_length=256)
-    value: Any
-    ts: datetime
-    model: str = Field(min_length=1, max_length=256)
-    prompt_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
-    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
-
-
-class AgentFactorResponse(APIModel):
-    factor_id: str
-    param: str
-    market_id: str
-    ts: datetime
-    value: float
-    definition_version: str
-    provenance_written: bool
-
-
-class ResearchRunResponse(APIModel):
-    run_ids: list[str] = Field(default_factory=list)
-    unique_run_count: int | None = None
-    runs: list[dict[str, Any]] = Field(default_factory=list)
-    run_id: str | None = None
-    status: str | None = None
-
-
-class EvaluationReportResponse(APIModel):
-    report_id: str
-    run_id: str
-    ranking_metric: Literal["brier", "sharpe", "pnl_cum"]
-    ranked_strategies: list[dict[str, Any]]
-    benchmark_rows: list[dict[str, Any]]
-    attribution_commentary: str | None = None
-    warnings: list[Any]
-    next_action: str | None = None
-    generated_at: datetime
-
-
-class DecisionExplanation(APIModel):
-    decision_id: str
-    available: bool
-    reason: str | None = None
-    decision_trace: dict[str, Any] | None = None
-    forecasts: dict[str, Any] | None = None
-    gates: dict[str, Any] | None = None
-    sizing: dict[str, Any] | None = None
-    risk: dict[str, Any] | None = None
-
-
-class RiskCheckResponse(APIModel):
-    decision_id: str
-    approved: bool
-    reason: str
-
-
-class PendingApprovalsResponse(APIModel):
-    approvals: list[dict[str, Any]]
-
-
-class Position(APIModel):
-    market_id: str
-    token_id: str | None
-    venue: str
-    side: str
-    shares_held: float
-    avg_entry_price: float
-    unrealized_pnl: float
-    locked_usdc: float
-    mark_source: str | None = None
-    mark_age_seconds: float | None = None
-    strategy_id: str
-    strategy_version_id: str
-    risk_group_id: str | None = None
-
-
-class PositionsResponse(APIModel):
-    positions: list[Position]
-
-
-class RunStopResponse(APIModel):
-    status: str
-
-
-ModelT = TypeVar("ModelT", bound=BaseModel)
-QueryValue = str | int | float | bool | None | Sequence[str | int | float | bool | None]
-QueryParams = Mapping[str, QueryValue]
-
-
-class MCPServerLike(Protocol):
-    def tool(
-        self,
-        *,
-        name: str,
-        structured_output: bool,
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]: ...
-
-    async def run_stdio_async(self) -> None: ...
+class _AnyOutput(RootModel[Any]):
+    """Runtime adapter; its advertised schema is replaced by OpenAPI."""
 
 
 class PMSMCPClient:
-    """Typed async client used by MCP tools and unit tests."""
+    """HTTP-only client. It never imports PMS runtime modules."""
 
-    def __init__(
-        self,
-        config: MCPConfig | None = None,
-        *,
-        http_client: httpx.AsyncClient | None = None,
-        timeout: float = 20.0,
-    ) -> None:
+    def __init__(self, config: MCPConfig | None = None, *, http_client: httpx.AsyncClient | None = None, timeout: float | None = None) -> None:
         resolved = config or MCPConfig.from_env()
-        self.config = resolved
-        self._client = http_client or httpx.AsyncClient(
-            base_url=resolved.base_url.rstrip("/"),
-            headers={"Authorization": f"Bearer {resolved.token}"},
-            timeout=timeout,
-        )
-        if http_client is not None:
+        effective_timeout = resolved.timeout_seconds if timeout is None else timeout
+        if not math.isfinite(effective_timeout) or not 0 < effective_timeout <= 60:
+            raise ValueError("MCP timeout must be between 0 and 60 seconds")
+        if http_client is None:
+            self._client = httpx.AsyncClient(base_url=resolved.base_url, headers={"Authorization": f"Bearer {resolved.token}"}, timeout=resolved.timeout_seconds)
+            self._owns_client = True
+        else:
+            self._client = http_client
+            if not str(http_client.base_url):
+                http_client.base_url = httpx.URL(resolved.base_url)
             http_client.headers["Authorization"] = f"Bearer {resolved.token}"
-        self._owns_client = http_client is None
+            self._owns_client = False
+        self.config = resolved
+        self._timeout = effective_timeout
 
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
 
-    async def _request(
-        self,
-        method: Literal["GET", "POST"],
-        path: str,
-        *,
-        params: QueryParams | None = None,
-        json: object | None = None,
-    ) -> Any:
-        response = await self._client.request(method, path, params=params, json=json)
+    async def fetch_openapi(self) -> dict[str, Any]:
+        payload = await self._request("GET", "/openapi.json")
+        if not isinstance(payload, dict) or not isinstance(payload.get("paths"), dict):
+            raise MCPStartupError("bad_openapi", "OpenAPI response has no paths object")
+        return payload
+
+    async def prepare(self, document: Mapping[str, Any] | None = None) -> tuple[OpenAPIOperation, ...]:
+        openapi = document if document is not None else await self.fetch_openapi()
+        paths = openapi.get("paths")
+        if not isinstance(paths, Mapping):
+            raise MCPStartupError("bad_openapi", "OpenAPI document has no paths object")
+        active: list[OpenAPIOperation] = []
+        for spec in TOOL_SPECS:
+            raw_path = paths.get(spec.path)
+            operation = raw_path.get(spec.method.lower()) if isinstance(raw_path, Mapping) else None
+            if not isinstance(operation, Mapping):
+                if spec.requires_routes:
+                    continue
+                raise MCPStartupError("missing_operation", f"required MCP operation is missing: {spec.method} {spec.path}")
+            active.append(_operation_from_openapi(spec, operation, openapi))
+        return tuple(active)
+
+    async def invoke(self, operation: OpenAPIOperation, arguments: Mapping[str, Any]) -> Any:
+        return await self._invoke_spec(operation.spec, arguments)
+
+    async def _invoke_spec(self, spec: ToolSpec, arguments: Mapping[str, Any]) -> Any:
+        path = spec.path
+        remaining = dict(arguments)
+        for name in spec.path_params:
+            if name not in remaining:
+                raise MCPError("invalid_input", f"missing path parameter: {name}")
+            path = path.replace("{" + name + "}", _path_segment(str(remaining.pop(name))))
+        query: dict[str, object] = {}
+        for name in spec.query_params:
+            if name in remaining and remaining[name] is not None:
+                query[name] = _wire_value(remaining.pop(name))
+        body: dict[str, Any] | None = None
+        if spec.body_fields:
+            body = {name: _wire_value(remaining[name]) for name in spec.body_fields if name in remaining and remaining[name] is not None}
+        return await self._request(spec.method, path, params=cast(QueryParams, query or None), json=body)
+
+    async def _request(self, method: str, path: str, *, params: QueryParams | None = None, json: object | None = None) -> Any:
+        try:
+            response = await self._client.request(method, path, params=params, json=json, timeout=self._timeout)
+        except httpx.TimeoutException as exc:
+            raise MCPError("timeout", "PMS API request timed out") from exc
+        except httpx.HTTPError as exc:
+            raise MCPError("transport", "PMS API transport failed") from exc
         if response.is_error:
-            try:
-                detail: object = response.json()
-            except ValueError:
-                detail = response.text
-            raise MCPError(response.status_code, detail)
-        return response.json()
+            raise MCPError("http_error", _response_detail(response, self.config.token), status_code=response.status_code)
+        try:
+            return response.json()
+        except (TypeError, ValueError) as exc:
+            raise MCPError("bad_json", f"PMS API returned malformed JSON ({response.status_code})", status_code=response.status_code) from exc
 
-    async def _model(
-        self,
-        model: type[ModelT],
-        method: Literal["GET", "POST"],
-        path: str,
-        *,
-        params: QueryParams | None = None,
-        json: object | None = None,
-    ) -> ModelT:
-        return model.model_validate(
-            await self._request(method, path, params=params, json=json)
-        )
+    async def get_status(self) -> Any:
+        return await self._invoke_spec(_static_operation("get_status"), {})
 
-    async def get_status(self) -> StatusResponse:
-        return await self._model(StatusResponse, "GET", "/status")
+    async def list_markets(self, **arguments: Any) -> Any:
+        return await self._invoke_spec(_static_operation("list_markets"), arguments)
 
-    async def list_markets(
-        self,
-        *,
-        limit: int = 20,
-        offset: int = 0,
-        q: str = "",
-        volume_min: float = 0.0,
-        liquidity_min: float = 0.0,
-        spread_max_bps: int | None = None,
-        yes_min: float = 0.0,
-        yes_max: float = 1.0,
-        resolves_within_days: int | None = None,
-        subscribed: Literal["all", "only", "idle"] = "all",
-    ) -> MarketsResponse:
-        params = _compact_params(
-            limit=limit,
-            offset=offset,
-            q=q,
-            volume_min=volume_min,
-            liquidity_min=liquidity_min,
-            spread_max_bps=spread_max_bps,
-            yes_min=yes_min,
-            yes_max=yes_max,
-            resolves_within_days=resolves_within_days,
-            subscribed=subscribed,
-        )
-        return await self._model(MarketsResponse, "GET", "/markets", params=params)
+    async def explain_selection(self, market_id: str) -> Any:
+        return await self._invoke_spec(_static_operation("explain_selection"), {"market_id": market_id})
 
-    async def explain_selection(self, market_id: str) -> SelectionExplanation:
-        return await self._model(
-            SelectionExplanation,
-            "GET",
-            "/selection/explain",
-            params={"market_id": market_id},
-        )
+    async def list_signals(self, *, limit: int = 50) -> Any:
+        return await self._invoke_spec(_static_operation("list_signals"), {"limit": limit})
 
-    async def list_signals(self, *, limit: int = 50) -> list[Signal]:
-        payload = await self._request("GET", "/signals", params={"limit": limit})
-        return [Signal.model_validate(item) for item in payload]
+    async def get_factor_catalog(self) -> Any:
+        return await self._invoke_spec(_static_operation("get_factor_catalog"), {})
 
-    async def get_factor_catalog(self) -> FactorCatalogResponse:
-        return await self._model(FactorCatalogResponse, "GET", "/factors/catalog")
+    async def get_factor_series(self, **arguments: Any) -> Any:
+        return await self._invoke_spec(_static_operation("get_factor_series"), arguments)
 
-    async def get_factor_series(
-        self,
-        *,
-        factor_id: str,
-        market_id: str,
-        param: str = "",
-        since: datetime | None = None,
-        limit: int = 500,
-    ) -> FactorSeriesResponse:
-        return await self._model(
-            FactorSeriesResponse,
-            "GET",
-            "/factors",
-            params=_compact_params(
-                factor_id=factor_id,
-                market_id=market_id,
-                param=param,
-                since=since,
-                limit=limit,
-            ),
-        )
+    async def submit_evidence(self, **arguments: Any) -> Any:
+        return await self._invoke_spec(_static_operation("submit_evidence"), arguments)
 
-    async def submit_evidence(
-        self,
-        request: AgentEvidenceRequest | Mapping[str, Any],
-    ) -> AgentEvidenceResponse:
-        body = AgentEvidenceRequest.model_validate(request)
-        return await self._model(
-            AgentEvidenceResponse,
-            "POST",
-            "/evidence",
-            json=body.model_dump(mode="json", exclude_none=True),
-        )
+    async def submit_agent_factor(self, **arguments: Any) -> Any:
+        return await self._invoke_spec(_static_operation("submit_agent_factor"), arguments)
 
-    async def submit_agent_factor(
-        self,
-        factor_id: str,
-        request: AgentFactorRequest | Mapping[str, Any],
-    ) -> AgentFactorResponse:
-        body = AgentFactorRequest.model_validate(request)
-        return await self._model(
-            AgentFactorResponse,
-            "POST",
-            f"/factors/{_path_segment(factor_id)}/observations",
-            json=body.model_dump(mode="json"),
-        )
+    async def run_backtest(self, sweep_yaml: str) -> Any:
+        return await self._invoke_spec(_static_operation("run_backtest"), {"sweep_yaml": sweep_yaml})
 
-    async def run_backtest(self, sweep_yaml: str) -> ResearchRunResponse:
-        return await self._model(
-            ResearchRunResponse,
-            "POST",
-            "/research/backtest",
-            json={"sweep_yaml": sweep_yaml},
-        )
+    async def get_research_report(self, report_id: str) -> Any:
+        return await self._invoke_spec(_static_operation("get_research_report"), {"report_id": report_id})
 
-    async def get_research_report(
-        self,
-        run_id: str | None = None,
-        *,
-        report_id: str | None = None,
-    ) -> ResearchRunResponse | EvaluationReportResponse:
-        if report_id is not None:
-            return await self._model(
-                EvaluationReportResponse,
-                "GET",
-                f"/evaluation/reports/{_path_segment(report_id)}",
-            )
-        if run_id is None:
-            raise ValueError("run_id or report_id is required")
-        return await self._model(
-            ResearchRunResponse,
-            "GET",
-            f"/research/backtest/{_path_segment(run_id)}",
-        )
+    async def explain_decision(self, decision_id: str) -> Any:
+        return await self._invoke_spec(_static_operation("explain_decision"), {"decision_id": decision_id})
 
-    async def explain_decision(self, decision_id: str) -> DecisionExplanation:
-        return await self._model(
-            DecisionExplanation,
-            "GET",
-            f"/decisions/{_path_segment(decision_id)}/explain",
-        )
+    async def risk_check_decision(self, decision_id: str) -> Any:
+        return await self._invoke_spec(_static_operation("risk_check_decision"), {"decision_id": decision_id})
 
-    async def risk_check_decision(self, decision_id: str) -> RiskCheckResponse:
-        return await self._model(
-            RiskCheckResponse,
-            "POST",
-            f"/decisions/{_path_segment(decision_id)}/risk-check",
-        )
+    async def list_pending_approvals(self) -> Any:
+        return await self._invoke_spec(_static_operation("list_pending_approvals"), {})
 
-    async def list_pending_approvals(self) -> PendingApprovalsResponse:
-        return await self._model(
-            PendingApprovalsResponse,
-            "GET",
-            "/approvals/pending",
-        )
+    async def list_positions(self) -> Any:
+        return await self._invoke_spec(_static_operation("list_positions"), {})
 
-    async def list_positions(self) -> PositionsResponse:
-        return await self._model(PositionsResponse, "GET", "/positions")
-
-    async def kill_switch(self) -> RunStopResponse:
-        return await self._model(RunStopResponse, "POST", "/run/kill")
+    async def kill_switch(self) -> Any:
+        return await self._invoke_spec(_static_operation("kill_switch"), {})
 
 
-def create_server(client: PMSMCPClient | None = None) -> Any:
-    """Build the stdio MCP server without importing PMS runtime modules."""
+async def create_server(client: PMSMCPClient | None = None, *, openapi: Mapping[str, Any] | None = None) -> Any:
+    """Fetch and validate OpenAPI, then register only compatible tools."""
 
     api = client or PMSMCPClient()
-    try:
-        from mcp.server.fastmcp import FastMCP
+    operations = await api.prepare(openapi)
+    from mcp.server.fastmcp import FastMCP
 
-        server_impl: Any = FastMCP(
-            name="pms-mcp",
-            instructions="Typed, scoped proxy for the Prediction Market System API.",
-        )
-    except ModuleNotFoundError:
-        # MCP 2.x renamed FastMCP to MCPServer; keep the proxy source usable
-        # for environments that already have the newer official SDK installed.
-        from mcp.server.mcpserver import MCPServer
-
-        server_impl = MCPServer(
-            name="pms-mcp",
-            version="0.1.0",
-            description="Typed, scoped proxy for the Prediction Market System API.",
-        )
-    server = cast(MCPServerLike, server_impl)
-
-    @server.tool(name="get_status", structured_output=True)
-    async def get_status() -> StatusResponse:
-        return await api.get_status()
-
-    @server.tool(name="list_markets", structured_output=True)
-    async def list_markets(
-        limit: int = 20,
-        offset: int = 0,
-        q: str = "",
-        volume_min: float = 0.0,
-        liquidity_min: float = 0.0,
-        spread_max_bps: int | None = None,
-        yes_min: float = 0.0,
-        yes_max: float = 1.0,
-        resolves_within_days: int | None = None,
-        subscribed: Literal["all", "only", "idle"] = "all",
-    ) -> MarketsResponse:
-        return await api.list_markets(
-            limit=limit,
-            offset=offset,
-            q=q,
-            volume_min=volume_min,
-            liquidity_min=liquidity_min,
-            spread_max_bps=spread_max_bps,
-            yes_min=yes_min,
-            yes_max=yes_max,
-            resolves_within_days=resolves_within_days,
-            subscribed=subscribed,
-        )
-
-    @server.tool(name="explain_selection", structured_output=True)
-    async def explain_selection(market_id: str) -> SelectionExplanation:
-        return await api.explain_selection(market_id)
-
-    @server.tool(name="list_signals", structured_output=True)
-    async def list_signals(limit: int = 50) -> list[Signal]:
-        return await api.list_signals(limit=limit)
-
-    @server.tool(name="get_factor_catalog", structured_output=True)
-    async def get_factor_catalog() -> FactorCatalogResponse:
-        return await api.get_factor_catalog()
-
-    @server.tool(name="get_factor_series", structured_output=True)
-    async def get_factor_series(
-        factor_id: str,
-        market_id: str,
-        param: str = "",
-        since: datetime | None = None,
-        limit: int = 500,
-    ) -> FactorSeriesResponse:
-        return await api.get_factor_series(
-            factor_id=factor_id,
-            market_id=market_id,
-            param=param,
-            since=since,
-            limit=limit,
-        )
-
-    @server.tool(name="submit_evidence", structured_output=True)
-    async def submit_evidence(
-        market_id: str,
-        source: str,
-        model: str,
-        url: str,
-        summary: str,
-        payload: dict[str, Any],
-        content_hash: str,
-        captured_at: datetime,
-        expires_at: datetime | None = None,
-        evidence_id: str | None = None,
-    ) -> AgentEvidenceResponse:
-        return await api.submit_evidence(
-            AgentEvidenceRequest(
-                market_id=market_id,
-                source=source,
-                model=model,
-                url=url,
-                summary=summary,
-                payload=payload,
-                content_hash=content_hash,
-                captured_at=captured_at,
-                expires_at=expires_at,
-                evidence_id=evidence_id,
-            )
-        )
-
-    @server.tool(name="submit_agent_factor", structured_output=True)
-    async def submit_agent_factor(
-        factor_id: str,
-        market_id: str,
-        value: Any,
-        ts: datetime,
-        model: str,
-        prompt_hash: str,
-        param: str = "",
-        evidence_ids: list[str] | None = None,
-    ) -> AgentFactorResponse:
-        return await api.submit_agent_factor(
-            factor_id,
-            AgentFactorRequest(
-                market_id=market_id,
-                param=param,
-                value=value,
-                ts=ts,
-                model=model,
-                prompt_hash=prompt_hash,
-                evidence_ids=evidence_ids or [],
-            ),
-        )
-
-    @server.tool(name="run_backtest", structured_output=True)
-    async def run_backtest(sweep_yaml: str) -> ResearchRunResponse:
-        return await api.run_backtest(sweep_yaml)
-
-    @server.tool(name="get_research_report", structured_output=True)
-    async def get_research_report(
-        run_id: str | None = None,
-        report_id: str | None = None,
-    ) -> ResearchRunResponse | EvaluationReportResponse:
-        return await api.get_research_report(run_id, report_id=report_id)
-
-    @server.tool(name="explain_decision", structured_output=True)
-    async def explain_decision(decision_id: str) -> DecisionExplanation:
-        return await api.explain_decision(decision_id)
-
-    @server.tool(name="risk_check_decision", structured_output=True)
-    async def risk_check_decision(decision_id: str) -> RiskCheckResponse:
-        return await api.risk_check_decision(decision_id)
-
-    @server.tool(name="list_pending_approvals", structured_output=True)
-    async def list_pending_approvals() -> PendingApprovalsResponse:
-        return await api.list_pending_approvals()
-
-    @server.tool(name="list_positions", structured_output=True)
-    async def list_positions() -> PositionsResponse:
-        return await api.list_positions()
-
-    @server.tool(name="kill_switch", structured_output=True)
-    async def kill_switch() -> RunStopResponse:
-        return await api.kill_switch()
-
+    server: Any = FastMCP(name="pms-mcp", instructions="Typed, scoped proxy for the Prediction Market System API.")
+    for operation in operations:
+        _register_tool(server, api, operation)
     return server
 
 
-create_mcp_server = create_server
-
-
-async def _run_stdio() -> None:
-    client = PMSMCPClient()
+async def _run_stdio() -> int:
     try:
-        await create_server(client).run_stdio_async()
+        client = PMSMCPClient()
+    except ValueError as exc:
+        print(f"pms-mcp startup failed [config]: {exc}", file=sys.stderr)
+        return 1
+    try:
+        server = await create_server(client)
+        await server.run_stdio_async()
+        return 0
+    except MCPError as exc:
+        print(f"pms-mcp startup failed [{exc.code}]: {exc.detail}", file=sys.stderr)
+        return 1
     finally:
         await client.aclose()
 
@@ -709,25 +291,169 @@ async def _run_stdio() -> None:
 def main() -> None:
     """Run the MCP server over stdio for Claude Code or Codex."""
 
-    asyncio.run(_run_stdio())
+    raise SystemExit(asyncio.run(_run_stdio()))
 
 
-def _first_env(*names: str) -> str | None:
-    for name in names:
-        value = os.environ.get(name)
-        if value:
-            return value
-    return None
+def _register_tool(server: Any, api: PMSMCPClient, operation: OpenAPIOperation) -> None:
+    spec = operation.spec
+
+    async def invoke(**kwargs: Any) -> Any:
+        return await api.invoke(operation, kwargs)
+
+    invoke.__name__ = spec.name
+    invoke.__doc__ = f"{spec.method} {spec.path} ({spec.scope} scope)"
+    setattr(invoke, "__signature__", _signature_for_schema(operation.input_schema))
+    server.add_tool(invoke, name=spec.name, structured_output=False)
+    tool = server._tool_manager._tools[spec.name]
+    tool.parameters = operation.input_schema
+    tool.fn_metadata.output_schema = operation.output_schema
+    tool.fn_metadata.output_model = _AnyOutput
 
 
-def _compact_params(**params: object) -> QueryParams:
-    compact: dict[str, QueryValue] = {}
-    for key, value in params.items():
-        if value is None:
-            continue
-        compact[key] = value.isoformat() if isinstance(value, datetime) else value  # type: ignore[assignment]
-    return compact
+def _operation_from_openapi(spec: ToolSpec, operation: Mapping[str, Any], document: Mapping[str, Any]) -> OpenAPIOperation:
+    _assert_safe_tool(spec)
+    return OpenAPIOperation(spec, operation, _input_schema(spec, operation, document), _output_schema(operation, document))
+
+
+def _input_schema(spec: ToolSpec, operation: Mapping[str, Any], document: Mapping[str, Any]) -> dict[str, Any]:
+    parameters = operation.get("parameters", [])
+    if not isinstance(parameters, list):
+        raise MCPStartupError("incompatible_operation", f"{spec.name} parameters are not a list")
+    props: dict[str, Any] = {}
+    required: list[str] = []
+    seen_query: list[str] = []
+    seen_path: list[str] = []
+    for parameter in parameters:
+        if not isinstance(parameter, Mapping):
+            raise MCPStartupError("incompatible_operation", f"{spec.name} has an invalid parameter")
+        name = parameter.get("name")
+        location = parameter.get("in")
+        if not isinstance(name, str) or location not in {"query", "path"}:
+            raise MCPStartupError("incompatible_operation", f"{spec.name} has an unsupported parameter")
+        props[name] = _resolve_schema(parameter.get("schema"), document)
+        (seen_query if location == "query" else seen_path).append(name)
+        if parameter.get("required") is True:
+            required.append(name)
+    if tuple(seen_query) != spec.query_params or tuple(seen_path) != spec.path_params:
+        raise MCPStartupError("incompatible_operation", f"{spec.name} parameter contract changed")
+    request_body = operation.get("requestBody")
+    if spec.body_fields:
+        if not isinstance(request_body, Mapping):
+            raise MCPStartupError("incompatible_operation", f"{spec.name} request body is missing")
+        content = request_body.get("content")
+        if not isinstance(content, Mapping) or not isinstance(content.get("application/json"), Mapping):
+            raise MCPStartupError("incompatible_operation", f"{spec.name} has no JSON request body")
+        body_schema = _resolve_schema(content["application/json"].get("schema"), document)
+        body_props = body_schema.get("properties")
+        if body_schema.get("type") != "object" or not isinstance(body_props, Mapping):
+            raise MCPStartupError("incompatible_operation", f"{spec.name} body is not an object")
+        if set(body_props) != set(spec.body_fields):
+            raise MCPStartupError("incompatible_operation", f"{spec.name} body fields changed")
+        props.update(body_props)
+        for name in body_schema.get("required", []):
+            if isinstance(name, str) and name not in required:
+                required.append(name)
+    elif request_body is not None:
+        raise MCPStartupError("incompatible_operation", f"{spec.name} unexpectedly has a request body")
+    return {"type": "object", "properties": props, "required": required, "additionalProperties": False}
+
+
+def _output_schema(operation: Mapping[str, Any], document: Mapping[str, Any]) -> dict[str, Any]:
+    responses = operation.get("responses")
+    response = None
+    if isinstance(responses, Mapping):
+        response = responses.get("200") or responses.get("201")
+        if response is None:
+            response = next((item for key, item in responses.items() if str(key).startswith("2")), None)
+    content = response.get("content") if isinstance(response, Mapping) else None
+    schema = content.get("application/json", {}).get("schema") if isinstance(content, Mapping) else None
+    if schema is None:
+        raise MCPStartupError("incompatible_operation", "mapped operation has no JSON 2xx response schema")
+    return _resolve_schema(schema, document)
+
+
+def _resolve_schema(value: object, document: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise MCPStartupError("bad_openapi", "OpenAPI schema is not an object")
+    if "$ref" in value:
+        ref = value.get("$ref")
+        if not isinstance(ref, str) or not ref.startswith("#/components/schemas/"):
+            raise MCPStartupError("bad_openapi", "unsupported OpenAPI schema reference")
+        components = document.get("components")
+        schemas = components.get("schemas") if isinstance(components, Mapping) else None
+        target = schemas.get(ref.rsplit("/", 1)[-1]) if isinstance(schemas, Mapping) else None
+        return _resolve_schema(target, document)
+    resolved: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "properties" and isinstance(item, Mapping):
+            resolved[key] = {name: _resolve_schema(schema, document) for name, schema in item.items()}
+        elif key == "items" and isinstance(item, Mapping):
+            resolved[key] = _resolve_schema(item, document)
+        elif key in {"anyOf", "oneOf", "allOf"} and isinstance(item, list):
+            resolved[key] = [_resolve_schema(schema, document) for schema in item]
+        else:
+            resolved[key] = item
+    return resolved
+
+
+def _assert_safe_tool(spec: ToolSpec) -> None:
+    path = spec.path.lower()
+    if (spec.method, spec.path) in FORBIDDEN_OPERATIONS:
+        raise MCPStartupError("forbidden_operation", f"MCP tool maps to forbidden operation: {spec.method} {spec.path}")
+    if path == "/run/kill" and spec.method != "POST":
+        raise MCPStartupError("forbidden_operation", f"kill operation must be POST: {spec.method} {spec.path}")
+    forbidden = (
+        path == "/run/start",
+        path == "/run/stop",
+        path == "/config",
+        "/accept" in path,
+        path.startswith("/live/"),
+        "/halt/clear" in path,
+        "/reconcile" in path,
+        "/resolve" in path,
+    )
+    if any(forbidden):
+        raise MCPStartupError("forbidden_operation", f"MCP tool maps to forbidden operation: {spec.method} {spec.path}")
+
+
+def _static_operation(name: str) -> ToolSpec:
+    for spec in TOOL_SPECS:
+        if spec.name == name:
+            _assert_safe_tool(spec)
+            return spec
+    raise KeyError(name)
+
+
+def _signature_for_schema(schema: Mapping[str, Any]) -> inspect.Signature:
+    properties = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    if not isinstance(properties, Mapping):
+        properties = {}
+    params = [inspect.Parameter(str(name), inspect.Parameter.KEYWORD_ONLY, annotation=Any, default=inspect.Parameter.empty if name in required else None) for name in properties]
+    return inspect.Signature(params)
+
+
+def _wire_value(value: object) -> object:
+    return value.isoformat() if isinstance(value, datetime) else value
 
 
 def _path_segment(value: str) -> str:
     return quote(value, safe="")
+
+
+def _response_detail(response: httpx.Response, token: str) -> str:
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return _truncate(_redact(response.text or f"HTTP {response.status_code}", token))
+    if isinstance(payload, Mapping) and "detail" in payload:
+        return _truncate(_redact(str(payload["detail"]), token))
+    return _truncate(_redact(str(payload), token))
+
+
+def _truncate(value: str) -> str:
+    return value if len(value) <= MAX_ERROR_DETAIL else value[:MAX_ERROR_DETAIL] + "…"
+
+
+def _redact(value: str, token: str) -> str:
+    return value.replace(token, "[REDACTED]") if token else value

@@ -171,4 +171,6 @@ forbidden_modules = [
     "pms.sensor",
     "pms.controller",
     "pms.actuator",
+    "pms.actuator.adapters",
+    "py_clob_client_v2",
 ]
