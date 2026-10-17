@@ -58,8 +58,12 @@ class EvalSpool:
         default_factory=asyncio.Queue,
     )
     _task: asyncio.Task[None] | None = None
-    _seen_fill_keys: set[str] = field(default_factory=set)
-    _scored_decisions: set[str] = field(default_factory=set)
+    # Live venues may emit cumulative snapshots for one order.  Retain the
+    # highest observed totals so retries do not double count and later
+    # snapshots can replace the durable evaluation row.
+    _latest_order_totals: dict[str, tuple[float, float, str]] = field(
+        default_factory=dict
+    )
     _scored_record_count: int = 0
     _last_feedback_record_count: int = 0
 
@@ -112,11 +116,19 @@ class EvalSpool:
                 decision_evidence,
             )
             return False
-        fill_key = fill.fill_id or fill.trade_id
-        if fill_key in self._seen_fill_keys:
-            return False
-        if fill.decision_id in self._scored_decisions:
-            return False
+        previous = self._latest_order_totals.get(fill.order_id)
+        if previous is not None:
+            previous_notional, previous_quantity, previous_status = previous
+            if (
+                fill.fill_notional_usdc < previous_notional
+                or fill.fill_quantity < previous_quantity
+                or (
+                    fill.fill_notional_usdc == previous_notional
+                    and fill.fill_quantity == previous_quantity
+                    and fill.status == previous_status
+                )
+            ):
+                return False
         scored_record = self.scorer.score(
             fill,
             decision,
@@ -131,10 +143,21 @@ class EvalSpool:
         # Duplicate delivery for one decision_id (sweep retry, or an
         # ON CONFLICT-deduped store append) is safe: the sink's calibrator
         # dedups per (model_id, decision_id).
-        inserted = await self.store.append(scored_record)
-        self._seen_fill_keys.add(fill_key)
-        self._scored_decisions.add(fill.decision_id)
-        if inserted:
+        if previous is None:
+            inserted = await self.store.append(scored_record)
+        else:
+            replace_record = getattr(self.store, "replace", None)
+            if not callable(replace_record):
+                # A store without replacement support still gets retry-safe
+                # first-write semantics; production EvalStore implements it.
+                return False
+            inserted = bool(await replace_record(scored_record))
+        self._latest_order_totals[fill.order_id] = (
+            fill.fill_notional_usdc,
+            fill.fill_quantity,
+            fill.status,
+        )
+        if previous is None and inserted:
             self._scored_record_count += 1
         if self.calibration_sink is not None:
             try:

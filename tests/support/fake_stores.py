@@ -15,6 +15,13 @@ class InMemoryEvalStore:
         self._records.append(record)
         return True
 
+    async def replace(self, record: EvalRecord) -> bool:
+        for index, existing in enumerate(self._records):
+            if existing.decision_id == record.decision_id:
+                self._records[index] = record
+                return True
+        return False
+
     async def all(self) -> list[EvalRecord]:
         return list(self._records)
 

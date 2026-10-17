@@ -21,6 +21,35 @@ class EvalStore:
         async with self._pool().acquire() as connection:
             return await insert_eval_record_row(connection, record)
 
+    async def replace(self, record: EvalRecord) -> bool:
+        """Replace one decision's score with its latest fill snapshot."""
+        async with self._pool().acquire() as connection:
+            result = await connection.execute(
+                _UPDATE_EVAL_RECORD_QUERY,
+                record.decision_id,
+                record.market_id,
+                record.prob_estimate,
+                record.resolved_outcome,
+                record.brier_score,
+                record.fill_status,
+                record.recorded_at,
+                json.dumps(record.citations),
+                record.baseline_prob_estimate,
+                record.baseline_brier_score,
+                json.dumps(dict(record.baseline_prob_estimates), allow_nan=False),
+                json.dumps(dict(record.baseline_brier_scores), allow_nan=False),
+                record.category,
+                record.model_id,
+                record.pnl,
+                record.slippage_bps,
+                record.filled,
+                record.strategy_id,
+                record.strategy_version_id,
+                record.edge_at_decision,
+                record.spread_bps_at_decision,
+            )
+        return cast(str, result).rsplit(" ", maxsplit=1)[-1] == "1"
+
     async def all(self) -> list[EvalRecord]:
         if self.pool is None:
             return []
@@ -109,6 +138,32 @@ async def insert_eval_record_row(
         record.spread_bps_at_decision,
     )
     return cast(str, result).rsplit(" ", maxsplit=1)[-1] == "1"
+
+
+_UPDATE_EVAL_RECORD_QUERY = """
+UPDATE eval_records
+SET market_id = $2,
+    prob_estimate = $3,
+    resolved_outcome = $4,
+    brier_score = $5,
+    fill_status = $6,
+    recorded_at = $7,
+    citations = $8::jsonb,
+    baseline_prob_estimate = $9,
+    baseline_brier_score = $10,
+    baseline_prob_estimates = $11::jsonb,
+    baseline_brier_scores = $12::jsonb,
+    category = $13,
+    model_id = $14,
+    pnl = $15,
+    slippage_bps = $16,
+    filled = $17,
+    strategy_id = $18,
+    strategy_version_id = $19,
+    edge_at_decision = $20,
+    spread_bps_at_decision = $21
+WHERE decision_id = $1
+"""
 
 
 _SELECT_ALL_QUERY = """
