@@ -2027,20 +2027,14 @@ class Runner:
                 fill = _fill_from_order(
                     order_state, decision, signal, fee_rate=fill_fee_rate
                 )
+                fee_unreconciled = bool(
+                    true_live_submit and fill is not None and fill.fees is None
+                )
                 if fill is not None:
-                    if true_live_submit and fill.fees is None:
-                        await self._hard_halt_live_persistence_failure(
-                            phase="live_fill_fee",
-                            decision=decision,
-                            order_state=order_state,
-                            error=RuntimeError(
-                                "LIVE venue fill fee is unavailable; refusing to "
-                                "persist fee-free fill"
-                            ),
-                        )
                     realized_result = _risk_trade_result_from_fill(
                         self.portfolio,
                         fill,
+                        decision=decision,
                     )
                     risk_manager = getattr(self.actuator_executor, "risk", None)
                     if realized_result is not None and risk_manager is not None:
@@ -2109,6 +2103,16 @@ class Runner:
                     current_status="submitted",
                     next_status=_decision_status_from_order(order_state),
                 )
+                if fee_unreconciled:
+                    await self._hard_halt_live_persistence_failure(
+                        phase="live_fill_fee",
+                        decision=decision,
+                        order_state=order_state,
+                        error=RuntimeError(
+                            "LIVE venue fill fee is unavailable; fill persisted "
+                            "with fee_unreconciled and new risk is suspended"
+                        ),
+                    )
             except PolymarketSubmissionUnknownError as error:
                 detail = _runtime_error_detail(error, self.config)
                 self._live_trading_suspended_reason = "submission_unknown"
@@ -2160,7 +2164,11 @@ class Runner:
                 await self._update_decision_status_if_supported(
                     decision.decision_id,
                     current_status="submitted",
-                    next_status="rejected",
+                    next_status=(
+                        "venue_rejected"
+                        if isinstance(error, PolymarketVenueRejectionError)
+                        else "rejected"
+                    ),
                 )
                 await self.event_bus.publish(
                     "error",
@@ -3320,9 +3328,31 @@ class Runner:
         clear_cutoff = read_last_halt_clear(
             Path(self.config.live_emergency_audit_path)
         )
+        if self.config.mode == RunMode.LIVE:
+            unknown_telemetry = [
+                trade.fill_id
+                for trade in trades
+                if trade.fees is None or trade.slippage_bps is None
+            ]
+            if unknown_telemetry:
+                raise RuntimeError(
+                    "LIVE risk telemetry contains unknown fee/slippage for fills: "
+                    + ", ".join(unknown_telemetry[:10])
+                )
+        clear_day_start = (
+            clear_cutoff.astimezone(UTC).replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            if clear_cutoff is not None
+            else None
+        )
         for trade in sorted(trades, key=lambda item: item.filled_at):
-            if clear_cutoff is not None and trade.filled_at <= clear_cutoff:
-                continue
+            include_risk_telemetry = (
+                clear_day_start is None or trade.filled_at >= clear_day_start
+            )
             key = (
                 trade.market_id,
                 trade.token_id,
@@ -3337,22 +3367,26 @@ class Runner:
                 pnl = direction * (trade.fill_price - avg_price) * closing - (
                     trade.fees or 0.0
                 )
-                risk_manager.record_trade_result(
-                    RiskTradeResult(
-                        pnl=pnl,
-                        slippage_bps=0.0,
-                        filled_at=trade.filled_at,
-                        trace_id=trade.trade_id,
+                if include_risk_telemetry:
+                    risk_manager.record_trade_result(
+                        RiskTradeResult(
+                            pnl=pnl,
+                            slippage_bps=trade.slippage_bps or 0.0,
+                            filled_at=trade.filled_at,
+                            trace_id=trade.trade_id,
+                        )
                     )
-                )
-                cumulative_pnl += pnl
-                peak_equity = max(peak_equity, self.portfolio.total_usdc + cumulative_pnl)
-                equity = self.portfolio.total_usdc + cumulative_pnl
-                if peak_equity > 0.0:
-                    max_drawdown_pct = max(
-                        max_drawdown_pct,
-                        (peak_equity - equity) / peak_equity * 100.0,
+                    cumulative_pnl += pnl
+                    peak_equity = max(
+                        peak_equity,
+                        self.portfolio.total_usdc + cumulative_pnl,
                     )
+                    equity = self.portfolio.total_usdc + cumulative_pnl
+                    if peak_equity > 0.0:
+                        max_drawdown_pct = max(
+                            max_drawdown_pct,
+                            (peak_equity - equity) / peak_equity * 100.0,
+                        )
                 shares -= closing
                 if shares <= 1e-9:
                     positions.pop(key, None)
@@ -4443,6 +4477,24 @@ def _fill_from_order(
         )
         fee_bps = int(effective_fee_rate * 10_000)
         anomaly_flags.append("fee_estimated")
+    elif fees is None:
+        anomaly_flags.append("fee_unreconciled")
+    if decision.limit_price > 0.0:
+        if (decision.action or decision.side).upper() == "BUY":
+            execution_slippage_bps = (
+                (order_state.fill_price - decision.limit_price)
+                / decision.limit_price
+                * 10_000.0
+            )
+        else:
+            execution_slippage_bps = (
+                (decision.limit_price - order_state.fill_price)
+                / decision.limit_price
+                * 10_000.0
+            )
+        anomaly_flags.append(
+            f"execution_slippage_bps={execution_slippage_bps:.9f}"
+        )
 
     return FillRecord(
         trade_id=order_state.order_id,
@@ -4605,6 +4657,8 @@ def _portfolio_with_risk_drawdown(
 def _risk_trade_result_from_fill(
     portfolio: Portfolio,
     fill: FillRecord,
+    *,
+    decision: TradeDecision | None = None,
 ) -> RiskTradeResult | None:
     """Return realized PnL for the closing portion of a fill, if any."""
     closing = next(
@@ -4623,13 +4677,20 @@ def _risk_trade_result_from_fill(
     direction = 1.0 if closing.side.upper() == "BUY" else -1.0
     fees = fill.fees or 0.0
     pnl = direction * (fill.fill_price - closing.avg_entry_price) * contracts - fees
-    slippage_bps = (
-        abs(fill.fill_price - closing.avg_entry_price)
-        / closing.avg_entry_price
-        * 10_000.0
-        if closing.avg_entry_price > 0.0
-        else 0.0
-    )
+    slippage_bps = 0.0
+    if decision is not None and decision.limit_price > 0.0:
+        if fill.side.upper() == "BUY":
+            slippage_bps = (
+                (fill.fill_price - decision.limit_price)
+                / decision.limit_price
+                * 10_000.0
+            )
+        else:
+            slippage_bps = (
+                (decision.limit_price - fill.fill_price)
+                / decision.limit_price
+                * 10_000.0
+            )
     return RiskTradeResult(
         pnl=pnl,
         slippage_bps=slippage_bps,

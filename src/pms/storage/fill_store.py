@@ -318,6 +318,7 @@ class StoredTradeRow:
     strategy_version_id: str
     fee_bps: int | None = None
     fees: float | None = None
+    slippage_bps: float | None = None
     risk_group_id: str | None = None
 
 
@@ -638,6 +639,7 @@ def _trade_from_row(row: asyncpg.Record) -> StoredTradeRow:
         strategy_version_id=cast(str, row["strategy_version_id"]),
         fee_bps=cast(int | None, payload.get("fee_bps")),
         fees=cast(float | None, payload.get("fees")),
+        slippage_bps=_slippage_from_anomaly_flags(payload.get("anomaly_flags")),
         risk_group_id=cast(str | None, payload.get("risk_group_id")),
     )
 
@@ -657,3 +659,15 @@ def _string_list(value: object) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value]
     return []
+
+
+def _slippage_from_anomaly_flags(value: object) -> float | None:
+    for flag in _string_list(value):
+        prefix = "execution_slippage_bps="
+        if not flag.startswith(prefix):
+            continue
+        try:
+            return float(flag[len(prefix) :])
+        except ValueError:
+            return None
+    return None

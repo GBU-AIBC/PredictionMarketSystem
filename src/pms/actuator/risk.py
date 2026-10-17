@@ -292,7 +292,7 @@ class RiskManager:
         if len(self._recent_trades) >= 10:
             last_ten = self._recent_trades[-10:]
             avg_slippage = sum(trade.slippage_bps for trade in last_ten) / len(last_ten)
-            if avg_slippage > 100.0:
+            if avg_slippage > 100.0 or last_ten[-1].slippage_bps > 100.0:
                 return self._halt(
                     trigger_kind="slippage_spike",
                     reason="avg_slippage_above_100bps",

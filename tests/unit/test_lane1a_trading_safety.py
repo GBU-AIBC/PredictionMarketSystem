@@ -22,7 +22,7 @@ from pms.actuator.adapters.polymarket import (
 )
 from pms.actuator.executor import ActuatorExecutor
 from pms.actuator.feedback import ActuatorFeedback
-from pms.actuator.risk import RiskManager
+from pms.actuator.risk import RiskManager, RiskTradeResult
 from pms.config import ControllerSettings, PMSSettings, PolymarketSettings, RiskSettings
 from pms.core.enums import OrderStatus, RunMode, TimeInForce
 from pms.core.models import (
@@ -504,6 +504,64 @@ def test_live_fill_uses_venue_fee_and_malformed_outcome_does_not_abort() -> None
     assert _portfolio_with_fill(Portfolio(100, 100, 0, []), fill).locked_usdc == 10.0
 
 
+def test_execution_slippage_ignores_profitable_price_moves_but_halts_adverse_fill() -> None:
+    risk = RiskManager(RiskSettings(max_daily_loss_usdc=1_000.0))
+    now = datetime(2026, 10, 18, tzinfo=UTC)
+    position = Position(
+        market_id="lane-1a-market",
+        token_id="lane-1a-token",
+        venue="polymarket",
+        side="BUY",
+        shares_held=10.0,
+        avg_entry_price=0.50,
+        unrealized_pnl=0.0,
+        locked_usdc=5.0,
+        strategy_id="lane-1a-strategy",
+        strategy_version_id="lane-1a-v1",
+    )
+    portfolio = Portfolio(100.0, 95.0, 5.0, [position])
+    expected_exit = _decision(
+        side="SELL", action="SELL", notional_usdc=5.6, limit_price=0.56
+    )
+    for index in range(10):
+        profitable_exit = _fill(
+            side="SELL", price=0.56, notional=5.6, quantity=10.0
+        )
+        result = _risk_trade_result_from_fill(
+            portfolio, profitable_exit, decision=expected_exit
+        )
+        assert result is not None
+        assert result.pnl > 0.0
+        assert result.slippage_bps == 0.0
+        risk.record_trade_result(result)
+    assert risk.check_auto_halt(portfolio, now=now).halted is False
+
+    adverse_exit = _fill(side="SELL", price=0.55, notional=5.5, quantity=10.0)
+    result = _risk_trade_result_from_fill(portfolio, adverse_exit, decision=expected_exit)
+    assert result is not None
+    assert result.slippage_bps > 100.0
+    risk.record_trade_result(result)
+    halt = risk.check_auto_halt(portfolio, now=now)
+    assert halt.halted is True
+    assert halt.trigger_kind == "slippage_spike"
+
+
+def test_operator_clear_keeps_daily_loss_until_next_utc_day() -> None:
+    now = datetime(2026, 10, 18, tzinfo=UTC)
+    risk = RiskManager(RiskSettings(max_daily_loss_usdc=10.0))
+    risk.record_trade_result(
+        RiskTradeResult(pnl=-10.0, slippage_bps=0.0, filled_at=now)
+    )
+    assert risk.check_auto_halt(Portfolio(100, 100, 0, []), now=now).halted is True
+    risk.clear_halt()
+    assert risk.check_auto_halt(Portfolio(100, 100, 0, []), now=now).halted is True
+    risk.clear_halt()
+    assert risk.check_auto_halt(
+        Portfolio(100, 100, 0, []),
+        now=now.replace(day=19),
+    ).halted is False
+
+
 def test_live_order_request_rejects_non_finite_after_entity_boundary() -> None:
     decision = _decision()
     object.__setattr__(decision, "limit_price", nan)
@@ -613,3 +671,79 @@ async def test_live_runner_losing_sequence_trips_daily_loss_halt() -> None:
     assert halt is not None
     assert halt.trigger_kind == "daily_loss_limit"
     assert len(runner.state.fills) == 2
+
+
+@pytest.mark.asyncio
+async def test_true_live_missing_fee_persists_fill_before_fail_closed() -> None:
+    @dataclass
+    class TrueLiveAdapter:
+        client: object = object()
+
+        async def execute(
+            self,
+            decision: TradeDecision,
+            portfolio: Portfolio | None = None,
+        ) -> OrderState:
+            del portfolio
+            now = datetime.now(tz=UTC)
+            return OrderState(
+                order_id="lane-1a-fee-unknown",
+                decision_id=decision.decision_id,
+                status=OrderStatus.MATCHED.value,
+                market_id=decision.market_id,
+                token_id=decision.token_id,
+                venue=decision.venue,
+                requested_notional_usdc=decision.notional_usdc,
+                filled_notional_usdc=decision.notional_usdc,
+                remaining_notional_usdc=0.0,
+                fill_price=decision.limit_price,
+                submitted_at=now,
+                last_updated_at=now,
+                raw_status="matched",
+                strategy_id=decision.strategy_id,
+                strategy_version_id=decision.strategy_version_id,
+                filled_quantity=decision.notional_usdc / decision.limit_price,
+                action=decision.action,
+                outcome=decision.outcome,
+                time_in_force=decision.time_in_force.value,
+            )
+
+    class Store:
+        def __init__(self) -> None:
+            self.items: list[object] = []
+
+        async def insert(self, item: object) -> None:
+            self.items.append(item)
+
+    settings = PMSSettings(
+        mode=RunMode.LIVE,
+        live_trading_enabled=True,
+        live_emergency_audit_path="/tmp/lane-1a-fee-audit.jsonl",
+        risk=RiskSettings(
+            max_position_per_market=100.0,
+            max_total_exposure=100.0,
+            max_drawdown_pct=50.0,
+            max_daily_loss_usdc=50.0,
+        ),
+    )
+    runner = Runner(config=settings)
+    runner.actuator_executor = ActuatorExecutor(
+        adapter=TrueLiveAdapter(),
+        risk=RiskManager(settings.risk),
+        feedback=ActuatorFeedback(cast(FeedbackStore, InMemoryFeedbackStore())),
+    )
+    order_store = Store()
+    fill_store = Store()
+    runner.order_store = cast(Any, order_store)
+    runner.fill_store = cast(Any, fill_store)
+    runner._controller_task = asyncio.create_task(asyncio.sleep(0))  # noqa: SLF001
+    await runner._decision_queue.put(  # noqa: SLF001
+        ActuatorWorkItem(_decision(decision_id="lane-1a-fee-unknown"), None)
+    )
+    with pytest.raises(RuntimeError, match="fee_unreconciled|fee is unavailable"):
+        await runner._actuator_loop()  # noqa: SLF001
+    assert len(order_store.items) == 1
+    assert len(fill_store.items) == 1
+    assert len(runner.state.fills) == 1
+    assert runner.portfolio.locked_usdc > 0.0
+    assert runner.live_trading_suspended is True

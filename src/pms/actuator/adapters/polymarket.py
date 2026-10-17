@@ -2151,9 +2151,9 @@ def _numeric_approval_value(value: object) -> float | None:
 
 
 def _approval_tolerance(expected: float) -> float:
-    # One Polymarket cent tick plus a small representation tolerance. The
-    # approval remains a one-sided ceiling/floor and cannot authorize a wider
-    # move or resize than this bounded mark window.
+    # A bounded one-percent mark window capped at one cent, plus a small
+    # representation tolerance. The approval remains one-sided and cannot
+    # authorize a wider move or resize than this window.
     return max(0.0005, min(0.01, abs(expected) * 0.01))
 
 
@@ -3082,14 +3082,15 @@ def _compare_positions(
                 f"{key}: DB={db_position.locked_usdc:.8f} "
                 f"venue={venue_position.locked_usdc:.8f}"
             )
-            mismatches.extend(
-                _strategy_position_residuals(
-                    db_positions,
-                    key,
-                    venue_position.shares_held,
-                    share_tolerance,
+            if abs(db_position.shares_held - venue_position.shares_held) <= share_tolerance:
+                mismatches.extend(
+                    _strategy_position_residuals(
+                        db_positions,
+                        key,
+                        venue_position.shares_held,
+                        share_tolerance,
+                    )
                 )
-            )
     return mismatches
 
 
