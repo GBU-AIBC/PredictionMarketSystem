@@ -145,13 +145,14 @@ class MarketSelector:
         market_id: str,
         *,
         max_subscription_asset_ids: int | None = None,
+        current_asset_ids: Sequence[str] = (),
     ) -> SelectionExplanation:
         read_market = getattr(self._store, "read_market", None)
         if not callable(read_market):
             return SelectionExplanation(market_id, False, ("unresolved_market",))
         market = await read_market(market_id)
         if market is None:
-            return SelectionExplanation(market_id, True, ("unresolved_market",))
+            return SelectionExplanation(market_id, False, ("unresolved_market",))
         strategy_ids: list[str] = []
         token_ids: list[str] = []
         reasons: list[SelectionReasonCode] = []
@@ -161,26 +162,41 @@ class MarketSelector:
             reason = await self._explain_for_spec(market, spec)
             if reason is not None:
                 reasons.append(reason)
-                continue
-            eligible = await self._store.read_eligible_markets(
-                spec.venue,
-                spec.resolution_time_max_horizon_days,
-                spec.volume_min_usdc,
-            )
-            for candidate, tokens in eligible:
-                if candidate.condition_id == market_id:
-                    token_ids.extend(
-                        token.token_id
-                        for token in tokens
-                        if token.outcome in {"YES", "NO"}
-                    )
-                    break
+            read_tokens = getattr(self._store, "read_tokens_for_market", None)
+            if callable(read_tokens):
+                tokens = await read_tokens(market_id)
+                token_ids.extend(
+                    token.token_id
+                    for token in tokens
+                    if token.outcome in {"YES", "NO"}
+                )
+            elif reason is None:
+                eligible = await self._store.read_eligible_markets(
+                    spec.venue,
+                    spec.resolution_time_max_horizon_days,
+                    spec.volume_min_usdc,
+                )
+                for candidate, tokens in eligible:
+                    if candidate.condition_id == market_id:
+                        token_ids.extend(
+                            token.token_id
+                            for token in tokens
+                            if token.outcome in {"YES", "NO"}
+                        )
+                        break
         pinned = tuple(sorted(await self._read_user_subscriptions()))
         token_ids = list(dict.fromkeys(token_ids))
         if pinned and any(token_id in pinned for token_id in token_ids):
             reasons.append("user_pin")
         if max_subscription_asset_ids is not None and token_ids:
-            capped = len(token_ids) > max_subscription_asset_ids
+            active_assets = set(current_asset_ids)
+            capped = (
+                bool(active_assets)
+                and len(active_assets) >= max_subscription_asset_ids
+                and any(token_id not in active_assets for token_id in token_ids)
+            ) or (
+                not active_assets and len(token_ids) > max_subscription_asset_ids
+            )
             if capped:
                 reasons.append("cap")
         else:
@@ -213,6 +229,14 @@ class MarketSelector:
                 return "resolution_horizon"
         if market.volume_24h is None or market.volume_24h < spec.volume_min_usdc:
             return "volume"
+        return await self._filter_reason(market, spec)
+
+    async def _filter_reason(
+        self,
+        market: Market,
+        spec: MarketSelectionSpec,
+    ) -> SelectionReasonCode | None:
+        """Apply the same discovery predicates used by selection and explain."""
         if spec.accepting_orders and market.accepting_orders is False:
             return "accepting_orders"
         if spec.liquidity_min_usdc is not None and (
@@ -259,35 +283,7 @@ class MarketSelector:
         market: Market,
         spec: MarketSelectionSpec,
     ) -> bool:
-        if spec.accepting_orders and market.accepting_orders is False:
-            return False
-
-        if spec.liquidity_min_usdc is not None and (
-            market.liquidity is None or market.liquidity < spec.liquidity_min_usdc
-        ):
-            return False
-
-        if spec.yes_price_min is not None and (
-            market.yes_price is None or market.yes_price < spec.yes_price_min
-        ):
-            return False
-
-        if spec.yes_price_max is not None and (
-            market.yes_price is None or market.yes_price > spec.yes_price_max
-        ):
-            return False
-
-        if spec.spread_max_bps is None and spec.depth_min_usdc is None:
-            return True
-
-        summary = await self._store.get_latest_book_summary(market.condition_id)
-        if summary is None:
-            return _market_passes_discovery_bootstrap_filters(market, spec)
-        if spec.spread_max_bps is not None and summary.spread_bps > spec.spread_max_bps:
-            return False
-        if spec.depth_min_usdc is not None and summary.depth_usdc < spec.depth_min_usdc:
-            return False
-        return True
+        return await self._filter_reason(market, spec) is None
 
     async def _read_user_subscriptions(self) -> frozenset[str]:
         if self._market_subscription_store is None:

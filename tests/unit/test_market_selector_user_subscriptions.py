@@ -44,6 +44,14 @@ class _MarketStoreDouble:
     async def get_latest_book_summary(self, market_id: str) -> BookSummary | None:
         return None
 
+    async def read_market(self, market_id: str) -> Market | None:
+        rows = await self.read_eligible_markets("polymarket", 30, 500.0)
+        return next((market for market, _tokens in rows if market.condition_id == market_id), None)
+
+    async def read_tokens_for_market(self, market_id: str) -> list[Token]:
+        rows = await self.read_eligible_markets("polymarket", 30, 500.0)
+        return next((tokens for market, tokens in rows if market.condition_id == market_id), [])
+
 
 @dataclass
 class _RegistryDouble:
@@ -146,3 +154,23 @@ async def test_select_no_user_rows_preserves_existing_merge_result() -> None:
     assert result.asset_ids == ["strategy-token"]
     assert result.conflicts == []
     assert user_store.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_explain_reports_pins_and_active_subscription_cap() -> None:
+    selector, _ = _selector(
+        strategy_token_ids=["strategy-token", "second-token"],
+        user_results=[{"second-token"}],
+    )
+
+    explanation = await selector.explain(
+        "strategy-market",
+        max_subscription_asset_ids=2,
+        current_asset_ids=("existing-token", "another-token"),
+    )
+
+    assert explanation.available is True
+    assert explanation.pinned_token_ids == ("second-token",)
+    assert "user_pin" in explanation.reasons
+    assert "cap" in explanation.reasons
+    assert explanation.capped is True

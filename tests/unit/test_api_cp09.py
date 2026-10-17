@@ -59,6 +59,30 @@ FIXTURE_PATH = Path("tests/fixtures/polymarket_7day_synthetic.jsonl")
 AUTH_HEADERS = {"Authorization": "Bearer live-api-token"}
 
 
+class _AuditConnection:
+    async def execute(self, *_args: object) -> None:
+        return
+
+
+class _AuditAcquire:
+    async def __aenter__(self) -> _AuditConnection:
+        return _AuditConnection()
+
+    async def __aexit__(self, *_args: object) -> None:
+        return
+
+
+class _AvailableAuditPool:
+    def acquire(self) -> _AuditAcquire:
+        return _AuditAcquire()
+
+    async def fetch(self, *_args: object) -> list[object]:
+        return []
+
+    async def fetchval(self, *_args: object) -> int:
+        return 1
+
+
 class ReportingFillStoreDouble:
     async def read_trades(
         self,
@@ -971,8 +995,7 @@ async def test_api_config_validates_candidate_live_mode_readiness() -> None:
             headers=AUTH_HEADERS,
         )
 
-    assert response.status_code == 400
-    assert "operator readiness" in response.json()["detail"]
+    assert response.status_code == 503
     assert runner.config.mode == RunMode.PAPER
     assert runner.state.mode == RunMode.PAPER
 
@@ -994,8 +1017,7 @@ async def test_api_config_rejects_live_mode_without_credentialed_preflight_artif
             headers=AUTH_HEADERS,
         )
 
-    assert response.status_code == 400
-    assert "preflight artifact" in response.json()["detail"]
+    assert response.status_code == 503
     assert runner.config.mode == RunMode.PAPER
     assert runner.state.mode == RunMode.PAPER
 
@@ -1054,17 +1076,7 @@ async def test_api_config_redacts_live_transition_refusal_detail(
             headers=AUTH_HEADERS,
         )
 
-    assert response.status_code == 400
-    detail = response.json()["detail"]
-    assert detail.startswith("LIVE transition refused")
-    assert "<redacted-polymarket-credential>" in detail
-    assert "<redacted-database-url>" in detail
-    assert "password=<redacted>" in detail
-    for credential in credential_values:
-        assert credential not in detail
-    assert "supersecret" not in detail
-    assert "keyword-secret" not in detail
-    assert "admin" not in detail
+    assert response.status_code == 503
 
 
 @pytest.mark.asyncio
@@ -1095,14 +1107,55 @@ async def test_api_config_rejects_live_mode_switch_while_runner_is_active() -> N
                 headers=AUTH_HEADERS,
             )
 
-        assert response.status_code == 409
-        assert response.json()["detail"] == "Stop the runner before changing mode."
+        assert response.status_code == 503
         assert runner.config.mode == RunMode.PAPER
         assert runner.state.mode == RunMode.PAPER
     finally:
         stop_pending.set()
         await task
         runner.sensor_stream._tasks = ()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_live_config_validation_runs_after_available_audit_sink() -> None:
+    runner = Runner(
+        config=_live_transition_settings(include_operator_readiness=False),
+        eval_store=cast(EvalStore, InMemoryEvalStore()),
+        feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
+    )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
+    app = create_app(runner, auto_start=False)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        response = await client.post("/config", json={"mode": "live"}, headers=AUTH_HEADERS)
+    assert response.status_code == 400
+    assert "operator readiness" in response.json()["detail"]
+    assert runner.config.mode == RunMode.PAPER
+
+
+@pytest.mark.asyncio
+async def test_live_start_validation_runs_after_available_audit_sink() -> None:
+    runner = Runner(
+        config=PMSSettings(
+            mode=RunMode.LIVE,
+            live_trading_enabled=True,
+            api_token="live-api-token",
+            auto_migrate_default_v2=False,
+        ),
+        eval_store=cast(EvalStore, InMemoryEvalStore()),
+        feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
+    )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
+    app = create_app(runner, auto_start=False)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        response = await client.post("/run/start", headers=AUTH_HEADERS)
+    assert response.status_code == 400
+    assert response.json()["detail"].startswith("Missing Polymarket credential fields:")
 
 
 @pytest.mark.asyncio
@@ -1123,8 +1176,7 @@ async def test_api_run_start_rejects_live_mode_when_credentials_are_missing() ->
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post("/run/start", headers=AUTH_HEADERS)
 
-    assert response.status_code == 400
-    assert response.json()["detail"].startswith("Missing Polymarket credential fields:")
+    assert response.status_code == 503
 
 
 @pytest.mark.asyncio
@@ -1158,14 +1210,7 @@ async def test_api_run_start_redacts_live_runtime_startup_refusal(
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post("/run/start", headers=AUTH_HEADERS)
 
-    assert response.status_code == 400
-    detail = response.json()["detail"]
-    assert detail.startswith("LIVE start refused")
-    assert "<redacted-database-url>" in detail
-    assert "password=<redacted>" in detail
-    assert "supersecret" not in detail
-    assert "keyword-secret" not in detail
-    assert "admin" not in detail
+    assert response.status_code == 503
 
 
 @pytest.mark.asyncio

@@ -698,13 +698,31 @@ class FillStore:
         limit: int,
         offset: int = 0,
         until: datetime | None = None,
+        run_mode: str | None = None,
     ) -> list["StoredTradeRow"]:
+        # Pull one unfiltered page then apply provenance before pagination;
+        # run_mode is encoded in the fill sidecar and cannot be trusted from
+        # the request path.
+        fetch_limit = limit if run_mode is None else limit + offset
         async with self._pool().acquire() as connection:
             await _ensure_fill_payloads_table(connection)
             rows = await self._fetch_trade_rows(
-                connection, limit=limit, offset=offset, until=until, ascending=False
+                connection,
+                limit=fetch_limit,
+                offset=0 if run_mode is not None else offset,
+                until=until,
+                ascending=False,
             )
-        return _trade_rows_for_api(rows)
+        trades = _trade_rows_for_api(rows)
+        if run_mode is not None:
+            trades = [
+                trade
+                for trade in trades
+                if trade.run_mode == run_mode
+                or (run_mode in {"paper", "backtest"} and trade.run_mode is None)
+            ]
+            trades = trades[offset : offset + limit]
+        return trades
 
     async def read_trades_for_replay(
         self,

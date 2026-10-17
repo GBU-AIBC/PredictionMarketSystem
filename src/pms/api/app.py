@@ -157,32 +157,57 @@ class ConfigResponse(BaseModel):
     mode: RunMode
 
 
-class APIResponse(BaseModel):
-    model_config = ConfigDict(
-        extra="allow",
-        json_schema_extra={
-            "properties": {
-                "data": {
-                    "description": "Endpoint-specific response payload.",
-                    "nullable": True,
-                }
-            }
-        },
-    )
-    data: Any | None = Field(default=None, exclude=True)
+class StatusResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    mode: RunMode
+    runner_started_at: str | None = None
+    running: bool
+    healthy: bool
+    workers: dict[str, Any]
+    autostart_attempted: bool
+    autostart_error: str | None = None
+    runtime_continuity: Any = None
+    sensors: Any = Field(default_factory=dict)
+    controller: dict[str, Any]
+    actuator: dict[str, Any]
+    evaluator: dict[str, Any]
+    supervision: dict[str, Any]
+    quality: dict[str, Any]
 
 
-class RunStartResponse(APIResponse):
+class ReadinessResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    status: str
+    checks: dict[str, Any]
+    workers: dict[str, Any]
+
+
+class RunStartResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
     status: str
     mode: RunMode
     runner_started_at: str | None = None
 
 
-class RunStopResponse(APIResponse):
+class RunStopResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
     status: str
 
 
-class SignalResponse(APIResponse):
+class DecisionResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    decision_id: str
+    market_id: str | None = None
+    token_id: str | None = None
+    side: str | None = None
+    notional_usdc: float | None = None
+    status: str | None = None
+    factor_snapshot_hash: str | None = None
+    decision_evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class SignalResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
     market_id: str
     token_id: str | None
     venue: str
@@ -210,11 +235,13 @@ class SignalDepthResponse(BaseModel):
     stale: bool
 
 
-class HealthResponse(APIResponse):
+class HealthResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
     status: str | None = None
 
 
-class DecisionExplainResponse(APIResponse):
+class DecisionExplainResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
     decision_id: str
     available: bool
     reason: str | None = None
@@ -228,11 +255,14 @@ class RiskCheckResponse(BaseModel):
 
 class HaltResponse(BaseModel):
     status: str
-    halted: bool
+    halted: bool | None = None
     reason: str | None = None
+    cleared_by: str | None = None
+    active_trigger_kind: str | None = None
 
 
-class SelectionExplainResponse(APIResponse):
+class SelectionExplainResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
     market_id: str
     available: bool
     reason: str | None = None
@@ -244,7 +274,7 @@ class SelectionExplainResponse(APIResponse):
 
 
 class EvaluationReportsResponse(BaseModel):
-    reports: list[dict[str, Any]]
+    reports: list["EvaluationReportResponse"]
 
 
 class EvaluationReportResponse(BaseModel):
@@ -259,7 +289,11 @@ class EvaluationReportResponse(BaseModel):
     generated_at: datetime
 
 
-class DecayStatusResponse(APIResponse):
+EvaluationReportsResponse.model_rebuild()
+
+
+class DecayStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
     strategy_id: str
     strategy_version_id: str
     decay_status: Literal[
@@ -275,6 +309,65 @@ class DecayStatusResponse(APIResponse):
 
 class ApprovalPendingResponse(BaseModel):
     approvals: list[dict[str, Any]]
+
+
+class MetricsResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    ops_view: dict[str, Any]
+    per_strategy: list[dict[str, Any]]
+    mark_to_market: dict[str, Any]
+    quality: dict[str, Any]
+
+
+class FeedbackResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    feedback_id: str
+    target: str
+    source: str
+    message: str
+    severity: str
+    created_at: datetime
+    resolved: bool = False
+    resolved_at: datetime | None = None
+    category: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    strategy_id: str = "default"
+    strategy_version_id: str = "default-v1"
+
+
+class StreamEventResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    event: dict[str, Any] | None = None
+
+
+class ResearchRunResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    run_ids: list[str] = Field(default_factory=list)
+    unique_run_count: int | None = None
+    runs: list[dict[str, Any]] = Field(default_factory=list)
+    run_id: str | None = None
+    status: str | None = None
+
+
+class ResearchStrategyRunResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    strategy_run_id: str | None = None
+    run_id: str | None = None
+    strategy_id: str | None = None
+    strategy_version_id: str | None = None
+
+
+class ComparisonResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    run_id: str | None = None
+    strategy_id: str | None = None
+    strategy_version_id: str | None = None
+
+
+class ReconcileResponse(BaseModel):
+    status: str
+    decision_id: str
+    resolution: str
 
 
 def _require_mode_scope(request: Request, mode: RunMode) -> None:
@@ -301,7 +394,7 @@ def _is_live_control_request(
     if path.startswith("/live/"):
         return True
     if path.startswith("/run/"):
-        return current_mode == RunMode.LIVE
+        return current_mode == RunMode.LIVE and path not in {"/run/stop", "/run/kill"}
     if path.startswith("/decisions/") and path.endswith("/accept"):
         return current_mode == RunMode.LIVE
     if path.startswith("/feedback/"):
@@ -321,6 +414,8 @@ def _is_live_control_request(
 def _require_stop_scope(request: Request, mode: RunMode) -> None:
     auth = principal(request)
     if auth is None:
+        if mode == RunMode.LIVE:
+            raise HTTPException(status_code=401, detail="LIVE control requires an API token.")
         return
     if "kill" in auth.scopes:
         request.state.auth_scope = "kill"
@@ -479,7 +574,6 @@ def create_app(
             live_control
             and live_actor_allowed
             and pool is None
-            and active_runner.config.api_tokens
         ):
             return JSONResponse(status_code=503, content={"detail": "Request audit unavailable."})
         if live_control and live_actor_allowed and pool is not None and hasattr(pool, "fetchval"):
@@ -501,11 +595,12 @@ def create_app(
         finally:
             if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
                 pool = getattr(active_runner, "pg_pool", None)
-                if (
+                audit_available = (
                     pool is not None
                     and hasattr(pool, "acquire")
                     and hasattr(pool, "fetch")
-                ):
+                )
+                if audit_available:
                     try:
                         await append_request_audit(
                             pool,
@@ -517,14 +612,32 @@ def create_app(
                         )
                     except Exception:  # noqa: BLE001
                         logger.exception("API request audit append failed")
-                        # LIVE control paths fail closed if audit persistence is
-                        # unavailable. The handler has already completed, so
-                        # this protects the response and surfaces the outage.
                         if live_control:
-                            response = JSONResponse(status_code=503, content={"detail": "Request audit unavailable."})
+                            # The preflight reservation prevents an unavailable
+                            # sink before a risk-increasing operation. If the
+                            # sink fails after the handler has run, preserve the
+                            # successful side effect and make degradation
+                            # explicit while recording a local fallback.
+                            _write_audit_fallback(
+                                request,
+                                500 if response is None else response.status_code,
+                            )
+                            if response is not None:
+                                response.headers["X-Audit-Degraded"] = "true"
+                                response = await _audit_degraded_response(response)
+                        elif request.url.path in {"/run/stop", "/run/kill"}:
+                            _write_audit_fallback(request, 500 if response is None else response.status_code)
+                            if response is not None and active_runner.config.mode == RunMode.LIVE:
+                                response.headers["X-Audit-Degraded"] = "true"
+                                response = await _audit_degraded_response(response)
+                elif request.url.path in {"/run/stop", "/run/kill"}:
+                    _write_audit_fallback(request, 500 if response is None else response.status_code)
+                    if response is not None and active_runner.config.mode == RunMode.LIVE:
+                        response.headers["X-Audit-Degraded"] = "true"
+                        response = await _audit_degraded_response(response)
         return response
 
-    @app.get("/status", response_model=APIResponse, tags=["info-collection"], dependencies=[Depends(require_scope("read"))])
+    @app.get("/status", response_model=StatusResponse, tags=["info-collection"], dependencies=[Depends(require_scope("read"))])
     async def status(request: Request) -> dict[str, Any]:
         records = await active_runner.eval_store.all()
         unresolved_feedback = await list_feedback_items(
@@ -597,7 +710,7 @@ def create_app(
         )
         return JSONResponse(status_code=code, content=payload)
 
-    @app.get("/readiness", response_model=APIResponse, tags=["ops"])
+    @app.get("/readiness", response_model=ReadinessResponse, tags=["ops"])
     async def readiness(request: Request) -> JSONResponse:
         code, payload = readiness_payload(
             active_runner,
@@ -742,7 +855,10 @@ def create_app(
     async def positions() -> dict[str, Any]:
         if active_runner.pg_pool is None:
             raise HTTPException(status_code=503, detail="Runner PostgreSQL pool is not initialized")
-        payload = await list_positions_items(active_runner.fill_store)
+        payload = await list_positions_items(
+            active_runner.fill_store,
+            run_mode=active_runner.config.mode.value,
+        )
         return payload.model_dump(mode="json")
 
     @app.get("/trades", response_model=TradesResponse, tags=["trading"], dependencies=[Depends(require_scope("read"))])
@@ -758,6 +874,7 @@ def create_app(
             limit=limit,
             offset=offset,
             until=until,
+            run_mode=active_runner.config.mode.value,
         )
         return payload.model_dump(mode="json")
 
@@ -779,7 +896,7 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return cast(dict[str, Any], _jsonable(payload))
 
-    @app.get("/decisions", response_model=list[APIResponse], tags=["decision"], dependencies=[Depends(require_scope("read"))])
+    @app.get("/decisions", response_model=list[DecisionResponse], tags=["decision"], dependencies=[Depends(require_scope("read"))])
     async def decisions(
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
@@ -807,7 +924,7 @@ def create_app(
             payloads.append(payload)
         return payloads
 
-    @app.get("/decisions/{decision_id}", response_model=APIResponse, tags=["decision"], dependencies=[Depends(require_scope("read"))])
+    @app.get("/decisions/{decision_id}", response_model=DecisionResponse, tags=["decision"], dependencies=[Depends(require_scope("read"))])
     async def decision_detail(
         decision_id: str,
         include: str | None = None,
@@ -873,7 +990,7 @@ def create_app(
             raise HTTPException(status_code=422, detail=exc.reason) from exc
         return payload.model_dump(mode="json")
 
-    @app.get("/metrics", response_model=APIResponse, tags=["ops"], dependencies=[Depends(require_scope("read"))])
+    @app.get("/metrics", response_model=MetricsResponse, tags=["ops"], dependencies=[Depends(require_scope("read"))])
     async def metrics(
         since: datetime | None = Query(default=None),
         until: datetime | None = Query(default=None),
@@ -900,14 +1017,14 @@ def create_app(
             capital_base_usdc=active_runner.config.risk.max_total_exposure,
         )
 
-    @app.get("/feedback", response_model=list[APIResponse], tags=["ops"], dependencies=[Depends(require_scope("read"))])
+    @app.get("/feedback", response_model=list[FeedbackResponse], tags=["ops"], dependencies=[Depends(require_scope("read"))])
     async def feedback(resolved: bool | None = None) -> list[dict[str, Any]]:
         return [
             cast(dict[str, Any], _jsonable(item))
             for item in await list_feedback_items(active_runner.feedback_store, resolved=resolved)
         ]
 
-    @app.get("/stream/events", response_model=APIResponse, tags=["ops"], dependencies=[Depends(require_scope("read"))])
+    @app.get("/stream/events", response_model=StreamEventResponse, tags=["ops"], dependencies=[Depends(require_scope("read"))])
     async def stream_events(
         request: Request,
         last_event_id: int | None = Query(default=None, ge=0),
@@ -1040,7 +1157,8 @@ def create_app(
 
     @app.post(
         "/research/backtest",
-        response_model=APIResponse,
+        response_model=ResearchRunResponse,
+        response_model_exclude_unset=True,
         tags=["research"],
         dependencies=[Depends(require_scope("research"))],
         openapi_extra={
@@ -1070,13 +1188,13 @@ def create_app(
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.get("/research/backtest", response_model=list[APIResponse], tags=["research"], dependencies=[Depends(require_scope("research"))])
+    @app.get("/research/backtest", response_model=list[ResearchRunResponse], response_model_exclude_unset=True, tags=["research"], dependencies=[Depends(require_scope("research"))])
     async def get_backtest_runs(limit: int = Query(default=25, ge=1, le=100)) -> list[dict[str, Any]]:
         if active_runner.pg_pool is None:
             raise HTTPException(status_code=503, detail="Runner PostgreSQL pool is not initialized")
         return await list_backtest_runs(active_runner.pg_pool, limit=limit)
 
-    @app.get("/research/backtest/{run_id}", response_model=APIResponse, tags=["research"], dependencies=[Depends(require_scope("research"))])
+    @app.get("/research/backtest/{run_id}", response_model=ResearchRunResponse, response_model_exclude_unset=True, tags=["research"], dependencies=[Depends(require_scope("research"))])
     async def get_backtest_run(run_id: str) -> dict[str, Any]:
         if active_runner.pg_pool is None:
             raise HTTPException(status_code=503, detail="Runner PostgreSQL pool is not initialized")
@@ -1087,7 +1205,8 @@ def create_app(
 
     @app.get(
         "/research/backtest/{run_id}/strategies",
-        response_model=list[APIResponse],
+        response_model=list[ResearchStrategyRunResponse],
+        response_model_exclude_unset=True,
         tags=["research"],
         dependencies=[Depends(require_scope("research"))],
     )
@@ -1098,7 +1217,8 @@ def create_app(
 
     @app.post(
         "/research/backtest/{run_id}/compare",
-        response_model=APIResponse,
+        response_model=ComparisonResponse,
+        response_model_exclude_unset=True,
         tags=["research"],
         dependencies=[Depends(require_scope("research"))],
         openapi_extra={
@@ -1128,7 +1248,7 @@ def create_app(
 
     @app.post(
         "/feedback/{feedback_id}/resolve",
-        response_model=APIResponse,
+        response_model=FeedbackResponse,
         tags=["ops"],
         dependencies=[Depends(require_any_scope("paper_operate", "live_admin"))],
     )
@@ -1141,7 +1261,7 @@ def create_app(
 
     @app.post(
         "/live/reconcile-submission-unknown",
-        response_model=APIResponse,
+        response_model=ReconcileResponse,
         tags=["ops"],
         dependencies=[Depends(require_scope("live_admin"))],
     )
@@ -1226,7 +1346,18 @@ def create_app(
 
     @app.post("/config", response_model=ConfigResponse, tags=["ops"], dependencies=[Depends(require_any_scope("paper_operate", "live_admin"))])
     async def update_config(update: ConfigUpdate, request: Request) -> dict[str, str]:
-        _require_mode_scope(request, update.mode)
+        current_mode = active_runner.config.mode
+        if current_mode == RunMode.BACKTEST and update.mode != RunMode.LIVE:
+            return {"mode": active_runner.state.mode.value}
+        if current_mode == RunMode.LIVE or update.mode == RunMode.LIVE:
+            auth = principal(request)
+            if auth is None:
+                raise HTTPException(status_code=401, detail="LIVE control requires an API token.")
+            if "live_admin" not in auth.scopes:
+                raise HTTPException(status_code=403, detail="API token does not have the required scope.")
+            request.state.auth_scope = "live_admin"
+        else:
+            _require_mode_scope(request, update.mode)
         if (
             update.mode != active_runner.config.mode
             and _is_runner_running(active_runner)
@@ -1301,21 +1432,6 @@ def create_app(
             await active_runner.stop(close_pool=False)
         return {"status": "killed"}
 
-    @app.post("/live/halt/clear", response_model=HaltResponse, tags=["ops"], dependencies=[Depends(require_scope("live_admin"))])
-    async def clear_live_halt() -> dict[str, Any]:
-        if active_runner.config.mode != RunMode.LIVE:
-            raise HTTPException(status_code=409, detail="LIVE halt clear requires mode=live.")
-        try:
-            validate_live_mode_ready(active_runner.config)
-            require_live_preflight_artifact(active_runner.config)
-        except LiveTradingDisabledError as exc:
-            raise HTTPException(status_code=400, detail=redact_live_error(str(exc), active_runner.config)) from exc
-        risk = getattr(active_runner.actuator_executor, "risk", None)
-        if risk is None:
-            raise HTTPException(status_code=503, detail="Risk manager is unavailable.")
-        risk.clear_halt()
-        return {"status": "cleared", "halted": False, "reason": None}
-
     @app.get("/selection/explain", response_model=SelectionExplainResponse, tags=["info-collection"], dependencies=[Depends(require_scope("read"))])
     async def selection_explain(market_id: str) -> dict[str, Any]:
         selector = getattr(active_runner, "_market_selector", None)
@@ -1325,6 +1441,7 @@ def create_app(
         payload = explain(
             market_id,
             max_subscription_asset_ids=active_runner.config.sensor.max_subscription_asset_ids,
+            current_asset_ids=_current_subscription_asset_ids(active_runner),
         )
         if asyncio.iscoroutine(payload):
             payload = await payload
@@ -1341,8 +1458,13 @@ def create_app(
         if row is None:
             raise HTTPException(status_code=404, detail="Decision not found")
         evidence = dict(row.decision_evidence)
-        if not evidence:
-            return {"decision_id": decision_id, "available": False, "reason": "evidence_unavailable"}
+        trace = evidence.get("decision_trace")
+        if not isinstance(trace, dict):
+            return {
+                "decision_id": decision_id,
+                "available": False,
+                "reason": "decision_trace_unavailable",
+            }
         return {**evidence, "decision_id": decision_id, "available": True}
 
     @app.post("/decisions/{decision_id}/risk-check", response_model=RiskCheckResponse, tags=["decision"], dependencies=[Depends(require_scope("read"))])
@@ -1363,7 +1485,7 @@ def create_app(
             return {
                 "decision_id": decision_id,
                 "approved": False,
-                "reason": halt.trigger_kind,
+                "reason": halt.reason,
             }
         result = risk.check(copy.deepcopy(row.decision), portfolio)
         return {"decision_id": decision_id, "approved": result.approved, "reason": result.reason}
@@ -1386,7 +1508,7 @@ def create_app(
                 "SELECT report_id, run_id, ranking_metric, ranked_strategies, benchmark_rows, attribution_commentary, warnings, next_action, generated_at FROM evaluation_reports ORDER BY generated_at DESC LIMIT $1",
                 limit,
             )
-        return {"reports": [EvaluationReportResponse.model_validate(dict(row)) for row in rows]}
+        return {"reports": [_evaluation_report_payload(row) for row in rows]}
 
     @app.get("/evaluation/reports/{report_id}", response_model=EvaluationReportResponse, tags=["research"], dependencies=[Depends(require_scope("read"))])
     async def evaluation_report(report_id: UUID) -> EvaluationReportResponse:
@@ -1399,7 +1521,7 @@ def create_app(
             )
         if row is None:
             raise HTTPException(status_code=404, detail="Evaluation report not found")
-        return EvaluationReportResponse.model_validate(dict(row))
+        return _evaluation_report_payload(row)
 
     return app
 
@@ -1431,11 +1553,20 @@ async def _quote_eval_records(runner: Runner) -> list[QuoteEvalRecord]:
 
 
 async def _mark_to_market_payload(runner: Runner) -> dict[str, float | int]:
-    read_positions = getattr(runner.fill_store, "read_positions", None)
+    mode_reader = getattr(runner.fill_store, "read_positions_for_mode", None)
+    if callable(mode_reader):
+        read_positions = mode_reader
+        has_mode_reader = True
+    else:
+        read_positions = getattr(runner.fill_store, "read_positions", None)
+        has_mode_reader = False
     if not callable(read_positions):
         return _mark_to_market_from_positions([])
     try:
-        positions = list(await read_positions())
+        if has_mode_reader:
+            positions = list(await read_positions(runner.config.mode.value))
+        else:
+            positions = list(await read_positions())
     except Exception:  # noqa: BLE001
         logger.exception("mark-to-market metrics unavailable")
         return _mark_to_market_from_positions([])
@@ -1845,6 +1976,18 @@ def _request_metadata(request: Request) -> dict[str, object]:
     }
 
 
+def _evaluation_report_payload(row: Any) -> EvaluationReportResponse:
+    payload = dict(row)
+    for key in ("ranked_strategies", "benchmark_rows", "warnings"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            try:
+                payload[key] = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise HTTPException(status_code=503, detail="Evaluation report JSON is invalid.") from exc
+    return EvaluationReportResponse.model_validate(payload)
+
+
 _APPROVAL_PREVIEW_KEYS = (
     "venue",
     "market_id",
@@ -1885,6 +2028,46 @@ def _pending_approval_events(path: Path) -> list[dict[str, Any]]:
         elif event_name in {"approval_matched", "approval_consumed"}:
             pending.pop(key, None)
     return list(pending.values())
+
+
+def _write_audit_fallback(request: Request, outcome: int) -> None:
+    record = {
+        "token_id": getattr(request.state, "token_id", None),
+        "scope": getattr(request.state, "auth_scope", "unknown"),
+        "method": request.method,
+        "path": request.url.path,
+        "outcome": outcome,
+        "timestamp": datetime.now(tz=UTC).isoformat(),
+    }
+    logger.critical("request audit fallback: %s", record)
+    try:
+        fallback = Path(".data/api-request-audit-fallback.jsonl")
+        fallback.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with fallback.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except OSError:
+        logger.critical("request audit fallback file unavailable", exc_info=True)
+
+
+async def _audit_degraded_response(response: Any) -> Any:
+    """Add an explicit degradation marker without changing the status code."""
+    body = getattr(response, "body", None)
+    if body is None:
+        iterator = getattr(response, "body_iterator", None)
+        if iterator is not None:
+            body = b"".join([chunk async for chunk in iterator])
+    if not isinstance(body, (bytes, bytearray)):
+        return response
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return response
+    if not isinstance(payload, dict):
+        return response
+    payload["audit_degraded"] = True
+    headers = dict(getattr(response, "headers", {}))
+    headers.pop("content-length", None)
+    return JSONResponse(status_code=response.status_code, content=payload, headers=headers)
 
 
 def _actuator_status(runner: Runner, *, now: datetime) -> dict[str, Any]:

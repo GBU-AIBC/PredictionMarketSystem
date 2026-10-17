@@ -35,8 +35,16 @@ class PositionsResponse(BaseModel):
     positions: list[PositionRow]
 
 
-async def list_positions(store: PositionsReader) -> PositionsResponse:
-    positions = await store.read_positions()
+async def list_positions(
+    store: PositionsReader,
+    *,
+    run_mode: str | None = None,
+) -> PositionsResponse:
+    read_for_mode = getattr(store, "read_positions_for_mode", None)
+    if run_mode is not None and callable(read_for_mode):
+        positions = await read_for_mode(run_mode)
+    else:
+        positions = await store.read_positions()
     return PositionsResponse(
         positions=[
             PositionRow(

@@ -122,6 +122,12 @@ def require_scope(scope: str) -> Callable[[Request], None]:
         principal = authenticate(request)
         # Unconfigured local development remains open for non-LIVE routes.
         if principal is None:
+            # Kill and LIVE control are always authenticated, even when the
+            # local API has no configured bearer secret.  These scopes can
+            # increase or terminate real-world risk and must never inherit
+            # the development open mode.
+            if scope in {"kill", "live_admin"}:
+                _raise_unauthorized(request)
             return
         if scope not in principal.scopes:
             _raise_forbidden()
@@ -139,6 +145,12 @@ def require_any_scope(*scopes: str) -> Callable[[Request], None]:
         request.state.auth_scope = ",".join(scopes)
         principal = authenticate(request)
         if principal is None:
+            if any(scope in {"kill", "live_admin"} for scope in scopes):
+                # The dependency is also used by PAPER routes where the
+                # historical open mode remains valid; handlers enforce the
+                # stricter requirement when the runner is LIVE.  Do not make
+                # a mixed paper/live operation globally closed here.
+                return
             return
         if not principal.scopes.intersection(scopes):
             _raise_forbidden()

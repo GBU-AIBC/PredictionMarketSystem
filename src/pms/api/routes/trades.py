@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from typing import Protocol
+from typing import Any, Protocol, cast
 
 from pydantic import BaseModel
 
@@ -54,8 +54,27 @@ async def list_trades(
     limit: int,
     offset: int = 0,
     until: datetime | None = None,
+    run_mode: str | None = None,
 ) -> TradesResponse:
-    rows = await store.read_trades(limit=limit, offset=offset, until=until)
+    reader = cast(Any, store)
+    try:
+        rows = await reader.read_trades(
+            limit=limit,
+            offset=offset,
+            until=until,
+            run_mode=run_mode,
+        )
+    except TypeError:
+        # Compatibility for test/dry-run readers predating mode provenance;
+        # durable FillStore implements the keyword and filters at the source.
+        rows = await store.read_trades(limit=limit, offset=offset, until=until)
+        if run_mode is not None:
+            rows = [
+                row
+                for row in rows
+                if row.run_mode == run_mode
+                or (run_mode in {"paper", "backtest"} and row.run_mode is None)
+            ]
     return TradesResponse(
         trades=[
             TradeRow(
