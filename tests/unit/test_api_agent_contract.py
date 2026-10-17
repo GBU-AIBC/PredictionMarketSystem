@@ -10,7 +10,7 @@ import pytest
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
 
-from pms.api.app import _mark_to_market_payload, create_app
+from pms.api.app import ComparisonRequest, _mark_to_market_payload, create_app
 from pms.config import PMSSettings
 from pms.config import _require_live_api_control_plane_auth
 from pms.core.enums import RunMode, Side, TimeInForce, Venue
@@ -145,8 +145,14 @@ async def test_live_routes_require_a_token_in_open_mode(
     runner = Runner(config=PMSSettings(mode=RunMode.LIVE, auto_migrate_default_v2=False))
     app = create_app(runner, auto_start=False)
     async with _client(app, raise_app_exceptions=False) as client:
-        response = await client.post(path, **kwargs)
-    assert response.status_code == 401
+        missing = await client.post(path, **kwargs)
+        bogus = await client.post(
+            path,
+            headers={"Authorization": "Bearer arbitrary-unconfigured-value"},
+            **kwargs,
+        )
+    assert missing.status_code == 401
+    assert bogus.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -194,6 +200,29 @@ async def test_positions_trades_and_mtm_are_scoped_to_active_run_mode() -> None:
     assert mtm["open_positions"] == 1
 
 
+@pytest.mark.asyncio
+async def test_decay_status_exposes_typed_producer_not_wired(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def decay(_pool: object, **_kwargs: object) -> dict[str, str]:
+        return {
+            "strategy_id": "s",
+            "strategy_version_id": "v",
+            "decay_status": "producer_not_wired",
+        }
+
+    monkeypatch.setattr("pms.api.app.get_strategy_decay_status_item", decay)
+    runner = Runner(config=_settings(api_token="legacy-secret"))
+    runner.bind_pg_pool(cast(Any, object()))
+    app = create_app(runner, auto_start=False)
+    async with _client(app) as client:
+        response = await client.get(
+            "/strategies/s/decay-status",
+            headers={"Authorization": "Bearer legacy-secret"},
+        )
+    assert response.status_code == 200
+    assert response.json()["decay_status"] == "producer_not_wired"
+    assert response.json()["reason"] == "producer_not_wired"
+
+
 def test_token_settings_reject_invalid_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MISSING_AGENT_SECRET", raising=False)
     with pytest.raises(ValidationError, match="missing"):
@@ -210,6 +239,19 @@ def test_token_settings_reject_invalid_configuration(monkeypatch: pytest.MonkeyP
         PMSSettings(api_tokens=cast(Any, [{"token_id": "a", "secret": "", "scopes": ["read"]}]))
 
 
+@pytest.mark.parametrize("offset", [float("nan"), float("inf"), float("-inf")])
+def test_research_policy_rejects_non_finite_offsets(offset: float) -> None:
+    with pytest.raises(ValidationError, match="finite"):
+        ComparisonRequest.model_validate(
+            {
+                "live_window_start": "2026-01-01T00:00:00Z",
+                "live_window_end": "2026-01-02T00:00:00Z",
+                "denominator": "union",
+                "time_alignment_policy": {"generated_offset_s": offset},
+            }
+        )
+
+
 def test_scoped_live_admin_token_satisfies_live_control_plane_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LIVE_ADMIN_SECRET", "live-admin-secret")
     settings = PMSSettings(
@@ -221,12 +263,16 @@ def test_scoped_live_admin_token_satisfies_live_control_plane_auth(monkeypatch: 
 
 @pytest.mark.asyncio
 async def test_legacy_token_fallback_and_token_id_spoofing_are_closed() -> None:
-    app = create_app(Runner(config=_settings(api_token="legacy-secret")), auto_start=False)
+    runner = Runner(config=_settings(api_token="legacy-secret"))
+    pool = _RecordingPool()
+    runner.bind_pg_pool(cast(Any, pool))
+    app = create_app(runner, auto_start=False)
     async with _client(app) as client:
         headers = {"Authorization": "Bearer legacy-secret"}
         assert (await client.post("/config?token_id=attacker", headers=headers, json={"mode": "paper"})).status_code == 422
         assert (await client.post("/config", headers=headers, json={"mode": "paper", "token_id": "attacker"})).status_code == 422
         assert (await client.post("/config", headers=headers, json={"mode": "paper"})).status_code == 200
+    assert any(int(cast(int, row[4])) == 422 for row in pool.rows)
 
 
 def test_routes_have_explicit_auth_or_public_exception_and_typed_openapi() -> None:
@@ -609,8 +655,12 @@ async def test_live_control_fails_closed_when_audit_sink_is_down(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["/run/kill", "/run/stop"])
-async def test_kill_and_stop_remain_available_when_audit_sink_is_down(path: str) -> None:
+async def test_kill_and_stop_remain_available_when_audit_sink_is_down(
+    path: str,
+    tmp_path: Any,
+) -> None:
     runner = Runner(config=_settings(mode=RunMode.LIVE, api_token="legacy-secret"))
+    runner.config.live_request_audit_fallback_path = str(tmp_path / "fallback.jsonl")
     runner.bind_pg_pool(cast(Any, _AuditPool()))
     stop_calls: list[int] = []
 
@@ -661,8 +711,10 @@ async def test_risk_increasing_live_controls_fail_closed_without_audit_pool(
 
 @pytest.mark.asyncio
 async def test_live_control_reports_success_when_post_audit_degrades(
+    tmp_path: Any,
 ) -> None:
     runner = Runner(config=_settings(mode=RunMode.LIVE, api_token="legacy-secret"))
+    runner.config.live_request_audit_fallback_path = str(tmp_path / "fallback.jsonl")
     started: list[int] = []
 
     async def start() -> None:
@@ -683,7 +735,7 @@ async def test_live_control_reports_success_when_post_audit_degrades(
 
 
 @pytest.mark.asyncio
-async def test_scoped_kill_stops_with_no_pool() -> None:
+async def test_scoped_kill_stops_with_no_pool(tmp_path: Any) -> None:
     os.environ["KILL_ONLY_SECRET"] = "kill-only-secret"
     settings = PMSSettings(
         mode=RunMode.LIVE,
@@ -691,6 +743,7 @@ async def test_scoped_kill_stops_with_no_pool() -> None:
         auto_migrate_default_v2=False,
     )
     runner = Runner(config=settings)
+    runner.config.live_request_audit_fallback_path = str(tmp_path / "fallback.jsonl")
     stop_calls: list[int] = []
 
     async def stop(*, close_pool: bool = True) -> None:
@@ -707,3 +760,29 @@ async def test_scoped_kill_stops_with_no_pool() -> None:
     assert response.status_code == 200
     assert response.json()["audit_degraded"] is True
     assert stop_calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_audit_fallback_defaults_next_to_emergency_audit_path(tmp_path: Any) -> None:
+    emergency = tmp_path / "emergency.jsonl"
+    runner = Runner(
+        config=_settings(mode=RunMode.LIVE, api_token="legacy-secret").model_copy(
+            update={"live_emergency_audit_path": str(emergency)}
+        )
+    )
+    runner.stop = (  # type: ignore[method-assign]
+        lambda **_kwargs: _completed_stop()
+    )
+    app = create_app(runner, auto_start=False)
+    async with _client(app, raise_app_exceptions=False) as client:
+        response = await client.post(
+            "/run/kill",
+            headers={"Authorization": "Bearer legacy-secret"},
+        )
+    assert response.status_code == 200
+    assert response.json()["audit_degraded"] is True
+    assert emergency.with_name("api-request-audit-fallback.jsonl").exists()
+
+
+async def _completed_stop() -> None:
+    return None

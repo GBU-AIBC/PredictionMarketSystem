@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import os
 from collections import defaultdict
 from collections.abc import AsyncIterator, Sequence
@@ -21,7 +22,8 @@ import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.routing import Match
 
 from pms.api.auth import authenticate, principal, require_any_scope, require_scope
 from pms.api.health import health_payload, readiness_payload
@@ -152,6 +154,16 @@ class ComparisonRequest(BaseModel):
     time_alignment_policy: dict[str, Any] | None = None
     symbol_normalization_policy: dict[str, Any] | None = None
 
+    @field_validator("time_alignment_policy", "symbol_normalization_policy")
+    @classmethod
+    def _finite_policy_values(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        for key, item in value.items():
+            if isinstance(item, (int, float)) and not math.isfinite(float(item)):
+                raise ValueError(f"{key} must be finite")
+        return value
+
 
 class ConfigResponse(BaseModel):
     mode: RunMode
@@ -245,6 +257,11 @@ class DecisionExplainResponse(BaseModel):
     decision_id: str
     available: bool
     reason: str | None = None
+    decision_trace: dict[str, Any] | None = None
+    forecasts: dict[str, Any] | None = None
+    gates: dict[str, Any] | None = None
+    sizing: dict[str, Any] | None = None
+    risk: dict[str, Any] | None = None
 
 
 class RiskCheckResponse(BaseModel):
@@ -271,6 +288,7 @@ class SelectionExplainResponse(BaseModel):
     token_ids: list[str] = Field(default_factory=list)
     pinned_token_ids: list[str] = Field(default_factory=list)
     capped: bool = False
+    strategy_reasons: dict[str, str] = Field(default_factory=dict)
 
 
 class EvaluationReportsResponse(BaseModel):
@@ -435,6 +453,36 @@ def _live_audit_actor_allowed(path: str, auth: Any) -> bool:
     return "live_admin" in scopes
 
 
+def _scope_for_request(app: FastAPI, request: Request) -> str:
+    """Resolve the declared route scope before LIVE audit preflight."""
+    for route in app.routes:
+        matcher = getattr(route, "matches", None)
+        if not callable(matcher):
+            continue
+        match, _child_scope = matcher(request.scope)
+        if match is not Match.FULL:
+            continue
+        names = {
+            getattr(dependency.call, "__name__", "")
+            for dependency in getattr(getattr(route, "dependant", None), "dependencies", ())
+        }
+        declared = sorted(
+            name.removeprefix("require_scope_")
+            for name in names
+            if name.startswith("require_scope_")
+        )
+        if declared:
+            return declared[0]
+        any_declared = sorted(
+            name.removeprefix("require_any_scope_").replace("_", " ")
+            for name in names
+            if name.startswith("require_any_scope_")
+        )
+        if any_declared:
+            return any_declared[0]
+    return "unknown"
+
+
 class SubscriptionStateResponse(BaseModel):
     asset_ids: list[str]
     count: int
@@ -548,7 +596,37 @@ def create_app(
     @app.middleware("http")
     async def request_audit(request: Request, call_next: Any) -> Any:
         if "token_id" in request.query_params:
-            return JSONResponse(status_code=422, content={"detail": "token_id is server-assigned."})
+            # Reject client-supplied identity before dispatching the handler,
+            # but still record the mutating request outcome.
+            try:
+                authenticate(request)
+            except HTTPException:
+                pass
+            response: Any = JSONResponse(
+                status_code=422,
+                content={"detail": "token_id is server-assigned."},
+            )
+            if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+                pool = getattr(active_runner, "pg_pool", None)
+                if pool is not None and hasattr(pool, "acquire"):
+                    try:
+                        await append_request_audit(
+                            pool,
+                            token_id=str(
+                                getattr(request.state, "token_id", None)
+                                or "anonymous"
+                            ),
+                            scope="unknown",
+                            method=request.method.upper(),
+                            path=request.url.path,
+                            outcome=422,
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception("API request audit append failed for spoofed identity")
+                        _write_audit_fallback(request, 422, active_runner.config)
+                elif request.url.path in {"/run/stop", "/run/kill"}:
+                    _write_audit_fallback(request, 422, active_runner.config)
+            return response
         pool = getattr(active_runner, "pg_pool", None)
         request_body: bytes | None = None
         if request.url.path == "/config":
@@ -566,6 +644,8 @@ def create_app(
                 preflight_principal = authenticate(request)
             except HTTPException:
                 preflight_principal = None
+        if preflight_principal is not None:
+            request.state.auth_scope = _scope_for_request(app, request)
         live_actor_allowed = _live_audit_actor_allowed(
             request.url.path,
             preflight_principal,
@@ -621,17 +701,26 @@ def create_app(
                             _write_audit_fallback(
                                 request,
                                 500 if response is None else response.status_code,
+                                active_runner.config,
                             )
                             if response is not None:
                                 response.headers["X-Audit-Degraded"] = "true"
                                 response = await _audit_degraded_response(response)
                         elif request.url.path in {"/run/stop", "/run/kill"}:
-                            _write_audit_fallback(request, 500 if response is None else response.status_code)
+                            _write_audit_fallback(
+                                request,
+                                500 if response is None else response.status_code,
+                                active_runner.config,
+                            )
                             if response is not None and active_runner.config.mode == RunMode.LIVE:
                                 response.headers["X-Audit-Degraded"] = "true"
                                 response = await _audit_degraded_response(response)
                 elif request.url.path in {"/run/stop", "/run/kill"}:
-                    _write_audit_fallback(request, 500 if response is None else response.status_code)
+                    _write_audit_fallback(
+                        request,
+                        500 if response is None else response.status_code,
+                        active_runner.config,
+                    )
                     if response is not None and active_runner.config.mode == RunMode.LIVE:
                         response.headers["X-Audit-Degraded"] = "true"
                         response = await _audit_degraded_response(response)
@@ -1327,10 +1416,11 @@ def create_app(
         tags=["ops"],
         dependencies=[Depends(require_scope("live_admin"))],
     )
-    async def clear_live_halt(payload: HaltClearRequest) -> dict[str, str]:
+    async def clear_live_halt(payload: HaltClearRequest, request: Request) -> dict[str, str]:
         try:
             remaining_halt = await active_runner.clear_live_halt(
-                cleared_by=payload.cleared_by
+                cleared_by=payload.cleared_by,
+                token_id=getattr(request.state, "token_id", None),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2030,7 +2120,7 @@ def _pending_approval_events(path: Path) -> list[dict[str, Any]]:
     return list(pending.values())
 
 
-def _write_audit_fallback(request: Request, outcome: int) -> None:
+def _write_audit_fallback(request: Request, outcome: int, settings: PMSSettings) -> None:
     record = {
         "token_id": getattr(request.state, "token_id", None),
         "scope": getattr(request.state, "auth_scope", "unknown"),
@@ -2041,7 +2131,11 @@ def _write_audit_fallback(request: Request, outcome: int) -> None:
     }
     logger.critical("request audit fallback: %s", record)
     try:
-        fallback = Path(".data/api-request-audit-fallback.jsonl")
+        emergency_path = Path(settings.live_emergency_audit_path).expanduser()
+        fallback = Path(
+            settings.live_request_audit_fallback_path
+            or emergency_path.with_name("api-request-audit-fallback.jsonl")
+        ).expanduser()
         fallback.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with fallback.open("a", encoding="utf-8") as file:
             file.write(json.dumps(record, separators=(",", ":")) + "\n")

@@ -939,12 +939,14 @@ async def test_status_marks_market_data_stale_when_no_signal_arrives_after_start
 @pytest.mark.asyncio
 async def test_api_feedback_resolve_and_config_errors() -> None:
     runner = _runner_with_state()
+    runner.config.api_token = "live-api-token"
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
     app = create_app(runner)
     transport = httpx.ASGITransport(app=app)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        resolved = await client.post("/feedback/fb-pending/resolve")
-        missing = await client.post("/feedback/not-found/resolve")
+        resolved = await client.post("/feedback/fb-pending/resolve", headers=AUTH_HEADERS)
+        missing = await client.post("/feedback/not-found/resolve", headers=AUTH_HEADERS)
         blocked_live = await client.post(
             "/config",
             json={"mode": "live"},
@@ -964,6 +966,8 @@ async def test_api_feedback_resolve_and_config_errors() -> None:
 async def test_api_config_rejects_live_mode_when_credentials_are_missing() -> None:
     runner = _runner_with_state()
     runner.config.live_trading_enabled = True
+    runner.config.api_token = "live-api-token"
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
     app = create_app(runner)
     transport = httpx.ASGITransport(app=app)
 
@@ -985,6 +989,7 @@ async def test_api_config_validates_candidate_live_mode_readiness() -> None:
         eval_store=cast(EvalStore, InMemoryEvalStore()),
         feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
     )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
     app = create_app(runner, auto_start=False)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
 
@@ -995,7 +1000,8 @@ async def test_api_config_validates_candidate_live_mode_readiness() -> None:
             headers=AUTH_HEADERS,
         )
 
-    assert response.status_code == 503
+    assert response.status_code == 400
+    assert "operator readiness" in response.json()["detail"]
     assert runner.config.mode == RunMode.PAPER
     assert runner.state.mode == RunMode.PAPER
 
@@ -1007,6 +1013,7 @@ async def test_api_config_rejects_live_mode_without_credentialed_preflight_artif
         eval_store=cast(EvalStore, InMemoryEvalStore()),
         feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
     )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
     app = create_app(runner, auto_start=False)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
 
@@ -1017,7 +1024,8 @@ async def test_api_config_rejects_live_mode_without_credentialed_preflight_artif
             headers=AUTH_HEADERS,
         )
 
-    assert response.status_code == 503
+    assert response.status_code == 400
+    assert "preflight artifact" in response.json()["detail"]
     assert runner.config.mode == RunMode.PAPER
     assert runner.state.mode == RunMode.PAPER
 
@@ -1055,6 +1063,7 @@ async def test_api_config_redacts_live_transition_refusal_detail(
         eval_store=cast(EvalStore, InMemoryEvalStore()),
         feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
     )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
 
     def _refuse_live_transition(settings: PMSSettings) -> None:
         assert settings.mode == RunMode.LIVE
@@ -1076,7 +1085,17 @@ async def test_api_config_redacts_live_transition_refusal_detail(
             headers=AUTH_HEADERS,
         )
 
-    assert response.status_code == 503
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail.startswith("LIVE transition refused")
+    assert "<redacted-polymarket-credential>" in detail
+    assert "<redacted-database-url>" in detail
+    assert "password=<redacted>" in detail
+    for credential in credential_values:
+        assert credential not in detail
+    assert "supersecret" not in detail
+    assert "keyword-secret" not in detail
+    assert "admin" not in detail
 
 
 @pytest.mark.asyncio
@@ -1093,6 +1112,7 @@ async def test_api_config_rejects_live_mode_switch_while_runner_is_active() -> N
 
     task = asyncio.create_task(_pending())
     runner.sensor_stream._tasks = (task,)  # noqa: SLF001
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
     app = create_app(runner, auto_start=False)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
 
@@ -1107,7 +1127,8 @@ async def test_api_config_rejects_live_mode_switch_while_runner_is_active() -> N
                 headers=AUTH_HEADERS,
             )
 
-        assert response.status_code == 503
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Stop the runner before changing mode."
         assert runner.config.mode == RunMode.PAPER
         assert runner.state.mode == RunMode.PAPER
     finally:
@@ -1170,13 +1191,15 @@ async def test_api_run_start_rejects_live_mode_when_credentials_are_missing() ->
         eval_store=cast(EvalStore, InMemoryEvalStore()),
         feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
     )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
     app = create_app(runner, auto_start=False)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post("/run/start", headers=AUTH_HEADERS)
 
-    assert response.status_code == 503
+    assert response.status_code == 400
+    assert response.json()["detail"].startswith("Missing Polymarket credential fields:")
 
 
 @pytest.mark.asyncio
@@ -1196,6 +1219,7 @@ async def test_api_run_start_redacts_live_runtime_startup_refusal(
         eval_store=cast(EvalStore, InMemoryEvalStore()),
         feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
     )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
 
     async def _failing_start() -> None:
         raise exception_type(
@@ -1210,7 +1234,14 @@ async def test_api_run_start_redacts_live_runtime_startup_refusal(
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post("/run/start", headers=AUTH_HEADERS)
 
-    assert response.status_code == 503
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail.startswith("LIVE start refused")
+    assert "<redacted-database-url>" in detail
+    assert "password=<redacted>" in detail
+    assert "supersecret" not in detail
+    assert "keyword-secret" not in detail
+    assert "admin" not in detail
 
 
 @pytest.mark.asyncio
@@ -1229,6 +1260,7 @@ async def test_api_run_start_redacts_polymarket_credentials_from_live_startup_er
         config=PMSSettings(
             mode=RunMode.LIVE,
             live_trading_enabled=True,
+            api_token="live-api-token",
             auto_migrate_default_v2=False,
             polymarket=PolymarketSettings(
                 private_key=credential_values[0],
@@ -1242,6 +1274,7 @@ async def test_api_run_start_redacts_polymarket_credentials_from_live_startup_er
         eval_store=cast(EvalStore, InMemoryEvalStore()),
         feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
     )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
 
     async def _failing_start() -> None:
         raise ConnectionError(
@@ -1287,6 +1320,7 @@ async def test_api_run_start_redacts_live_trading_disabled_error_detail(
         config=PMSSettings(
             mode=RunMode.LIVE,
             live_trading_enabled=True,
+            api_token="live-api-token",
             auto_migrate_default_v2=False,
             polymarket=PolymarketSettings(
                 private_key=credential_values[0],
@@ -1300,6 +1334,7 @@ async def test_api_run_start_redacts_live_trading_disabled_error_detail(
         eval_store=cast(EvalStore, InMemoryEvalStore()),
         feedback_store=cast(FeedbackStore, InMemoryFeedbackStore()),
     )
+    runner.bind_pg_pool(cast(Any, _AvailableAuditPool()))
 
     async def _failing_start() -> None:
         raise LiveTradingDisabledError(

@@ -174,16 +174,24 @@ class LiveEmergencyAuditWriter:
             },
         )
 
-    async def append_halt_clear(self, *, cleared_by: str) -> None:
+    async def append_halt_clear(
+        self,
+        *,
+        cleared_by: str,
+        token_id: str | None = None,
+    ) -> None:
+        record: dict[str, object] = {
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+            "phase": "risk_halt_clear",
+            "event": "risk_halt_clear",
+            "cleared_by": _require_operator_id(cleared_by, "cleared_by"),
+        }
+        if token_id is not None:
+            record["token_id"] = token_id
         await asyncio.to_thread(
             _append_jsonl,
             self.path,
-            {
-                "timestamp": datetime.now(tz=UTC).isoformat(),
-                "phase": "risk_halt_clear",
-                "event": "risk_halt_clear",
-                "cleared_by": _require_operator_id(cleared_by, "cleared_by"),
-            },
+            record,
         )
 
 

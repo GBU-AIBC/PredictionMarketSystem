@@ -65,15 +65,10 @@ def _principal_for_request(request: Request) -> AuthPrincipal | None:
     settings = _settings_from_request(request)
     authorization = request.headers.get("Authorization")
     if not settings.api_token and not settings.api_tokens:
-        # Preserve the historical open local-development mode. A supplied
-        # bearer still establishes an operator principal so LIVE controls can
-        # require the presence of a token without inventing a secret.
-        if authorization is None:
-            return None
-        scheme, _, presented_token = authorization.partition(" ")
-        if scheme.lower() != "bearer" or not presented_token.strip():
-            _raise_unauthorized(request)
-        return AuthPrincipal("unconfigured", frozenset(SCOPES))
+        # Preserve open local-development mode for non-sensitive routes while
+        # refusing to turn an arbitrary bearer value into an operator token.
+        # LIVE and kill dependencies convert this missing principal to 401.
+        return None
     if authorization is None:
         if settings.api_token or settings.api_tokens:
             _raise_unauthorized(request)
@@ -145,12 +140,6 @@ def require_any_scope(*scopes: str) -> Callable[[Request], None]:
         request.state.auth_scope = ",".join(scopes)
         principal = authenticate(request)
         if principal is None:
-            if any(scope in {"kill", "live_admin"} for scope in scopes):
-                # The dependency is also used by PAPER routes where the
-                # historical open mode remains valid; handlers enforce the
-                # stricter requirement when the runner is LIVE.  Do not make
-                # a mixed paper/live operation globally closed here.
-                return
             return
         if not principal.scopes.intersection(scopes):
             _raise_forbidden()

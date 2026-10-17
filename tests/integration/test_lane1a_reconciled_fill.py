@@ -468,6 +468,13 @@ async def test_live_reconciliation_partitions_fill_provenance(
             )
         )
 
+        live_trades = await store.read_trades(limit=1, run_mode="live")
+        paper_trades = await store.read_trades(limit=1, run_mode="paper")
+        assert live_trades and live_trades[0].run_mode == "live"
+        assert paper_trades and paper_trades[0].run_mode == "paper"
+        assert all(trade.run_mode != "paper" for trade in live_trades)
+        assert all(trade.run_mode != "live" for trade in paper_trades)
+
         settings = PMSSettings(
             mode=RunMode.LIVE,
             live_emergency_audit_path=str(tmp_path / "mode-audit.jsonl"),

@@ -54,6 +54,7 @@ class SelectionExplanation:
     token_ids: tuple[str, ...] = ()
     pinned_token_ids: tuple[str, ...] = ()
     capped: bool = False
+    strategy_reasons: dict[str, SelectionReasonCode] | None = None
 
 
 class MarketSelector:
@@ -156,10 +157,12 @@ class MarketSelector:
         strategy_ids: list[str] = []
         token_ids: list[str] = []
         reasons: list[SelectionReasonCode] = []
+        strategy_reasons: dict[str, SelectionReasonCode] = {}
         specs = await self._registry.list_market_selections()
         for strategy_id, _version_id, spec in specs:
             strategy_ids.append(strategy_id)
             reason = await self._explain_for_spec(market, spec)
+            strategy_reasons[strategy_id] = "selected" if reason is None else reason
             if reason is not None:
                 reasons.append(reason)
             read_tokens = getattr(self._store, "read_tokens_for_market", None)
@@ -201,8 +204,12 @@ class MarketSelector:
                 reasons.append("cap")
         else:
             capped = False
-        if not reasons:
-            reasons.append("selected" if token_ids else "not_selected")
+        selected_by_strategy = any(reason == "selected" for reason in strategy_reasons.values())
+        pinned_for_market = bool(pinned and any(token_id in pinned for token_id in token_ids))
+        if selected_by_strategy or pinned_for_market:
+            reasons.append("selected")
+        elif not reasons:
+            reasons.append("not_selected")
         return SelectionExplanation(
             market_id=market_id,
             available=True,
@@ -211,6 +218,7 @@ class MarketSelector:
             token_ids=tuple(token_ids),
             pinned_token_ids=tuple(token_id for token_id in pinned if token_id in token_ids),
             capped=capped,
+            strategy_reasons=strategy_reasons,
         )
 
     async def _explain_for_spec(

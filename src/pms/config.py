@@ -471,6 +471,7 @@ class PMSSettings(BaseSettings):
     live_account_reconciliation_required: bool = True
     live_emergency_audit_path: str = ".data/live-emergency-audit.jsonl"
     live_first_order_audit_path: str = ".data/first-order-audit.jsonl"
+    live_request_audit_fallback_path: str | None = None
     live_paper_soak_report_path: str | None = None
     live_operator_rehearsal_report_path: str | None = None
     live_execution_model_path: str | None = None
@@ -1291,9 +1292,21 @@ def _require_distinct_live_audit_paths(settings: PMSSettings) -> None:
     if _path_looks_like_placeholder(settings.live_emergency_audit_path):
         msg = "LIVE emergency audit path contains placeholder"
         raise LiveTradingDisabledError(msg)
+    fallback_raw = settings.live_request_audit_fallback_path
+    if fallback_raw is not None and fallback_raw.strip() == "":
+        msg = "LIVE request-audit fallback path missing: live_request_audit_fallback_path"
+        raise LiveTradingDisabledError(msg)
+    if fallback_raw is not None and _path_looks_like_placeholder(fallback_raw):
+        msg = "LIVE request-audit fallback path contains placeholder"
+        raise LiveTradingDisabledError(msg)
 
     emergency_path = Path(settings.live_emergency_audit_path).expanduser()
     approval_audit_path = Path(first_order_path).expanduser()
+    fallback_path = (
+        Path(fallback_raw).expanduser()
+        if fallback_raw is not None
+        else emergency_path.with_name("api-request-audit-fallback.jsonl")
+    )
     _require_live_path_outside_working_tree(
         approval_audit_path,
         label="LIVE first-order audit path",
@@ -1301,6 +1314,10 @@ def _require_distinct_live_audit_paths(settings: PMSSettings) -> None:
     _require_live_path_outside_working_tree(
         emergency_path,
         label="LIVE emergency audit path",
+    )
+    _require_live_path_outside_working_tree(
+        fallback_path,
+        label="LIVE request-audit fallback path",
     )
     _require_live_path_parent_owner_writable(
         approval_audit_path,
@@ -1310,9 +1327,17 @@ def _require_distinct_live_audit_paths(settings: PMSSettings) -> None:
         emergency_path,
         label="LIVE emergency audit parent directory",
     )
+    _require_live_path_parent_owner_writable(
+        fallback_path,
+        label="LIVE request-audit fallback parent directory",
+    )
     _require_live_artifact_regular_file_or_absent(
         emergency_path,
         label="LIVE emergency audit path",
+    )
+    _require_live_artifact_regular_file_or_absent(
+        fallback_path,
+        label="LIVE request-audit fallback path",
     )
     _require_live_artifact_regular_file_or_absent(
         approval_audit_path,
