@@ -5,6 +5,7 @@ from typing import Any, cast
 
 import httpx
 import pytest
+from fastapi.routing import APIRoute
 
 from pms.agent_mcp.server import (
     MCPConfig,
@@ -15,6 +16,8 @@ from pms.agent_mcp.server import (
     ToolSpec,
     _assert_safe_tool,
     _input_schema,
+    _path_segment,
+    _redact,
     create_server,
 )
 from pms.api.app import create_app
@@ -48,6 +51,7 @@ async def test_openapi_drives_active_tool_schemas_and_feature_detects_2b() -> No
             operation = real_openapi["paths"][spec.path][spec.method.lower()]
             assert tools[spec.name].inputSchema == _input_schema(spec, operation, real_openapi)
             assert tools[spec.name].outputSchema is not None
+            assert tools[spec.name].outputSchema["type"] == "object"
 
         without_2b = deepcopy(real_openapi)
         without_2b["paths"].pop("/evidence")
@@ -56,7 +60,7 @@ async def test_openapi_drives_active_tool_schemas_and_feature_detects_2b() -> No
         names = {tool.name for tool in await server.list_tools()}
         assert "submit_evidence" not in names
         assert "submit_agent_factor" not in names
-        assert len(names) == 13
+        assert len(names) == len(TOOL_SPECS) - 2
     finally:
         await transport_client.aclose()
 
@@ -70,6 +74,14 @@ async def test_missing_required_operation_and_malformed_openapi_fail_closed() ->
     try:
         with pytest.raises(MCPStartupError, match="missing_operation"):
             await create_server(client, openapi=document)
+        drifted = deepcopy(_app_openapi())
+        drifted["paths"]["/markets"]["get"]["parameters"].pop()
+        with pytest.raises(MCPStartupError, match="incompatible_operation"):
+            await create_server(client, openapi=drifted)
+        drifted = deepcopy(_app_openapi())
+        drifted["components"]["schemas"]["AgentEvidenceRequest"]["properties"].pop("summary")
+        with pytest.raises(MCPStartupError, match="incompatible_operation"):
+            await create_server(client, openapi=drifted)
         with pytest.raises(MCPStartupError, match="paths object"):
             await client.prepare({"openapi": "3.1.0"})
     finally:
@@ -84,6 +96,24 @@ def test_endpoint_guard_rejects_mutated_live_operation() -> None:
     _assert_safe_tool(next(spec for spec in TOOL_SPECS if spec.name == "kill_switch"))
 
 
+def test_tool_scopes_match_actual_route_dependencies() -> None:
+    app = create_app(Runner(config=PMSSettings(auto_migrate_default_v2=False)), auto_start=False)
+    expected = {
+        "read": "require_scope_read",
+        "research": "require_scope_research",
+        "kill": "require_scope_kill",
+        "paper_operate|research": "require_any_scope_paper_operate_research",
+    }
+    for spec in TOOL_SPECS:
+        route = next(
+            route for route in app.routes
+            if isinstance(route, APIRoute) and route.path == spec.path and spec.method in route.methods
+        )
+        dependency_names = {getattr(dependency.call, "__name__", "") for dependency in route.dependant.dependencies}
+        assert expected[spec.scope] in dependency_names, spec.name
+        assert "require_scope_live_admin" not in dependency_names, spec.name
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("response", "error_code", "status"),
@@ -91,6 +121,7 @@ def test_endpoint_guard_rejects_mutated_live_operation() -> None:
         (httpx.Response(200, text="not-json"), "bad_json", 200),
         (httpx.Response(401, text="agent-secret should not be copied"), "http_error", 401),
         (httpx.Response(403, json={"detail": "forbidden"}), "http_error", 403),
+        (httpx.Response(302, headers={"location": "/login"}), "http_error", 302),
         (httpx.Response(503, text="x" * 2000), "http_error", 503),
     ],
 )
@@ -122,6 +153,46 @@ async def test_timeout_and_owned_client_shutdown_are_typed() -> None:
     assert not owned._client.is_closed
     await owned.aclose()
     assert owned._client.is_closed
+
+
+@pytest.mark.asyncio
+async def test_real_mcp_session_wraps_non_object_outputs() -> None:
+    pytest.importorskip("mcp")
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/signals":
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json={})
+
+    client, transport_client = _client(handler)
+    try:
+        server = await create_server(client, openapi=_app_openapi())
+        async with create_connected_server_and_client_session(server) as session:
+            listed = await session.list_tools()
+            assert all(tool.outputSchema is not None for tool in listed.tools)
+            assert all(tool.outputSchema["type"] == "object" for tool in listed.tools if tool.outputSchema)
+            result = await session.call_tool("list_signals", {})
+            assert result.isError is False
+            assert result.structuredContent == {"result": []}
+        assert any(request.url.path == "/signals" for request in requests)
+    finally:
+        await transport_client.aclose()
+
+
+def test_path_parameters_reject_traversal_and_slashes() -> None:
+    for value in ("", ".", "..", "nested/value", "nested\\value"):
+        with pytest.raises(MCPError, match="path parameters"):
+            _path_segment(value)
+    assert _path_segment("safe id") == "safe%20id"
+
+
+def test_short_token_redaction_is_boundary_aware() -> None:
+    assert _redact("Bearer tok", "tok") == "Bearer [REDACTED]"
+    assert _redact("token", "tok") == "token"
 
 
 @pytest.mark.asyncio

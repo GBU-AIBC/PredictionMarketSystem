@@ -42,10 +42,10 @@ async def _seed_market(pool: asyncpg.Pool, market_id: str) -> None:
         await seed_factor_catalog(connection, factor_ids=("agent_probability",))
 
 
-def _app(pool: asyncpg.Pool, mode: RunMode, *, token_env: str) -> Any:
+def _app(pool: asyncpg.Pool, mode: RunMode, *, token_env: str, scopes: list[str] | None = None) -> Any:
     settings = PMSSettings(
         mode=mode,
-        api_tokens=cast(Any, [{"token_id": "agent", "secret": token_env, "scopes": ["paper_operate"]}]),
+        api_tokens=cast(Any, [{"token_id": "agent", "secret": token_env, "scopes": scopes or ["paper_operate"]}]),
         auto_migrate_default_v2=False,
     )
     runner = Runner(config=settings)
@@ -61,6 +61,7 @@ async def test_mcp_contribution_tools_are_scoped_and_live_refused(
     pytest.importorskip("mcp")
     monkeypatch.setenv("MCP_PAPER_SECRET", "paper-secret")
     monkeypatch.setenv("MCP_READ_SECRET", "read-secret")
+    monkeypatch.setenv("MCP_RESEARCH_SECRET", "research-secret")
     market_id = f"mcp-w2c-{uuid4().hex}"
     await _seed_market(pg_pool, market_id)
     paper_app = _app(pg_pool, RunMode.PAPER, token_env="MCP_PAPER_SECRET")
@@ -117,6 +118,14 @@ async def test_mcp_contribution_tools_are_scoped_and_live_refused(
     read_app = create_app(read_runner, auto_start=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=read_app), base_url="http://test") as read_http:
         read_client = PMSMCPClient(MCPConfig("http://test", "read-secret"), http_client=read_http)
+        report_id = str(uuid4())
+        with pytest.raises(MCPError) as research_forbidden:
+            await read_client.get_research_report(str(uuid4()))
+        assert research_forbidden.value.status_code == 403
+        assert await read_client.list_evaluation_reports() == {"reports": []}
+        with pytest.raises(MCPError) as report_missing:
+            await read_client.get_evaluation_report(report_id)
+        assert report_missing.value.status_code == 404
         with pytest.raises(MCPError) as evidence_forbidden:
             await read_client.submit_evidence(**evidence_body)
         assert evidence_forbidden.value.status_code == 403
@@ -130,6 +139,16 @@ async def test_mcp_contribution_tools_are_scoped_and_live_refused(
                 prompt_hash="b" * 64,
             )
         assert factor_forbidden.value.status_code == 403
+
+    research_app = _app(pg_pool, RunMode.PAPER, token_env="MCP_RESEARCH_SECRET", scopes=["research"])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=research_app), base_url="http://test") as research_http:
+        research_client = PMSMCPClient(MCPConfig("http://test", "research-secret"), http_client=research_http)
+        with pytest.raises(MCPError) as missing_run:
+            await research_client.get_research_report(str(uuid4()))
+        assert missing_run.value.status_code == 404
+        with pytest.raises(MCPError) as report_forbidden:
+            await research_client.get_evaluation_report(str(uuid4()))
+        assert report_forbidden.value.status_code == 403
 
     live_app = _app(pg_pool, RunMode.LIVE, token_env="MCP_PAPER_SECRET")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=live_app), base_url="http://test") as live_http:

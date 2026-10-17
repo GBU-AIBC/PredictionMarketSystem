@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import math
 import os
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -25,6 +26,10 @@ FORBIDDEN_OPERATIONS = frozenset({
     ("POST", "/run/stop"),
     ("POST", "/config"),
     ("POST", "/decisions/{decision_id}/accept"),
+})
+OPTIONAL_OPERATIONS = frozenset({
+    ("POST", "/evidence"),
+    ("POST", "/factors/{factor_id}/observations"),
 })
 
 
@@ -96,7 +101,6 @@ class ToolSpec:
     query_params: tuple[str, ...] = ()
     path_params: tuple[str, ...] = ()
     body_fields: tuple[str, ...] = ()
-    feature_detected: bool = False
 
 
 TOOL_SPECS: tuple[ToolSpec, ...] = (
@@ -109,10 +113,12 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("list_signals", "GET", "/signals", "read", query_params=("limit",)),
     ToolSpec("get_factor_catalog", "GET", "/factors/catalog", "read"),
     ToolSpec("get_factor_series", "GET", "/factors", "read", query_params=("factor_id", "market_id", "param", "since", "limit")),
-    ToolSpec("submit_evidence", "POST", "/evidence", "paper_operate|research", body_fields=("market_id", "source", "model", "url", "summary", "payload", "content_hash", "captured_at", "expires_at", "evidence_id"), feature_detected=True),
-    ToolSpec("submit_agent_factor", "POST", "/factors/{factor_id}/observations", "paper_operate|research", path_params=("factor_id",), body_fields=("market_id", "param", "value", "ts", "model", "prompt_hash", "evidence_ids"), feature_detected=True),
+    ToolSpec("submit_evidence", "POST", "/evidence", "paper_operate|research", body_fields=("market_id", "source", "model", "url", "summary", "payload", "content_hash", "captured_at", "expires_at", "evidence_id")),
+    ToolSpec("submit_agent_factor", "POST", "/factors/{factor_id}/observations", "paper_operate|research", path_params=("factor_id",), body_fields=("market_id", "param", "value", "ts", "model", "prompt_hash", "evidence_ids")),
     ToolSpec("run_backtest", "POST", "/research/backtest", "research", body_fields=("sweep_yaml",)),
-    ToolSpec("get_research_report", "GET", "/evaluation/reports/{report_id}", "read", path_params=("report_id",)),
+    ToolSpec("get_research_report", "GET", "/research/backtest/{run_id}", "research", path_params=("run_id",)),
+    ToolSpec("get_evaluation_report", "GET", "/evaluation/reports/{report_id}", "read", path_params=("report_id",)),
+    ToolSpec("list_evaluation_reports", "GET", "/evaluation/reports", "read", query_params=("limit",)),
     ToolSpec("explain_decision", "GET", "/decisions/{decision_id}/explain", "read", path_params=("decision_id",)),
     ToolSpec("risk_check_decision", "POST", "/decisions/{decision_id}/risk-check", "read", path_params=("decision_id",)),
     ToolSpec("list_pending_approvals", "GET", "/approvals/pending", "read"),
@@ -127,6 +133,7 @@ class OpenAPIOperation:
     operation: Mapping[str, Any]
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
+    wrap_output: bool
 
 
 class _AnyOutput(RootModel[Any]):
@@ -173,7 +180,7 @@ class PMSMCPClient:
             raw_path = paths.get(spec.path)
             operation = raw_path.get(spec.method.lower()) if isinstance(raw_path, Mapping) else None
             if not isinstance(operation, Mapping):
-                if spec.feature_detected:
+                if (spec.method, spec.path) in OPTIONAL_OPERATIONS:
                     continue
                 raise MCPStartupError("missing_operation", f"required MCP operation is missing: {spec.method} {spec.path}")
             active.append(_operation_from_openapi(spec, operation, openapi))
@@ -205,7 +212,7 @@ class PMSMCPClient:
             raise MCPError("timeout", "PMS API request timed out") from exc
         except httpx.HTTPError as exc:
             raise MCPError("transport", "PMS API transport failed") from exc
-        if response.is_error:
+        if not 200 <= response.status_code < 300:
             raise MCPError("http_error", _response_detail(response, self.config.token), status_code=response.status_code)
         try:
             return response.json()
@@ -239,8 +246,14 @@ class PMSMCPClient:
     async def run_backtest(self, sweep_yaml: str) -> Any:
         return await self._invoke_spec(_static_operation("run_backtest"), {"sweep_yaml": sweep_yaml})
 
-    async def get_research_report(self, report_id: str) -> Any:
-        return await self._invoke_spec(_static_operation("get_research_report"), {"report_id": report_id})
+    async def get_research_report(self, run_id: str) -> Any:
+        return await self._invoke_spec(_static_operation("get_research_report"), {"run_id": run_id})
+
+    async def get_evaluation_report(self, report_id: str) -> Any:
+        return await self._invoke_spec(_static_operation("get_evaluation_report"), {"report_id": report_id})
+
+    async def list_evaluation_reports(self, *, limit: int = 25) -> Any:
+        return await self._invoke_spec(_static_operation("list_evaluation_reports"), {"limit": limit})
 
     async def explain_decision(self, decision_id: str) -> Any:
         return await self._invoke_spec(_static_operation("explain_decision"), {"decision_id": decision_id})
@@ -308,11 +321,13 @@ def _register_tool(server: Any, api: PMSMCPClient, operation: OpenAPIOperation) 
     tool.parameters = operation.input_schema
     tool.fn_metadata.output_schema = operation.output_schema
     tool.fn_metadata.output_model = _AnyOutput
+    tool.fn_metadata.wrap_output = operation.wrap_output
 
 
 def _operation_from_openapi(spec: ToolSpec, operation: Mapping[str, Any], document: Mapping[str, Any]) -> OpenAPIOperation:
     _assert_safe_tool(spec)
-    return OpenAPIOperation(spec, operation, _input_schema(spec, operation, document), _output_schema(operation, document))
+    output_schema, wrap_output = _output_schema(operation, document)
+    return OpenAPIOperation(spec, operation, _input_schema(spec, operation, document), output_schema, wrap_output)
 
 
 def _input_schema(spec: ToolSpec, operation: Mapping[str, Any], document: Mapping[str, Any]) -> dict[str, Any]:
@@ -358,7 +373,7 @@ def _input_schema(spec: ToolSpec, operation: Mapping[str, Any], document: Mappin
     return {"type": "object", "properties": props, "required": required, "additionalProperties": False}
 
 
-def _output_schema(operation: Mapping[str, Any], document: Mapping[str, Any]) -> dict[str, Any]:
+def _output_schema(operation: Mapping[str, Any], document: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
     responses = operation.get("responses")
     response = None
     if isinstance(responses, Mapping):
@@ -369,7 +384,15 @@ def _output_schema(operation: Mapping[str, Any], document: Mapping[str, Any]) ->
     schema = content.get("application/json", {}).get("schema") if isinstance(content, Mapping) else None
     if schema is None:
         raise MCPStartupError("incompatible_operation", "mapped operation has no JSON 2xx response schema")
-    return _resolve_schema(schema, document)
+    resolved = _resolve_schema(schema, document)
+    if resolved.get("type") == "object":
+        return resolved, False
+    return {
+        "type": "object",
+        "properties": {"result": resolved},
+        "required": ["result"],
+        "additionalProperties": False,
+    }, True
 
 
 def _resolve_schema(value: object, document: Mapping[str, Any]) -> dict[str, Any]:
@@ -438,6 +461,8 @@ def _wire_value(value: object) -> object:
 
 
 def _path_segment(value: str) -> str:
+    if not value or value in {".", ".."} or "/" in value or "\\" in value:
+        raise MCPError("invalid_input", "path parameters must be a single non-empty path segment")
     return quote(value, safe="")
 
 
@@ -456,4 +481,7 @@ def _truncate(value: str) -> str:
 
 
 def _redact(value: str, token: str) -> str:
-    return value.replace(token, "[REDACTED]") if token else value
+    if not token:
+        return value
+    pattern = re.compile(r"(?<![A-Za-z0-9])" + re.escape(token) + r"(?![A-Za-z0-9])")
+    return pattern.sub("[REDACTED]", value)

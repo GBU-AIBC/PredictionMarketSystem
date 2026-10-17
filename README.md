@@ -428,9 +428,9 @@ preflight artifact check as startup.
 
 The optional `agent` extra installs the official MCP Python SDK and exposes a
 stdio server that forwards a curated, scoped tool set to the typed PMS HTTP
-API. At startup it fetches `/openapi.json`, derives each tool schema from the
-live operation, and fails closed on schema drift; Wave 2B contribution tools
-appear only after their routes are present. The proxy has no trading logic and
+API. At startup it fetches `/openapi.json`, derives each tool schema from every
+mapped operation, and fails closed when an operation is missing or drifts; the
+Wave 2B contribution tools are feature-detected from that document. The proxy has no trading logic and
 cannot start LIVE, switch mode, accept a live decision, clear a halt, or
 resolve an incident.
 
