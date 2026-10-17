@@ -59,6 +59,8 @@ class EvalSpool:
     )
     _task: asyncio.Task[None] | None = None
     _fills_by_decision: dict[str, FillRecord] = field(default_factory=dict)
+    _scored_record_count: int = 0
+    _last_feedback_record_count: int = 0
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -129,6 +131,8 @@ class EvalSpool:
         # ON CONFLICT-deduped store append) is safe: the sink's calibrator
         # dedups per (model_id, decision_id).
         inserted = await self.store.append(scored_record)
+        if inserted:
+            self._scored_record_count += 1
         if self.calibration_sink is not None:
             try:
                 self.calibration_sink(scored_record)
@@ -194,10 +198,19 @@ class EvalSpool:
     async def _generate_feedback(self) -> None:
         if self.feedback_generator is None or self.metrics_provider is None:
             return
+        # Keep the first two updates responsive for operator feedback, then
+        # batch later updates so a resolution sweep does not reload every row
+        # once per fill (the previous O(N²) behavior).
+        if (
+            self._scored_record_count > 2
+            and self._scored_record_count - self._last_feedback_record_count < 20
+        ):
+            return
         metrics_by_strategy = await self.metrics_provider()
         if not metrics_by_strategy:
             return
         await self.feedback_generator.generate(metrics_by_strategy)
+        self._last_feedback_record_count = self._scored_record_count
 
     async def _record_quote_eval(
         self,

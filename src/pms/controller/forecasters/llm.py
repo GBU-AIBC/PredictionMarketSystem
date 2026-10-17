@@ -4,6 +4,7 @@ import json
 from hashlib import sha256
 import logging
 import math
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -11,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from importlib import import_module
+from pathlib import Path
 from typing import Mapping, Protocol, Self, cast
 from weakref import ReferenceType, ref
 
@@ -43,6 +45,8 @@ class _BudgetTracker:
     lock: threading.Lock = field(default_factory=threading.Lock)
     cost_day: date | None = None
     daily_cost_usdc: Decimal = Decimal("0")
+    ledger_path: Path | None = None
+    ledger_loaded: bool = False
 
 
 _BUDGET_TRACKERS: dict[int, tuple[ReferenceType[LLMSettings], _BudgetTracker]] = {}
@@ -416,6 +420,7 @@ class LLMForecaster:
             tracker.daily_cost_usdc = max(
                 Decimal("0"), tracker.daily_cost_usdc - reserved + actual
             )
+            _write_budget_ledger(tracker)
 
     def _retain_failed_reservation(self) -> bool:
         assert self.config is not None
@@ -429,6 +434,7 @@ class LLMForecaster:
         tracker = self._budget_tracker()
         with tracker.lock:
             today = _today_utc()
+            _load_budget_ledger(tracker, today)
             if tracker.cost_day != today:
                 tracker.cost_day = today
                 tracker.daily_cost_usdc = Decimal("0")
@@ -442,6 +448,7 @@ class LLMForecaster:
             ):
                 return False
             tracker.daily_cost_usdc += estimated_cost_usdc
+            _write_budget_ledger(tracker)
             return True
 
     def _refund_budget(self, estimated_cost_usdc: Decimal) -> None:
@@ -451,6 +458,7 @@ class LLMForecaster:
                 Decimal("0"),
                 tracker.daily_cost_usdc - estimated_cost_usdc,
             )
+            _write_budget_ledger(tracker)
 
     def _record_cost(self, estimated_cost_usdc: Decimal, signal: MarketSignal) -> None:
         assert self.config is not None
@@ -496,7 +504,12 @@ class LLMForecaster:
             if entry is not None and entry[0]() is self.config:
                 return entry[1]
             else:
-                tracker = _BudgetTracker()
+                ledger_path = (
+                    None
+                    if self.config.spend_ledger_path is None
+                    else Path(self.config.spend_ledger_path).expanduser()
+                )
+                tracker = _BudgetTracker(ledger_path=ledger_path)
                 _BUDGET_TRACKERS[key] = (ref(self.config), tracker)
             return tracker
 
@@ -669,3 +682,41 @@ def _clamp_probability(value: float) -> float:
 
 def _today_utc() -> date:
     return datetime.now(tz=UTC).date()
+
+
+def _load_budget_ledger(tracker: _BudgetTracker, today: date) -> None:
+    if tracker.ledger_loaded:
+        return
+    tracker.ledger_loaded = True
+    if tracker.ledger_path is None or not tracker.ledger_path.exists():
+        return
+    try:
+        payload = json.loads(tracker.ledger_path.read_text(encoding="utf-8"))
+        if payload.get("date") == today.isoformat():
+            tracker.cost_day = today
+            tracker.daily_cost_usdc = Decimal(str(payload.get("cost_usdc", "0")))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        logger.warning("ignoring unreadable LLM spend ledger", exc_info=True)
+
+
+def _write_budget_ledger(tracker: _BudgetTracker) -> None:
+    if tracker.ledger_path is None or tracker.cost_day is None:
+        return
+    try:
+        tracker.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = tracker.ledger_path.with_suffix(
+            f"{tracker.ledger_path.suffix}.tmp-{os.getpid()}"
+        )
+        temporary.write_text(
+            json.dumps(
+                {
+                    "date": tracker.cost_day.isoformat(),
+                    "cost_usdc": str(tracker.daily_cost_usdc),
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(temporary, tracker.ledger_path)
+    except OSError:
+        logger.warning("could not persist LLM spend ledger", exc_info=True)
