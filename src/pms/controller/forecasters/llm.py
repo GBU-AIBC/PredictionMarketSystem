@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
+from contextlib import contextmanager
 from hashlib import sha256
 import logging
 import math
@@ -15,7 +17,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from importlib import import_module
 from pathlib import Path
-from typing import Mapping, Protocol, Self, cast
+from typing import Iterator, Mapping, Protocol, Self, cast
 from typing import Literal
 from weakref import ReferenceType, ref
 
@@ -737,10 +739,12 @@ class LLMForecaster:
     def _settle_budget(self, reserved: Decimal, actual: Decimal) -> None:
         tracker = self._budget_tracker()
         with tracker.lock:
-            tracker.daily_cost_usdc = max(
-                Decimal("0"), tracker.daily_cost_usdc - reserved + actual
-            )
-            _write_budget_ledger(tracker)
+            with _budget_ledger_lock(tracker):
+                _refresh_budget_ledger(tracker)
+                tracker.daily_cost_usdc = max(
+                    Decimal("0"), tracker.daily_cost_usdc - reserved + actual
+                )
+                _write_budget_ledger(tracker)
 
     def _retain_failed_reservation(self) -> bool:
         assert self.config is not None
@@ -753,32 +757,32 @@ class LLMForecaster:
         assert self.config is not None
         tracker = self._budget_tracker()
         with tracker.lock:
-            today = _today_utc()
-            _load_budget_ledger(tracker, today)
-            if tracker.cost_day != today:
-                tracker.cost_day = today
-                tracker.daily_cost_usdc = Decimal("0")
-            max_daily = self.config.max_daily_llm_cost_usdc
-            max_daily_decimal = (
-                None if max_daily is None else Decimal(str(max_daily))
-            )
-            if (
-                max_daily_decimal is not None
-                and tracker.daily_cost_usdc + estimated_cost_usdc > max_daily_decimal
-            ):
-                return False
-            tracker.daily_cost_usdc += estimated_cost_usdc
-            _write_budget_ledger(tracker)
-            return True
+            with _budget_ledger_lock(tracker):
+                today = _today_utc()
+                _refresh_budget_ledger(tracker, today=today)
+                max_daily = self.config.max_daily_llm_cost_usdc
+                max_daily_decimal = (
+                    None if max_daily is None else Decimal(str(max_daily))
+                )
+                if (
+                    max_daily_decimal is not None
+                    and tracker.daily_cost_usdc + estimated_cost_usdc > max_daily_decimal
+                ):
+                    return False
+                tracker.daily_cost_usdc += estimated_cost_usdc
+                _write_budget_ledger(tracker)
+                return True
 
     def _refund_budget(self, estimated_cost_usdc: Decimal) -> None:
         tracker = self._budget_tracker()
         with tracker.lock:
-            tracker.daily_cost_usdc = max(
-                Decimal("0"),
-                tracker.daily_cost_usdc - estimated_cost_usdc,
-            )
-            _write_budget_ledger(tracker)
+            with _budget_ledger_lock(tracker):
+                _refresh_budget_ledger(tracker)
+                tracker.daily_cost_usdc = max(
+                    Decimal("0"),
+                    tracker.daily_cost_usdc - estimated_cost_usdc,
+                )
+                _write_budget_ledger(tracker)
 
     def _record_cost(self, estimated_cost_usdc: Decimal, signal: MarketSignal) -> None:
         assert self.config is not None
@@ -1193,6 +1197,45 @@ def _load_budget_ledger(tracker: _BudgetTracker, today: date) -> None:
     except (OSError, ValueError, TypeError, InvalidOperation, json.JSONDecodeError) as exc:
         raise LLMProviderUnavailableError(
             "LLM spend ledger is unreadable; refusing provider calls"
+        ) from exc
+
+
+def _refresh_budget_ledger(
+    tracker: _BudgetTracker,
+    *,
+    today: date | None = None,
+) -> None:
+    """Reload the shared ledger while its advisory file lock is held."""
+    if tracker.ledger_path is None:
+        if today is not None and tracker.cost_day != today:
+            tracker.cost_day = today
+            tracker.daily_cost_usdc = Decimal("0")
+        return
+    tracker.ledger_loaded = False
+    refresh_day = _today_utc() if today is None else today
+    tracker.cost_day = refresh_day
+    tracker.daily_cost_usdc = Decimal("0")
+    _load_budget_ledger(tracker, refresh_day)
+
+
+@contextmanager
+def _budget_ledger_lock(tracker: _BudgetTracker) -> Iterator[None]:
+    """Serialize ledger read-modify-write operations across processes."""
+    if tracker.ledger_path is None:
+        yield
+        return
+    lock_path = tracker.ledger_path.with_name(tracker.ledger_path.name + ".lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except OSError as exc:
+        raise LLMProviderUnavailableError(
+            "LLM spend ledger could not be locked; refusing provider calls"
         ) from exc
 
 
