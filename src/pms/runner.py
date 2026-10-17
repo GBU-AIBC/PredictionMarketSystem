@@ -681,9 +681,13 @@ class Runner:
                     self._strategy_registry,
                     "_llm_identity",
                     (
-                        self.config.llm.provider,
-                        self.config.llm.model,
-                        self.config.llm.prompt_version,
+                        (
+                            self.config.llm.provider,
+                            self.config.llm.model,
+                            self.config.llm.prompt_version,
+                        )
+                        if self.config.llm.enabled
+                        else None
                     ),
                 )
                 if self.config.mode == RunMode.LIVE:
@@ -4008,7 +4012,7 @@ def _default_active_strategy(settings: PMSSettings) -> ActiveStrategy:
             settings.llm.provider,
             settings.llm.model,
             settings.llm.prompt_version,
-        ),
+        ) if settings.llm.enabled else None,
     )
     return ActiveStrategy(
         strategy_id="default",
