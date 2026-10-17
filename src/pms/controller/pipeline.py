@@ -25,7 +25,11 @@ from pms.controller.factor_snapshot import (
     NullFactorSnapshotReader,
     required_factor_keys,
 )
-from pms.controller.forecasters.llm import LLMForecaster, durable_spend_ledger_path
+from pms.controller.forecasters.llm import (
+    LLMForecaster,
+    LLMReplayCacheMissError,
+    durable_spend_ledger_path,
+)
 from pms.controller.forecasters.rules import RulesForecaster
 from pms.controller.forecasters.statistical import StatisticalForecaster
 from pms.controller.outcome_tokens import (
@@ -152,8 +156,6 @@ class ControllerPipeline:
     settings: PMSSettings = field(default_factory=PMSSettings)
     last_diagnostic: ControllerDiagnostic | None = field(init=False, default=None)
     last_execution_signal: MarketSignal | None = field(init=False, default=None)
-    last_forecaster_results: list[dict[str, object]] = field(init=False, default_factory=list)
-    last_gate_outcomes: list[dict[str, object]] = field(init=False, default_factory=list)
     suppressed_zero_size: int = field(init=False, default=0)
     _last_decision_emitted_at: dict[tuple[str, str, str, str, str], datetime] = field(
         init=False,
@@ -233,8 +235,6 @@ class ControllerPipeline:
     ) -> OpportunityEmission | None:
         self.last_diagnostic = None
         self.last_execution_signal = None
-        self.last_forecaster_results = []
-        self.last_gate_outcomes = []
         router = _required(self.router, "router")
         if signal.token_id is None:
             _log_pipeline_funnel(signal, forecasted_count=0, emitted_count=0)
@@ -272,9 +272,6 @@ class ControllerPipeline:
         # to the diagnostic.
         if not router.gate(signal):
             gate_reason = router.gate_reason(signal)
-            self.last_gate_outcomes = [
-                {"name": "router", "passed": False, "reason": gate_reason or "unknown"}
-            ]
             _log_pipeline_funnel(signal, forecasted_count=0, emitted_count=0)
             gate_metadata: dict[str, object] = {
                 "gate_reason": gate_reason or "unknown"
@@ -296,8 +293,6 @@ class ControllerPipeline:
                 metadata=gate_metadata,
             )
             return None
-
-        self.last_gate_outcomes = [{"name": "router", "passed": True, "reason": None}]
 
         active_portfolio = portfolio or _default_portfolio()
         sizer = _required(self.sizer, "sizer")
@@ -351,12 +346,20 @@ class ControllerPipeline:
             zip(forecasters, results, strict=True)
         ):
             forecaster_name = (
-                forecaster_names[index] if index < len(forecaster_names) else type(forecaster).__name__
+                forecaster_names[index]
+                if index < len(forecaster_names)
+                else type(forecaster).__name__
             )
             if isinstance(result, BaseException):
                 self.last_forecaster_results.append(
-                    {"name": forecaster_name, "status": "error", "error_type": type(result).__name__}
+                    {
+                        "name": forecaster_name,
+                        "status": "error",
+                        "error_type": type(result).__name__,
+                    }
                 )
+                if isinstance(result, LLMReplayCacheMissError):
+                    raise result
                 logger.warning("forecaster failed: %s", result)
                 continue
             if result is None:
@@ -487,9 +490,6 @@ class ControllerPipeline:
                 key for key in reported_missing_factors if key not in factor_values
             )
             if _strict_factor_gates(self.settings) and unresolved_missing_factors:
-                self.last_gate_outcomes.append(
-                    {"name": "required_factors", "passed": False, "reason": "missing"}
-                )
                 self.last_diagnostic = _composition_diagnostic(
                     code="missing_required_factors",
                     message="Skipping decision because required raw factors are missing.",
@@ -509,9 +509,6 @@ class ControllerPipeline:
                 key for key in factor_snapshot.stale_factors if key not in signal_factor_values
             )
             if _strict_factor_gates(self.settings) and unresolved_stale_factors:
-                self.last_gate_outcomes.append(
-                    {"name": "factor_freshness", "passed": False, "reason": "stale"}
-                )
                 self.last_diagnostic = _composition_diagnostic(
                     code="stale_required_factors",
                     message="Skipping decision because required raw factors are stale.",
@@ -527,14 +524,6 @@ class ControllerPipeline:
                     extra={"controller_diagnostic": self.last_diagnostic},
                 )
                 return None
-            self.last_gate_outcomes.append(
-                {
-                    "name": "factor_gates",
-                    "passed": True,
-                    "reason": None,
-                    "strict": _strict_factor_gates(self.settings),
-                }
-            )
             try:
                 branch_probabilities = evaluate_branch_probabilities(
                     self.strategy.config.factor_composition,

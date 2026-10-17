@@ -109,6 +109,7 @@ from pms.event_stream import RuntimeEventBus
 from pms.execution.fees import market_fee_rate_from_metadata
 from pms.factors.catalog import ensure_factor_catalog
 from pms.factors.definitions import REGISTERED
+from pms.factors.catalog import FACTOR_CATALOG_ROWS
 from pms.factors.service import FactorService
 from pms.live_preflight import (
     ensure_live_market_data_freshness,
@@ -268,6 +269,11 @@ READINESS_REQUIRED_WORKERS: tuple[str, ...] = (
     WORKER_RUNTIME_HEARTBEAT,
 )
 REGISTERED_FACTOR_IDS = frozenset(factor_cls.factor_id for factor_cls in REGISTERED)
+AGENT_FACTOR_IDS = frozenset(
+    entry.factor_id
+    for entry in FACTOR_CATALOG_ROWS
+    if entry.owner.startswith("agent:")
+)
 DEFAULT_V2_FACTOR_COMPOSITION = DEFAULT_STRATEGY_COMPOSITION
 T = TypeVar("T")
 PositionSlotKey = tuple[str, str | None, str, str, str, str]
@@ -5116,7 +5122,7 @@ def _raw_factor_steps(
         factor_id = getattr(step, "factor_id", None)
         if role not in RAW_FACTOR_ROLES:
             continue
-        if factor_id not in REGISTERED_FACTOR_IDS:
+        if factor_id not in REGISTERED_FACTOR_IDS and factor_id not in AGENT_FACTOR_IDS:
             continue
         raw_steps.append(step)
     return tuple(raw_steps)

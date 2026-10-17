@@ -130,10 +130,23 @@ Strategies compose raw factors; they do not create new ones inline
 | `orderbook_imbalance` | Signed `(bid_depth − ask_depth) / total_depth` |
 | `subset_pricing_violation` | Arbitrage-violating subset pricing |
 | `yes_count` | Per-market YES-side resolution sample count |
+| `agent_probability` | Paper-only probability submitted by an authenticated agent |
 
 For `imbalance_with_prior_v1` both required factors (`orderbook_imbalance`
 and `metaculus_prior`) already exist. Done. If you need a factor
 that does not exist, see §8 before continuing.
+
+### 3.1.1 Paper agent contribution example
+
+`build_paper_agent_probability_strategy()` in
+`src/pms/strategies/paper_multifactor.py` is the smallest installed example.
+It composes the required `agent_probability` rule delta (weight `1.0`,
+freshness SLA `300s`) with the optional `orderbook_imbalance` rule delta
+(weight `0.1`, the same SLA), and uses the `rules` forecaster. The catalog
+row is owned by `agent:llm`, so observations are accepted only through the
+agent factor route and are read at the signal's point in time. Its metadata
+sets `live_allowed=false`; the controller loader also rejects any
+agent-owned factor in LIVE mode, so this flag is enforced at startup.
 
 ### 3.2 Write `build_imbalance_with_prior_strategy()`
 

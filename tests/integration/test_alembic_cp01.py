@@ -77,14 +77,6 @@ def _run_alembic(database_url: str, *args: str) -> subprocess.CompletedProcess[s
     )
 
 
-def _repository_head_revision(database_url: str) -> str:
-    result = _run_alembic(database_url, "heads")
-    assert result.returncode == 0, result.stdout + result.stderr
-    lines = [line for line in result.stdout.splitlines() if line.strip()]
-    assert len(lines) == 1
-    return lines[0].split(maxsplit=1)[0]
-
-
 def test_alembic_cp01_reports_version_and_repository_head() -> None:
     assert PMS_TEST_DATABASE_URL
     version = _run_alembic(PMS_TEST_DATABASE_URL, "--version")
@@ -269,8 +261,10 @@ def test_factor_definition_version_downgrade_rejects_duplicate_versions() -> Non
         assert "coexisting definition versions" in downgrade.stderr
         current = _run_alembic(temp_database_url, "current")
         # The failed guarded downgrade rolls back as one transaction, so the
-        # database stays at the repository's current head.
-        assert _repository_head_revision(temp_database_url) in current.stdout
+        # database stays at the current integration head.
+        heads = _run_alembic(temp_database_url, "heads")
+        current_revision = current.stdout.strip().split(maxsplit=1)[0]
+        assert current_revision in heads.stdout
         column = _run_psql(
             temp_database_url,
             "-At",

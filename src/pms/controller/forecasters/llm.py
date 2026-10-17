@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import fcntl
 from hashlib import sha256
 import logging
 import math
@@ -9,12 +10,15 @@ import threading
 import time
 from math import ceil
 from collections.abc import Callable
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from importlib import import_module
 from pathlib import Path
 from typing import Mapping, Protocol, Self, cast
+from typing import Literal
 from weakref import ReferenceType, ref
 
 from pms.config import LLMSettings
@@ -78,6 +82,20 @@ def durable_spend_ledger_path(
     )
 
 
+def durable_record_replay_path(
+    *,
+    database_dsn: str,
+    data_path: str,
+    scope: str = "default",
+) -> str:
+    database_digest = sha256(database_dsn.encode("utf-8")).hexdigest()[:24]
+    scope_digest = sha256(scope.encode("utf-8")).hexdigest()[:8]
+    return str(
+        Path(data_path).expanduser().parent
+        / f"llm-replay-{database_digest}-{scope_digest}.json"
+    )
+
+
 class _LLMClient(Protocol):
     """Marker protocol; concrete SDK shapes are provider-specific."""
 
@@ -96,6 +114,10 @@ class LLMProviderUnavailableError(RuntimeError):
 
 class LLMParseError(RuntimeError):
     """Raised when a provider response cannot satisfy the forecast contract."""
+
+
+class LLMReplayCacheMissError(RuntimeError):
+    """Raised when deterministic research replay lacks a recorded response."""
 
 
 class LLMForecastResult(tuple[float, float, str]):
@@ -158,6 +180,8 @@ class LLMForecaster:
     _cache: dict[str, tuple[float, LLMForecastResult]] = field(default_factory=dict)
     _negative_cache: dict[str, float] = field(default_factory=dict)
     _cache_lock: threading.Lock = field(default_factory=threading.Lock)
+    record_replay_mode: Literal["off", "record", "replay"] = "off"
+    replay_cache_path: str | None = None
     last_failure_reason: str | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
@@ -169,6 +193,13 @@ class LLMForecaster:
         if self.config is None or not self.config.enabled:
             return None
         self.last_failure_reason = None
+        prompt = _prompt(signal)
+        replay_key = _replay_key(self.config, signal, prompt)
+        if self.record_replay_mode == "replay":
+            cached_response = self._replay_read(replay_key)
+            result = self._parse(cast(str, cached_response["response"]))
+            result.provider = cast(str | None, cached_response.get("provider"))
+            return result
         # Resolve pricing before loading a client or reserving budget.  A
         # model without both token rates is unsafe to call because the result
         # cannot be accounted for after the provider has charged us.
@@ -246,7 +277,65 @@ class LLMForecaster:
             self._cache_put_negative(cache_key)
             return None
         self._cache_put(cache_key, result)
+        if self.record_replay_mode == "record":
+            self._replay_write(
+                replay_key,
+                {
+                    "model": self.config.model,
+                    "prompt_hash": replay_key[1],
+                    "input_hash": replay_key[2],
+                    "prompt": prompt,
+                    "response": response.text,
+                    "provider": self.config.provider,
+                    "recorded_at": datetime.now(tz=UTC).isoformat(),
+                },
+            )
         return result
+
+    def _replay_read(self, key: tuple[str, str, str]) -> dict[str, object]:
+        path = self._replay_path()
+        if path is None:
+            raise LLMReplayCacheMissError("LLM replay cache path is not configured")
+        try:
+            with _replay_lock(path, exclusive=False):
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            row = payload.get("entries", {}).get("|".join(key))
+        except (OSError, json.JSONDecodeError, AttributeError):
+            row = None
+        if not isinstance(row, dict) or not isinstance(row.get("response"), str):
+            raise LLMReplayCacheMissError(
+                "LLM replay cache miss for model/prompt/input point-in-time key"
+            )
+        return cast(dict[str, object], row)
+
+    def _replay_write(self, key: tuple[str, str, str], row: dict[str, object]) -> None:
+        path = self._replay_path()
+        if path is None:
+            return
+        with self._cache_lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with _replay_lock(path, exclusive=True):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+                except (OSError, json.JSONDecodeError):
+                    payload = {}
+                entries = payload.get("entries") if isinstance(payload, dict) else None
+                if not isinstance(entries, dict):
+                    entries = {}
+                entries["|".join(key)] = row
+                encoded = json.dumps({"entries": entries}, sort_keys=True, separators=(",", ":"))
+                temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+                with temporary.open("w", encoding="utf-8") as file:
+                    file.write(encoded)
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(temporary, path)
+
+    def _replay_path(self) -> Path | None:
+        configured = self.replay_cache_path
+        if configured is None and self.config is not None:
+            configured = self.config.record_replay_path
+        return None if configured is None else Path(configured).expanduser()
 
     async def forecast(self, signal: MarketSignal) -> float:
         import asyncio
@@ -689,6 +778,42 @@ def _cache_key(signal: MarketSignal) -> str:
     return sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     ).hexdigest()
+
+
+def _replay_key(
+    config: LLMSettings,
+    signal: MarketSignal,
+    prompt: str,
+) -> tuple[str, str, str]:
+    prompt_hash = sha256(
+        (_SYSTEM_PROMPT + "\n" + prompt).encode("utf-8")
+    ).hexdigest()
+    input_payload = {
+        "market_id": signal.market_id,
+        "timestamp": signal.timestamp.isoformat(),
+        "prompt": prompt,
+        "point_in_time_external_signal": _point_in_time_external_signal(
+            signal.external_signal
+        ),
+    }
+    input_hash = sha256(
+        json.dumps(input_payload, sort_keys=True, separators=(",", ":"), default=str).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return config.model, prompt_hash, input_hash
+
+
+@contextmanager
+def _replay_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _provider_response(text: str, response: object) -> _ProviderResponse:

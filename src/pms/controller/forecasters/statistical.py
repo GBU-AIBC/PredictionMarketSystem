@@ -10,6 +10,7 @@ from pms.controller.factor_snapshot import (
     NullFactorSnapshotReader,
 )
 from pms.core.models import MarketSignal
+from pms.factors.catalog import FACTOR_CATALOG_ROWS
 from pms.strategies.projections import FactorCompositionStep
 
 ForecastResult = tuple[float, float, str]
@@ -212,10 +213,17 @@ def _factor_probability(
     value: float,
     market_price: float,
 ) -> float | None:
-    if factor_id in PROBABILITY_FACTOR_IDS:
+    if factor_id in PROBABILITY_FACTOR_IDS or _catalog_output_type(factor_id) == "probability":
         return value
     if factor_id in EDGE_FACTOR_IDS:
         return market_price + value
+    return None
+
+
+def _catalog_output_type(factor_id: str) -> str | None:
+    for entry in FACTOR_CATALOG_ROWS:
+        if entry.factor_id == factor_id:
+            return entry.output_type
     return None
 
 

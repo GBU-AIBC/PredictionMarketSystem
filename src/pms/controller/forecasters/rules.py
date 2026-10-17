@@ -10,6 +10,7 @@ from pms.controller.factor_snapshot import (
     NullFactorSnapshotReader,
 )
 from pms.core.models import MarketSignal
+from pms.factors.catalog import FACTOR_CATALOG_ROWS
 from pms.strategies.projections import FactorCompositionStep
 
 ForecastResult = tuple[float, float, str]
@@ -98,11 +99,18 @@ def _rule_delta(
     *,
     market_price: float,
 ) -> float:
-    if step.factor_id == "metaculus_prior":
+    if _catalog_output_type(step.factor_id) == "probability":
         return factor_value - market_price
     if step.factor_id == "subset_pricing_violation":
         return -factor_value
     return factor_value
+
+
+def _catalog_output_type(factor_id: str) -> str | None:
+    for entry in FACTOR_CATALOG_ROWS:
+        if entry.factor_id == factor_id:
+            return entry.output_type
+    return None
 
 
 def _bounded_probability(value: float) -> float:

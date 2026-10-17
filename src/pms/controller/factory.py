@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from dataclasses import dataclass, field
 
 from pms.artifact_path_safety import (
@@ -18,12 +18,14 @@ from pms.controller.factor_snapshot import (
 from pms.controller.forecasters.llm import (
     LLMForecaster,
     durable_spend_ledger_path,
+    durable_record_replay_path,
     validate_llm_runtime_dependencies,
 )
 from pms.controller.forecasters.flb import FlbForecaster
 from pms.controller.forecasters.paper_canary import PaperCanaryForecaster
 from pms.controller.forecasters.rules import RulesForecaster
 from pms.controller.forecasters.statistical import StatisticalForecaster
+from pms.factors.catalog import FACTOR_CATALOG_ROWS
 from pms.core.enums import RunMode
 from pms.controller.outcome_tokens import (
     NullOutcomeTokenResolver,
@@ -155,9 +157,23 @@ def _build_forecaster(
                 data_path=settings.live_emergency_audit_path,
                 scope=settings.mode.value,
             )
+        if llm_payload.get("record_replay_path") is None:
+            llm_payload["record_replay_path"] = durable_record_replay_path(
+                database_dsn=settings.database.dsn,
+                data_path=settings.live_emergency_audit_path,
+                scope=settings.mode.value,
+            )
         llm_config = LLMSettings.model_validate(llm_payload)
         validate_llm_runtime_dependencies(llm_config)
-        return LLMForecaster(config=llm_config)
+        replay_mode = cast(
+            Literal["off", "record", "replay"],
+            {
+            RunMode.BACKTEST: "replay",
+            RunMode.PAPER: "record",
+            RunMode.LIVE: "off",
+            }[mode],
+        )
+        return LLMForecaster(config=llm_config, record_replay_mode=replay_mode)
     if name == "flb":
         if raw_params:
             msg = (
@@ -209,6 +225,12 @@ def _build_forecaster(
 
 
 def _assert_strategy_mode_allowed(strategy: ActiveStrategy, *, mode: RunMode) -> None:
+    if mode == RunMode.LIVE and any(
+        _is_agent_factor(step.factor_id)
+        for step in strategy.config.factor_composition
+        if step.enabled
+    ):
+        raise ValueError("agent-owned factors are prohibited in LIVE mode")
     if mode != RunMode.LIVE:
         return
     metadata = dict(strategy.config.metadata)
@@ -239,6 +261,13 @@ def _assert_strategy_mode_allowed(strategy: ActiveStrategy, *, mode: RunMode) ->
 
 def _live_strategy_has_non_llm_forecaster(strategy: ActiveStrategy) -> bool:
     return any(name != "llm" for name, _raw_params in strategy.forecaster.forecasters)
+
+
+def _is_agent_factor(factor_id: str) -> bool:
+    return any(
+        entry.factor_id == factor_id and entry.owner.startswith("agent:")
+        for entry in FACTOR_CATALOG_ROWS
+    )
 
 
 def _assert_live_strategy_metadata_ready(
