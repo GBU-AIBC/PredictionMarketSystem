@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 import os
 from types import SimpleNamespace
@@ -394,6 +395,184 @@ def test_generated_authorization_matrix_covers_every_route_and_scope() -> None:
     assert all(value in {"allow", "public", "401", "403"} for value in matrix.values())
     assert any(key[1] == "/run/start" and key[2] == "paper_operate" for key in matrix)
     assert any(key[1] == "/run/start" and key[2] == "live_admin" for key in matrix)
+
+
+@pytest.mark.asyncio
+async def test_behavioral_authorization_matrix_issues_requests_in_both_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the auth runtime independently of dependency declarations.
+
+    Handler failures (503/404/422) are expected after authorization; only
+    401/403 are classified here.  A short timeout lets the long-lived SSE
+    route prove authorization without waiting for an event.
+    """
+    for token_id, secret in {
+        "read": "read-secret",
+        "research": "research-secret",
+        "paper": "paper-secret",
+        "kill": "kill-secret",
+        "live": "live-secret",
+    }.items():
+        monkeypatch.setenv(f"MATRIX_{token_id.upper()}_SECRET", secret)
+
+    expected: dict[tuple[str, str], frozenset[str]] = {
+        ("GET", "/status"): frozenset({"read"}),
+        ("GET", "/health"): frozenset(),
+        ("GET", "/readiness"): frozenset(),
+        ("GET", "/signals"): frozenset({"read"}),
+        ("GET", "/markets"): frozenset({"read"}),
+        ("GET", "/markets/{condition_id}"): frozenset({"read"}),
+        ("GET", "/markets/{condition_id}/price-history"): frozenset({"read"}),
+        ("POST", "/markets/{token_id}/subscribe"): frozenset({"paper_operate"}),
+        ("DELETE", "/markets/{token_id}/subscribe"): frozenset({"paper_operate"}),
+        ("GET", "/positions"): frozenset({"read"}),
+        ("GET", "/trades"): frozenset({"read"}),
+        ("GET", "/signals/{market_id}/depth"): frozenset({"read"}),
+        ("GET", "/decisions"): frozenset({"read"}),
+        ("GET", "/decisions/{decision_id}"): frozenset({"read"}),
+        ("POST", "/decisions/{decision_id}/accept"): frozenset({"paper_operate", "live_admin"}),
+        ("GET", "/metrics"): frozenset({"read"}),
+        ("GET", "/feedback"): frozenset({"read"}),
+        ("GET", "/stream/events"): frozenset({"read"}),
+        ("GET", "/subscriptions"): frozenset({"read"}),
+        ("GET", "/strategies"): frozenset({"read"}),
+        ("GET", "/strategies/metrics"): frozenset({"read"}),
+        ("GET", "/strategies/{strategy_id}/decay-status"): frozenset({"read"}),
+        ("GET", "/share/{strategy_id}"): frozenset(),
+        ("GET", "/factors/catalog"): frozenset({"read"}),
+        ("GET", "/factors"): frozenset({"read"}),
+        ("POST", "/research/backtest"): frozenset({"research"}),
+        ("GET", "/research/backtest"): frozenset({"research"}),
+        ("GET", "/research/backtest/{run_id}"): frozenset({"research"}),
+        ("GET", "/research/backtest/{run_id}/strategies"): frozenset({"research"}),
+        ("POST", "/research/backtest/{run_id}/compare"): frozenset({"research"}),
+        ("POST", "/feedback/{feedback_id}/resolve"): frozenset({"paper_operate", "live_admin"}),
+        ("POST", "/live/reconcile-submission-unknown"): frozenset({"live_admin"}),
+        ("POST", "/live/halt/clear"): frozenset({"live_admin"}),
+        ("POST", "/config"): frozenset({"paper_operate", "live_admin"}),
+        ("POST", "/run/start"): frozenset({"paper_operate", "live_admin"}),
+        ("POST", "/run/stop"): frozenset({"kill", "paper_operate", "live_admin"}),
+        ("POST", "/run/kill"): frozenset({"kill"}),
+        ("GET", "/selection/explain"): frozenset({"read"}),
+        ("GET", "/decisions/{decision_id}/explain"): frozenset({"read"}),
+        ("POST", "/decisions/{decision_id}/risk-check"): frozenset({"read"}),
+        ("GET", "/approvals/pending"): frozenset({"read"}),
+        ("GET", "/evaluation/reports"): frozenset({"read"}),
+        ("GET", "/evaluation/reports/{report_id}"): frozenset({"read"}),
+    }
+    credentials: tuple[tuple[str, str | None, frozenset[str]], ...] = (
+        ("none", None, frozenset()),
+        ("bogus", "bogus", frozenset()),
+        ("read", "read-secret", frozenset({"read"})),
+        ("research", "research-secret", frozenset({"research"})),
+        ("paper_operate", "paper-secret", frozenset({"paper_operate"})),
+        ("kill", "kill-secret", frozenset({"kill"})),
+        ("live_admin", "live-secret", frozenset({"live_admin"})),
+        ("legacy", "legacy-secret", frozenset({"read", "research", "paper_operate", "kill", "live_admin"})),
+    )
+    methods = {"GET", "POST", "DELETE"}
+    public = {"/health", "/readiness", "/share/{strategy_id}"}
+    route_keys = {
+        (method, route.path)
+        for route in create_app(Runner(config=_settings()), auto_start=False).routes
+        if isinstance(route, APIRoute) and route.include_in_schema
+        for method in (route.methods or ())
+    }
+    assert route_keys == set(expected)
+
+    def materialize(path: str) -> str:
+        for name, value in {
+            "{condition_id}": "condition",
+            "{token_id}": "token",
+            "{market_id}": "market",
+            "{decision_id}": "decision",
+            "{feedback_id}": "feedback",
+            "{strategy_id}": "strategy",
+            "{run_id}": "00000000-0000-0000-0000-000000000001",
+            "{report_id}": "00000000-0000-0000-0000-000000000001",
+        }.items():
+            path = path.replace(name, value)
+        if path == "/factors":
+            return f"{path}?factor_id=f&market_id=market"
+        if path == "/selection/explain":
+            return f"{path}?market_id=market"
+        return path
+
+    def request_kwargs(method: str, path: str, mode: RunMode) -> dict[str, Any]:
+        if method == "GET":
+            return {}
+        if path == "/config":
+            return {"json": {"mode": "paper"}}
+        if path.endswith("/accept"):
+            return {"json": {"factor_snapshot_hash": "hash"}}
+        if path == "/live/halt/clear":
+            return {"json": {"cleared_by": "operator"}}
+        if path == "/live/reconcile-submission-unknown":
+            return {"json": {"decision_id": "d", "status": "not_found", "reconciled_by": "operator"}}
+        if path.endswith("/compare"):
+            return {"json": {"live_window_start": "2026-01-01", "live_window_end": "2026-01-02", "denominator": "union"}}
+        if path == "/research/backtest":
+            return {"content": ""}
+        del mode
+        return {}
+
+    async def issue(client: httpx.AsyncClient, method: str, url: str, **kwargs: Any) -> int | None:
+        try:
+            response = await asyncio.wait_for(client.request(method, url, **kwargs), timeout=0.25)
+        except (asyncio.TimeoutError, httpx.ReadTimeout):
+            return None
+        return response.status_code
+
+    for mode in (RunMode.PAPER, RunMode.LIVE):
+        for credential_name, presented, token_scopes in credentials:
+            settings = PMSSettings(
+                mode=mode,
+                api_token="legacy-secret",
+                api_tokens=cast(Any, [
+                    {"token_id": "read", "secret": "MATRIX_READ_SECRET", "scopes": ["read"]},
+                    {"token_id": "research", "secret": "MATRIX_RESEARCH_SECRET", "scopes": ["research"]},
+                    {"token_id": "paper", "secret": "MATRIX_PAPER_SECRET", "scopes": ["paper_operate"]},
+                    {"token_id": "kill", "secret": "MATRIX_KILL_SECRET", "scopes": ["kill"]},
+                    {"token_id": "live", "secret": "MATRIX_LIVE_SECRET", "scopes": ["live_admin"]},
+                ]),
+                auto_migrate_default_v2=False,
+            )
+            runner = Runner(config=settings)
+
+            async def noop_start() -> None:
+                return None
+
+            async def noop_stop(*, close_pool: bool = True) -> None:
+                del close_pool
+
+            runner.start = noop_start  # type: ignore[method-assign]
+            runner.stop = noop_stop  # type: ignore[method-assign]
+            app = create_app(runner, auto_start=False)
+            headers = {} if presented is None else {"Authorization": f"Bearer {presented}"}
+            async with _client(app, raise_app_exceptions=False) as client:
+                for method, route_path in sorted(expected):
+                    url = materialize(route_path)
+                    kwargs = request_kwargs(method, route_path, mode)
+                    status = await issue(client, method, url, headers=headers, **kwargs)
+                    required = expected[(method, route_path)]
+                    if mode == RunMode.LIVE:
+                        if route_path in {"/decisions/{decision_id}/accept", "/feedback/{feedback_id}/resolve", "/config", "/run/start"}:
+                            required = frozenset({"live_admin"})
+                        elif route_path == "/run/stop":
+                            required = frozenset({"kill", "live_admin"})
+                    elif route_path in {"/decisions/{decision_id}/accept", "/feedback/{feedback_id}/resolve", "/config", "/run/start"}:
+                        required = frozenset({"paper_operate"})
+                    elif route_path == "/run/stop":
+                        required = frozenset({"kill", "paper_operate"})
+                    if route_path in public:
+                        assert status not in {401, 403}, (mode, credential_name, method, route_path, status)
+                    elif token_scopes.intersection(required):
+                        assert status not in {401, 403}, (mode, credential_name, method, route_path, status)
+                    elif credential_name in {"none", "bogus"}:
+                        assert status == 401, (mode, credential_name, method, route_path, status)
+                    else:
+                        assert status == 403, (mode, credential_name, method, route_path, status)
 
 
 @pytest.mark.asyncio
