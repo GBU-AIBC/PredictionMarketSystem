@@ -49,6 +49,7 @@ class LiveEmergencyAuditWriter:
         slippage_bps: float | None,
         reconciled_by: str,
         evidence: str,
+        override: bool = False,
     ) -> None:
         if not fill_id.strip():
             raise ValueError("fill_id is required")
@@ -65,7 +66,7 @@ class LiveEmergencyAuditWriter:
         record = {
             "timestamp": datetime.now(tz=UTC).isoformat(),
             "phase": "live_fee_reconcile",
-            "event": "fee_reconciled",
+            "event": "fee_overridden" if override else "fee_reconciled",
             "fill_id": fill_id.strip(),
             "fees": fees,
             "fee_bps": fee_bps,

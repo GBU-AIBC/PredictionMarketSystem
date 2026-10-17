@@ -123,6 +123,11 @@ def build_parser() -> argparse.ArgumentParser:
     fee_reconcile.add_argument("--slippage-bps", type=float)
     fee_reconcile.add_argument("--reconciled-by", required=True)
     fee_reconcile.add_argument("--evidence", required=True)
+    fee_reconcile.add_argument(
+        "--override",
+        action="store_true",
+        help="Explicitly replace existing fee telemetry and audit the override.",
+    )
     fee_reconcile.add_argument("--database-url")
     reconcile_live_order = subparsers.add_parser(
         "reconcile-live-order",
@@ -367,6 +372,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                     slippage_bps=slippage_bps,
                     reconciled_by=reconciled_by,
                     evidence=evidence,
+                    override=bool(args.override),
                 )
                 if updated:
                     try:
@@ -379,6 +385,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                             slippage_bps=slippage_bps,
                             reconciled_by=reconciled_by,
                             evidence=evidence,
+                            override=bool(args.override),
                         )
                     except Exception as exc:  # noqa: BLE001
                         audit_error = exc
@@ -418,6 +425,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                     "fees": fees,
                     "fee_bps": fee_bps,
                     "reconciled_by": reconciled_by,
+                    "override": bool(args.override),
                 },
                 sort_keys=True,
             )
@@ -1281,7 +1289,12 @@ async def _portfolio_from_fill_store(
     *,
     total_budget_usdc: float,
 ) -> Portfolio:
-    positions = await FillStore(pool).read_positions()
+    store = FillStore(pool)
+    mode_reader = getattr(store, "read_positions_for_mode", None)
+    if callable(mode_reader):
+        positions = await mode_reader("live")
+    else:
+        positions = await store.read_positions()
     open_positions = [position for position in positions if position.shares_held > 0.0]
     locked_usdc = sum(position.locked_usdc for position in open_positions)
     return Portfolio(

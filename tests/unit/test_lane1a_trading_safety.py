@@ -224,6 +224,7 @@ async def test_live_fee_reconcile_cli_updates_store_and_audits(
             slippage_bps: float | None,
             reconciled_by: str | None = None,
             evidence: str | None = None,
+            override: bool = False,
         ) -> bool:
             calls["fee"] = (
                 fill_id,
@@ -232,6 +233,7 @@ async def test_live_fee_reconcile_cli_updates_store_and_audits(
                 slippage_bps,
                 reconciled_by,
                 evidence,
+                override,
             )
             return True
 
@@ -283,6 +285,7 @@ async def test_live_fee_reconcile_cli_updates_store_and_audits(
         None,
         "operator",
         "venue-trade-1",
+        False,
     )
     assert calls["audit"] == {
         "fill_id": "fill-live-1",
@@ -291,6 +294,7 @@ async def test_live_fee_reconcile_cli_updates_store_and_audits(
         "slippage_bps": None,
         "reconciled_by": "operator",
         "evidence": "venue-trade-1",
+        "override": False,
     }
     assert json.loads(capsys.readouterr().out)["updated"] is True
     bad_args = live_cli.build_parser().parse_args(
@@ -316,6 +320,7 @@ async def test_live_fee_reconcile_cli_updates_store_and_audits(
         None,
         "operator",
         "venue-trade-1",
+        False,
     )
     assert "placeholder" in json.loads(capsys.readouterr().out)["error"]
 

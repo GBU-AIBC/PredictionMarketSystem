@@ -416,7 +416,8 @@ async def _insert_reconciled_fill(
                 'status', 'filled',
                 'anomaly_flags', jsonb_build_array(
                     'reconciled_from_submission_unknown',
-                    'execution_slippage_bps=0.000000000'
+                    'execution_slippage_bps=0.000000000',
+                    'run_mode=live'
                 ),
                 'fee_bps', $5::integer,
                 'fees', $6::double precision,

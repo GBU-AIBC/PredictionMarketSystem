@@ -8,6 +8,7 @@ from pathlib import Path
 import asyncpg
 import pytest
 
+from pms.actuator.risk import RiskManager
 from pms.config import PMSSettings, RiskSettings
 from pms.core.enums import RunMode
 from pms.core.models import FillRecord
@@ -177,7 +178,7 @@ async def test_submission_unknown_filled_reconciles_idempotent_fill(
             executed_at=filled_at,
             filled_at=filled_at,
             status="filled",
-            anomaly_flags=[],
+            anomaly_flags=["run_mode=live"],
             strategy_id="lane-1a-strategy",
             strategy_version_id="lane-1a-v1",
             fees=0.01,
@@ -207,6 +208,23 @@ async def test_submission_unknown_filled_reconciles_idempotent_fill(
         legacy_recovered_runner = Runner(config=live_settings)
         legacy_recovered_runner.bind_pg_pool(pool)
         await legacy_recovered_runner._reconcile_risk_from_db()  # noqa: SLF001
+        assert await legacy_store.reconcile_fee(
+            legacy_fee_fill.trade_id,
+            fees=0.02,
+            fee_bps=30,
+            slippage_bps=0.0,
+            reconciled_by="operator",
+            evidence="legacy-venue-trade-override",
+        ) is False
+        assert await legacy_store.reconcile_fee(
+            legacy_fee_fill.trade_id,
+            fees=0.02,
+            fee_bps=30,
+            slippage_bps=0.0,
+            reconciled_by="operator",
+            evidence="legacy-venue-trade-override",
+            override=True,
+        )
 
         unresolved = FillRecord(
             trade_id="lane-1a-unresolved-trade",
@@ -225,6 +243,7 @@ async def test_submission_unknown_filled_reconciles_idempotent_fill(
             anomaly_flags=[
                 "fee_unreconciled",
                 "execution_slippage_bps=0.000000000",
+                "run_mode=live",
             ],
             strategy_id="lane-1a-strategy",
             strategy_version_id="lane-1a-v1",
@@ -272,4 +291,118 @@ async def test_submission_unknown_filled_reconciles_idempotent_fill(
             for position in positions
         )
     finally:
+        await pool.close()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("PMS_RUN_INTEGRATION") != "1",
+    reason="set PMS_RUN_INTEGRATION=1 to run integration tests",
+)
+@pytest.mark.asyncio
+async def test_live_reconciliation_partitions_fill_provenance(
+    tmp_path: Path,
+) -> None:
+    dsn = os.environ.get("PMS_TEST_DATABASE_URL")
+    if not dsn:
+        pytest.skip("PMS_TEST_DATABASE_URL is required")
+    pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=2)
+    store = FillStore(pool)
+    timestamp = datetime(2026, 10, 18, 1, 0, tzinfo=UTC)
+
+    def fill(*, fill_id: str, side: str, price: float, mode: str, at: datetime) -> FillRecord:
+        return FillRecord(
+            trade_id=fill_id,
+            order_id=f"order-{fill_id}",
+            decision_id=f"decision-{fill_id}",
+            market_id=f"market-{mode}",
+            token_id=f"token-{mode}",
+            venue="polymarket",
+            side=side,
+            fill_price=price,
+            fill_notional_usdc=price * 100.0,
+            fill_quantity=100.0,
+            executed_at=at,
+            filled_at=at,
+            status="filled",
+            anomaly_flags=[
+                f"run_mode={mode}",
+                "execution_slippage_bps=0.000000000",
+            ],
+            strategy_id="lane-1a-strategy",
+            strategy_version_id="lane-1a-v1",
+            fees=0.0,
+            fee_bps=0,
+        )
+
+    try:
+        async with pool.acquire() as connection:
+            await connection.execute(
+                "DELETE FROM fill_payloads WHERE fill_id LIKE 'mode-partition-%'"
+            )
+            await connection.execute("DELETE FROM fills WHERE fill_id LIKE 'mode-partition-%'")
+        await store.insert(
+            fill(
+                fill_id="mode-partition-paper-open",
+                side="BUY",
+                price=0.50,
+                mode="paper",
+                at=timestamp,
+            )
+        )
+        await store.insert(
+            fill(
+                fill_id="mode-partition-paper-close",
+                side="SELL",
+                price=0.40,
+                mode="paper",
+                at=timestamp.replace(hour=2),
+            )
+        )
+        await store.insert(
+            fill(
+                fill_id="mode-partition-live-open",
+                side="BUY",
+                price=0.50,
+                mode="live",
+                at=timestamp,
+            )
+        )
+        await store.insert(
+            fill(
+                fill_id="mode-partition-live-close",
+                side="SELL",
+                price=0.40,
+                mode="live",
+                at=timestamp.replace(hour=2),
+            )
+        )
+
+        settings = PMSSettings(
+            mode=RunMode.LIVE,
+            live_emergency_audit_path=str(tmp_path / "mode-audit.jsonl"),
+            risk=RiskSettings(max_daily_loss_usdc=5.0),
+        )
+        runner = Runner(config=settings)
+        runner.bind_pg_pool(pool)
+        risk = RiskManager(settings.risk)
+        runner.actuator_executor = type("Executor", (), {"risk": risk})()
+
+        await runner._reconcile_portfolio_from_db()  # noqa: SLF001
+        await runner._reconcile_risk_from_db()  # noqa: SLF001
+
+        assert risk._daily_trades  # noqa: SLF001
+        assert [trade.trace_id for trade in risk._daily_trades] == [  # noqa: SLF001
+            "mode-partition-live-close"
+        ]
+        assert all(
+            position.market_id != "market-paper"
+            for position in runner.portfolio.open_positions
+        )
+    finally:
+        async with pool.acquire() as connection:
+            await connection.execute(
+                "DELETE FROM fill_payloads WHERE fill_id LIKE 'mode-partition-%'"
+            )
+            await connection.execute("DELETE FROM fills WHERE fill_id LIKE 'mode-partition-%'")
         await pool.close()

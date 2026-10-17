@@ -135,7 +135,7 @@ from pms.storage.dedup_store import InMemoryDedupStore, PgDedupStore
 from pms.storage.decision_store import DecisionStore
 from pms.storage.eval_store import EvalStore
 from pms.storage.feedback_store import FeedbackStore
-from pms.storage.fill_store import FillStore, StoredTradeRow
+from pms.storage.fill_store import FillStore
 from pms.storage.live_emergency_audit import (
     LiveEmergencyAuditWriter,
     read_active_halt,
@@ -2020,6 +2020,13 @@ class Runner:
                 fill = _fill_from_order(
                     order_state, decision, signal, fee_rate=fill_fee_rate
                 )
+                if fill is not None:
+                    run_mode_flag = f"run_mode={self.config.mode.value}"
+                    if run_mode_flag not in fill.anomaly_flags:
+                        fill = replace(
+                            fill,
+                            anomaly_flags=[*fill.anomaly_flags, run_mode_flag],
+                        )
                 fee_unreconciled = bool(
                     live_fill and fill is not None and fill.fees is None
                 )
@@ -3231,7 +3238,13 @@ class Runner:
         if pool is None:
             return
         try:
-            persisted_positions = await self.fill_store.read_positions()
+            mode_reader = getattr(self.fill_store, "read_positions_for_mode", None)
+            if callable(mode_reader) and isinstance(
+                getattr(self.fill_store, "pool", None), asyncpg.Pool
+            ):
+                persisted_positions = await mode_reader(self.config.mode.value)
+            else:
+                persisted_positions = await self.fill_store.read_positions()
         except Exception as error:  # noqa: BLE001
             if self.config.mode == RunMode.LIVE:
                 # Fail closed in LIVE: silent degradation here recreates
@@ -3307,32 +3320,26 @@ class Runner:
             # sentinel _pg_pool for lifecycle tests without durable fills.
             return
         try:
-            page_size = 10_000
-            expected_count = await self.fill_store.count_trades()
-            trades: list[StoredTradeRow] = []
-            offset = 0
-            while offset < expected_count:
-                page = await self.fill_store.read_trades(
-                    limit=page_size,
-                    offset=offset,
-                )
-                if not page:
-                    raise RuntimeError(
-                        "durable fill replay truncated before expected row count "
-                        f"({len(trades)} of {expected_count})"
+            replay_reader = getattr(self.fill_store, "read_trades_for_replay", None)
+            if callable(replay_reader):
+                trades = await replay_reader(page_size=10_000)
+            else:
+                # Compatibility for narrow test doubles; FillStore uses the
+                # repeatable-snapshot reader above in production.
+                expected_count = await self.fill_store.count_trades()
+                trades = []
+                offset = 0
+                while offset < expected_count:
+                    page = await self.fill_store.read_trades(
+                        limit=10_000, offset=offset
                     )
-                trades.extend(page)
-                offset += len(page)
-                if len(page) < page_size and offset < expected_count:
-                    raise RuntimeError(
-                        "durable fill replay returned a short page before expected "
-                        f"row count ({offset} of {expected_count})"
-                    )
-            if len(trades) != expected_count:
-                raise RuntimeError(
-                    "durable fill replay row count mismatch "
-                    f"({len(trades)} of {expected_count})"
-                )
+                    if not page:
+                        raise RuntimeError(
+                            "durable fill replay truncated before expected row count "
+                            f"({len(trades)} of {expected_count})"
+                        )
+                    trades.extend(page)
+                    offset += len(page)
         except Exception as error:  # noqa: BLE001
             if self.config.mode == RunMode.LIVE:
                 detail = _runtime_error_detail(error, self.config)
@@ -3353,6 +3360,26 @@ class Runner:
         clear_cutoff = read_last_halt_clear(
             Path(self.config.live_emergency_audit_path)
         )
+        if self.config.mode == RunMode.LIVE:
+            unknown_provenance = [
+                trade.fill_id
+                for trade in trades
+                if trade.run_mode is None and isinstance(self.fill_store, FillStore)
+            ]
+            if unknown_provenance:
+                shown = unknown_provenance[:20]
+                omitted = len(unknown_provenance) - len(shown)
+                suffix = f"; {omitted} more" if omitted > 0 else ""
+                raise RuntimeError(
+                    "LIVE risk telemetry has fills with unknown run mode: "
+                    + ", ".join(shown)
+                    + suffix
+                    + "; backfill durable run_mode provenance before restarting"
+                )
+        if isinstance(self.fill_store, FillStore):
+            trades = [
+                trade for trade in trades if trade.run_mode == self.config.mode.value
+            ]
         if self.config.mode == RunMode.LIVE:
             unresolved_telemetry: list[str] = []
             for trade in trades:
@@ -3449,9 +3476,14 @@ class Runner:
                 positions[key] = (trade.fill_quantity, trade.fill_price, trade.side)
             else:
                 total_shares = shares + trade.fill_quantity
-                avg_price = (
-                    avg_price * shares + trade.fill_price * trade.fill_quantity
-                ) / total_shares
+                avg_price = float(
+                    (
+                        Decimal(str(avg_price)) * Decimal(str(shares))
+                        + Decimal(str(trade.fill_price))
+                        * Decimal(str(trade.fill_quantity))
+                    )
+                    / Decimal(str(total_shares))
+                )
                 positions[key] = (total_shares, avg_price, side)
         if max_drawdown_pct > 0:
             self.portfolio = replace(
@@ -4620,6 +4652,7 @@ def _is_open_order_state(order_state: OrderState) -> bool:
 def _portfolio_with_fill(portfolio: Portfolio, fill: FillRecord) -> Portfolio:
     positions = list(portfolio.open_positions)
     fill_size = fill.fill_notional_usdc
+    fill_fees = fill.fees or 0.0
     contracts = _filled_contracts(fill)
     for index, position in enumerate(positions):
         if _same_position(position, fill):
@@ -4654,7 +4687,7 @@ def _portfolio_with_fill(portfolio: Portfolio, fill: FillRecord) -> Portfolio:
                     )
                 return replace(
                     portfolio,
-                    free_usdc=portfolio.free_usdc + fill_size,
+                    free_usdc=portfolio.free_usdc + fill_size - fill_fees,
                     locked_usdc=max(0.0, portfolio.locked_usdc - released_locked),
                     open_positions=positions,
                 )
@@ -4677,7 +4710,7 @@ def _portfolio_with_fill(portfolio: Portfolio, fill: FillRecord) -> Portfolio:
         )
     return replace(
         portfolio,
-        free_usdc=portfolio.free_usdc - fill_size,
+        free_usdc=portfolio.free_usdc - fill_size - fill_fees,
         locked_usdc=portfolio.locked_usdc + fill_size,
         open_positions=positions,
     )
@@ -4694,12 +4727,16 @@ def _portfolio_with_risk_drawdown(
     *,
     peak_equity: float,
 ) -> Portfolio:
-    equity = _portfolio_equity(portfolio)
-    if peak_equity <= 0.0:
+    equity = Decimal(str(_portfolio_equity(portfolio)))
+    peak = Decimal(str(peak_equity))
+    if peak <= 0:
         return portfolio
-    drawdown_pct = max(0.0, (peak_equity - equity) / peak_equity * 100.0)
-    prior = portfolio.max_drawdown_pct or 0.0
-    return replace(portfolio, max_drawdown_pct=max(prior, drawdown_pct))
+    drawdown_pct = max(Decimal("0"), (peak - equity) / peak * Decimal("100"))
+    prior = Decimal(str(portfolio.max_drawdown_pct or 0.0))
+    return replace(
+        portfolio,
+        max_drawdown_pct=float(max(prior, drawdown_pct)),
+    )
 
 
 def _risk_trade_result_from_fill(

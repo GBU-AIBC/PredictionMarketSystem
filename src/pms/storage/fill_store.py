@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 import json
+import logging
 import math
 from typing import Any, cast
 
@@ -19,6 +20,8 @@ CREATE TABLE IF NOT EXISTS fill_payloads (
     payload JSONB NOT NULL
 )
 """
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -167,6 +170,7 @@ class FillStore:
         slippage_bps: float | None = None,
         reconciled_by: str | None = None,
         evidence: str | None = None,
+        override: bool = False,
     ) -> bool:
         """Record verified venue fee telemetry for an unresolved fill once."""
         if not fill_id.strip():
@@ -203,8 +207,15 @@ class FillStore:
                     return False
                 payload = _json_object(row["payload"])
                 existing_fees = payload.get("fees")
-                if existing_fees is not None and slippage_bps is None:
-                    return False
+                if existing_fees is not None:
+                    if fees is not None and not override:
+                        return False
+                    if fees is None and slippage_bps is None:
+                        return False
+                    if fees is not None and override and reconciled_by is None:
+                        raise ValueError(
+                            "fee override requires reconciled_by and evidence"
+                        )
                 if existing_fees is None and fees is None:
                     raise ValueError("fees are required for an unresolved fee")
                 if fees is not None:
@@ -224,7 +235,11 @@ class FillStore:
                     )
                 ]
                 flags.append(
-                    "fee_reconciled" if existing_fees is None else "slippage_reconciled"
+                    "fee_reconciled"
+                    if existing_fees is None
+                    else "fee_overridden"
+                    if fees is not None
+                    else "slippage_reconciled"
                 )
                 if slippage_bps is not None:
                     flags.append(f"execution_slippage_bps={slippage_bps:.9f}")
@@ -241,6 +256,12 @@ class FillStore:
         return True
 
     async def read_positions(self) -> list[Position]:
+        return await self._read_positions(run_mode=None)
+
+    async def read_positions_for_mode(self, run_mode: str) -> list[Position]:
+        return await self._read_positions(run_mode=run_mode)
+
+    async def _read_positions(self, *, run_mode: str | None) -> list[Position]:
         async with self._pool().acquire() as connection:
             await _ensure_fill_payloads_table(connection)
             rows = await connection.fetch(
@@ -253,6 +274,7 @@ class FillStore:
                     fills.fill_quantity,
                     fills.strategy_id,
                     fills.strategy_version_id,
+                    fill_payloads.payload,
                     fill_payloads.payload->>'token_id' AS token_id,
                     fill_payloads.payload->>'venue' AS venue,
                     fill_payloads.payload->>'side' AS side,
@@ -329,6 +351,15 @@ class FillStore:
                     fills.fill_id ASC
                 """
             )
+        if run_mode is not None:
+            rows = [
+                row
+                for row in rows
+                if _run_mode_from_anomaly_flags(
+                    _json_object(row["payload"]).get("anomaly_flags")
+                )
+                == run_mode
+            ]
         return _positions_from_fill_rows(rows)
 
     async def read_trades(
@@ -340,38 +371,107 @@ class FillStore:
     ) -> list["StoredTradeRow"]:
         async with self._pool().acquire() as connection:
             await _ensure_fill_payloads_table(connection)
-            rows = await connection.fetch(
-                """
-                SELECT
-                    fills.fill_id,
-                    fills.order_id,
-                    fills.market_id,
-                    fills.ts,
-                    fills.fill_notional_usdc,
-                    fills.fill_quantity,
-                    fills.strategy_id,
-                    fills.strategy_version_id,
-                    fill_payloads.payload,
-                    COALESCE(markets.question, fills.market_id) AS question
-                FROM fills
-                LEFT JOIN fill_payloads
-                    ON fill_payloads.fill_id = fills.fill_id
-                LEFT JOIN markets
-                    ON markets.condition_id = fills.market_id
-                WHERE ($1::timestamptz IS NULL OR fills.ts < $1)
-                ORDER BY
-                    fills.ts ASC,
-                    fill_payloads.payload->>'executed_at' ASC NULLS LAST,
-                    fills.order_id ASC,
-                    fills.fill_id ASC
-                LIMIT $2
-                OFFSET $3
-                """,
-                until,
-                limit,
-                offset,
+            rows = await self._fetch_trade_rows(
+                connection, limit=limit, offset=offset, until=until, ascending=False
             )
-        return [_trade_from_row(row) for row in rows]
+        return _trade_rows_for_api(rows)
+
+    async def read_trades_for_replay(
+        self,
+        *,
+        page_size: int = 10_000,
+    ) -> list["StoredTradeRow"]:
+        """Read every fill in one repeatable snapshot, oldest first.
+
+        API callers use ``read_trades`` and must retain newest-first ordering;
+        startup replay has different ordering and consistency requirements.
+        """
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+        async with self._pool().acquire() as connection:
+            await _ensure_fill_payloads_table(connection)
+            async with connection.transaction():
+                await connection.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                )
+                count_row = await connection.fetchrow(
+                    "SELECT COUNT(*) AS fill_count FROM fills"
+                )
+                expected_count = int(count_row["fill_count"])
+                rows: list[asyncpg.Record] = []
+                offset = 0
+                while offset < expected_count:
+                    page = await self._fetch_trade_rows(
+                        connection,
+                        limit=page_size,
+                        offset=offset,
+                        until=None,
+                        ascending=True,
+                    )
+                    if not page:
+                        raise RuntimeError(
+                            "durable fill replay truncated before expected row count "
+                            f"({offset} of {expected_count})"
+                        )
+                    rows.extend(page)
+                    offset += len(page)
+                    if len(page) < page_size and offset < expected_count:
+                        raise RuntimeError(
+                            "durable fill replay returned a short page before expected "
+                            f"row count ({offset} of {expected_count})"
+                        )
+                if len(rows) != expected_count:
+                    raise RuntimeError(
+                        "durable fill replay row count mismatch "
+                        f"({len(rows)} of {expected_count})"
+                    )
+                return [_trade_from_row(row) for row in rows]
+
+    async def _fetch_trade_rows(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        limit: int,
+        offset: int,
+        until: datetime | None,
+        ascending: bool,
+    ) -> list[asyncpg.Record]:
+        order = (
+            "fills.ts ASC, fill_payloads.payload->>'executed_at' ASC NULLS LAST, "
+            "fills.order_id ASC, fills.fill_id ASC"
+            if ascending
+            else "fills.ts DESC, fills.fill_id DESC"
+        )
+        return cast(
+            list[asyncpg.Record],
+            await connection.fetch(
+            f"""
+            SELECT
+                fills.fill_id,
+                fills.order_id,
+                fills.market_id,
+                fills.ts,
+                fills.fill_notional_usdc,
+                fills.fill_quantity,
+                fills.strategy_id,
+                fills.strategy_version_id,
+                fill_payloads.payload,
+                COALESCE(markets.question, fills.market_id) AS question
+            FROM fills
+            LEFT JOIN fill_payloads
+                ON fill_payloads.fill_id = fills.fill_id
+            LEFT JOIN markets
+                ON markets.condition_id = fills.market_id
+            WHERE ($1::timestamptz IS NULL OR fills.ts < $1)
+            ORDER BY {order}
+            LIMIT $2
+            OFFSET $3
+            """,
+            until,
+            limit,
+            offset,
+            ),
+        )
 
     async def count_trades(self) -> int:
         """Return the complete durable fill count for replay truncation checks."""
@@ -409,6 +509,7 @@ class StoredTradeRow:
     fees: float | None = None
     slippage_bps: float | None = None
     risk_group_id: str | None = None
+    run_mode: str | None = None
 
 
 class _PositionAccumulator:
@@ -710,33 +811,49 @@ def _trade_from_row(row: asyncpg.Record) -> StoredTradeRow:
     fill_id = str(row["fill_id"])
     try:
         payload = _json_object(row["payload"])
-    except (RuntimeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        return StoredTradeRow(
+            trade_id=cast(str, payload["trade_id"]),
+            fill_id=cast(str, row["fill_id"]),
+            order_id=cast(str, row["order_id"]),
+            decision_id=cast(str, payload["decision_id"]),
+            market_id=cast(str, row["market_id"]),
+            question=cast(str, row["question"]),
+            token_id=cast(str | None, payload.get("token_id")),
+            venue=cast(Venue, payload["venue"]),
+            side=cast(str, payload["side"]),
+            fill_price=cast(float, payload["fill_price"]),
+            fill_notional_usdc=cast(float, row["fill_notional_usdc"]),
+            fill_quantity=cast(float, row["fill_quantity"]),
+            executed_at=datetime.fromisoformat(cast(str, payload["executed_at"])),
+            filled_at=cast(datetime, row["ts"]),
+            status=cast(str, payload["status"]),
+            strategy_id=cast(str, row["strategy_id"]),
+            strategy_version_id=cast(str, row["strategy_version_id"]),
+            fee_bps=cast(int | None, payload.get("fee_bps")),
+            fees=cast(float | None, payload.get("fees")),
+            slippage_bps=_slippage_from_anomaly_flags(payload.get("anomaly_flags")),
+            risk_group_id=cast(str | None, payload.get("risk_group_id")),
+            run_mode=_run_mode_from_anomaly_flags(payload.get("anomaly_flags")),
+        )
+    except (RuntimeError, json.JSONDecodeError, TypeError, ValueError, KeyError) as error:
         raise RuntimeError(
             f"fill {fill_id} has missing or malformed fill_payloads sidecar"
         ) from error
-    return StoredTradeRow(
-        trade_id=cast(str, payload["trade_id"]),
-        fill_id=cast(str, row["fill_id"]),
-        order_id=cast(str, row["order_id"]),
-        decision_id=cast(str, payload["decision_id"]),
-        market_id=cast(str, row["market_id"]),
-        question=cast(str, row["question"]),
-        token_id=cast(str | None, payload.get("token_id")),
-        venue=cast(Venue, payload["venue"]),
-        side=cast(str, payload["side"]),
-        fill_price=cast(float, payload["fill_price"]),
-        fill_notional_usdc=cast(float, row["fill_notional_usdc"]),
-        fill_quantity=cast(float, row["fill_quantity"]),
-        executed_at=datetime.fromisoformat(cast(str, payload["executed_at"])),
-        filled_at=cast(datetime, row["ts"]),
-        status=cast(str, payload["status"]),
-        strategy_id=cast(str, row["strategy_id"]),
-        strategy_version_id=cast(str, row["strategy_version_id"]),
-        fee_bps=cast(int | None, payload.get("fee_bps")),
-        fees=cast(float | None, payload.get("fees")),
-        slippage_bps=_slippage_from_anomaly_flags(payload.get("anomaly_flags")),
-        risk_group_id=cast(str | None, payload.get("risk_group_id")),
-    )
+
+
+def _trade_rows_for_api(rows: Sequence[asyncpg.Record]) -> list[StoredTradeRow]:
+    trades: list[StoredTradeRow] = []
+    for row in rows:
+        try:
+            trades.append(_trade_from_row(row))
+        except (RuntimeError, json.JSONDecodeError, TypeError, ValueError, KeyError) as error:
+            fill_id = str(row["fill_id"])
+            logger.warning(
+                "skipping fill %s with missing or malformed fill_payloads sidecar: %s",
+                fill_id,
+                error,
+            )
+    return trades
 
 
 def _json_object(value: object) -> dict[str, Any]:
@@ -765,4 +882,13 @@ def _slippage_from_anomaly_flags(value: object) -> float | None:
             return float(flag[len(prefix) :])
         except ValueError:
             return None
+    return None
+
+
+def _run_mode_from_anomaly_flags(value: object) -> str | None:
+    prefix = "run_mode="
+    for flag in _string_list(value):
+        if flag.startswith(prefix):
+            mode = flag[len(prefix) :].strip().lower()
+            return mode or None
     return None
