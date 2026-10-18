@@ -155,10 +155,11 @@ class LLMForecastResult(tuple[float, float, str]):
         confidence: float,
         rationale: str,
         model_id: str,
+        prompt_hash: str,
     ) -> Self:
         instance = super().__new__(cls, (prob_estimate, confidence, rationale))
         instance.model_id = model_id
-        instance.prompt_hash = sha256(_SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+        instance.prompt_hash = prompt_hash
         instance.provider = None
         return instance
 
@@ -300,7 +301,10 @@ class LLMForecaster:
         self._settle_budget(estimated_cost, actual_cost)
         self._record_cost(actual_cost, signal)
         try:
-            result = self._parse(response.text)
+            result = self._parse(
+                response.text,
+                prompt_hash=_prompt_hash(_prompt(signal, evidence=evidence)),
+            )
         except LLMParseError:
             self.last_failure_reason = "parse_failed"
             self._cache_put_negative(cache_key)
@@ -444,7 +448,15 @@ class LLMForecaster:
             self.last_failure_reason = str(payload.get("reason", "no_forecast"))
             return None
         try:
-            result = self._parse(json.dumps(payload, sort_keys=True))
+            # Legacy cache-hit rows cannot recover the original dynamic prompt.
+            prompt_hash = payload.get(
+                "prompt_hash", sha256(_SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
+            )
+            if not isinstance(prompt_hash, str) or not prompt_hash:
+                raise ValueError("invalid recorded prompt hash")
+            result = self._parse(
+                json.dumps(payload, sort_keys=True), prompt_hash=prompt_hash,
+            )
         except (LLMParseError, TypeError, ValueError) as exc:
             raise LLMReplayCacheCorruptError(
                 "LLM replay row contains an invalid forecast response"
@@ -474,6 +486,7 @@ class LLMForecaster:
                 "confidence": result[1],
                 "rationale": result[2],
                 "provider": result.provider,
+                "prompt_hash": result.prompt_hash,
             }
         try:
             await self.replay_store.put(
@@ -629,7 +642,7 @@ class LLMForecaster:
             raise
         return _provider_response(_response_text_openai(response), response)
 
-    def _parse(self, raw: str) -> LLMForecastResult:
+    def _parse(self, raw: str, *, prompt_hash: str) -> LLMForecastResult:
         try:
             loaded = _load_json(raw)
         except (json.JSONDecodeError, ValueError) as exc:
@@ -651,6 +664,7 @@ class LLMForecaster:
             confidence=confidence,
             rationale=str(loaded["rationale"]),
             model_id=model_id,
+            prompt_hash=prompt_hash,
         )
         result.provider = self.config.provider
         return result
@@ -1010,6 +1024,10 @@ def _cache_key(
     ).hexdigest()
 
 
+def _prompt_hash(prompt: str) -> str:
+    return sha256((_SYSTEM_PROMPT + "\n" + prompt).encode("utf-8")).hexdigest()
+
+
 def _replay_key(
     config: LLMSettings,
     signal: MarketSignal,
@@ -1019,9 +1037,7 @@ def _replay_key(
     strategy_id: str | None = None,
     strategy_version_id: str | None = None,
 ) -> tuple[str, str, str]:
-    prompt_hash = sha256(
-        (_SYSTEM_PROMPT + "\n" + prompt).encode("utf-8")
-    ).hexdigest()
+    prompt_hash = _prompt_hash(prompt)
     input_payload = {
         "market_id": signal.market_id,
         "timestamp": signal.timestamp.isoformat(),

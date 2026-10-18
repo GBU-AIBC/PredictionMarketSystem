@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from dataclasses import replace
 import time
 from typing import Any, Mapping, cast
@@ -279,6 +280,44 @@ def _openai_client(content: str) -> object:
             )
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_llm_prompt_provenance_survives_cache_and_replay() -> None:
+    from pms.controller.forecasters.llm import _SYSTEM_PROMPT
+
+    store = MemoryReplayStore()
+    config = LLMSettings(
+        enabled=True, provider="openai", api_key="test", model="openai-test",
+        cache_ttl_s=30.0,
+    )
+    recorder = LLMForecaster(
+        config=config,
+        client=_openai_client('{"prob_estimate":0.8,"confidence":0.5,"rationale":"ok"}'),
+        record_replay_mode="record", replay_store=store,
+    )
+    signal = _signal()
+    first = await recorder.apredict(signal)
+    assert first is not None
+    expected_hash = sha256((_SYSTEM_PROMPT + "\n" + _prompt(signal)).encode()).hexdigest()
+    assert first.prompt_hash == expected_hash
+    # Price bucketing can reuse a paid forecast for a slightly different input.
+    cached_signal = replace(signal, yes_price=signal.yes_price + 0.00001)
+    cached = await recorder.apredict(cached_signal)
+    assert cached is first
+    changed = await recorder.apredict(replace(signal, title="Different question"))
+    assert changed is not None
+    assert changed.prompt_hash != first.prompt_hash
+    replay = LLMForecaster(config=config, record_replay_mode="replay", replay_store=store)
+    replayed = await replay.apredict(cached_signal)
+    assert replayed is not None
+    assert replayed.prompt_hash == expected_hash
+    assert replayed.provider == first.provider
+    for row in store.rows.values():
+        row.pop("prompt_hash")
+    legacy = await replay.apredict(cached_signal)
+    assert legacy is not None
+    assert legacy.prompt_hash == sha256(_SYSTEM_PROMPT.encode()).hexdigest()
 
 
 @pytest.mark.asyncio
