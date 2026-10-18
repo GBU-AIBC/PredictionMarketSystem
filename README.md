@@ -347,7 +347,6 @@ src/pms/               # Python package
   runner.py            # orchestrator wiring all four layers
   config.py            # PMSSettings (pydantic-settings)
 dashboard/             # Next.js console (port 3100)
-rust/                  # PyO3 workspace stub (reserved for perf paths)
 scripts/               # Utility scripts (paper report, migrations, strategy)
 tests/                 # pytest suite (unit + integration)
 docs/
