@@ -2367,7 +2367,9 @@ class Runner:
                 # Per-fill processing failures (eval append or scoring) leave
                 # the fill unresolved for retry; they count as sweep failures
                 # so /status can distinguish them from healthy idle.
-                self._resolution_sweep_failures_total += result.fills_failed
+                self._resolution_sweep_failures_total += (
+                    result.fills_failed + result.persistence_failures
+                )
                 if result.fills_resolved > 0:
                     logger.info(
                         "resolution sweep resolved %d fill(s), appended %d "

@@ -178,6 +178,7 @@ class ResolutionSweeper:
         condition_ids = list(dict.fromkeys(fill.market_id for fill in unresolved))
         resolutions = await self.resolution_source.fetch_resolutions(condition_ids)
         persistence_failures = 0
+        unpersisted_markets: set[str] = set()
         if self.resolution_store is not None:
             for market_id, label in resolutions.items():
                 resolved_at = getattr(
@@ -194,8 +195,9 @@ class ResolutionSweeper:
                     )
                 except Exception:  # noqa: BLE001
                     persistence_failures += 1
+                    unpersisted_markets.add(market_id)
                     logger.warning(
-                        "could not persist market resolution for %s; continuing sweep",
+                        "could not persist market resolution for %s; leaving fills unresolved for retry",
                         market_id,
                         exc_info=True,
                     )
@@ -203,6 +205,8 @@ class ResolutionSweeper:
         eval_records_appended = 0
         fills_failed = 0
         for fill in unresolved:
+            if fill.market_id in unpersisted_markets:
+                continue
             resolved_outcome = resolutions.get(fill.market_id)
             if resolved_outcome is None:
                 continue

@@ -156,8 +156,11 @@ class FakeResolutionSource:
 
 
 class FailingResolutionStore:
+    available = False
+
     async def upsert(self, *_args: Any, **_kwargs: Any) -> None:
-        raise RuntimeError("resolution persistence unavailable")
+        if not self.available:
+            raise RuntimeError("resolution persistence unavailable")
 
 
 class RecordingEvalSpool:
@@ -278,11 +281,14 @@ async def test_sweep_routes_resolved_fill_through_eval_spool_and_hooks() -> None
 
 
 @pytest.mark.asyncio
-async def test_resolution_persistence_failure_continues_sweep() -> None:
+async def test_resolution_persistence_failure_keeps_fill_retryable() -> None:
+    fill_store = FakeResolutionFillStore([_fill()])
+    spool = RecordingEvalSpool()
+    source = FakeResolutionSource({"0xmarket-1": 1.0})
     sweeper = _sweeper(
-        fill_store=FakeResolutionFillStore([_fill()]),
-        eval_spool=RecordingEvalSpool(),
-        source=FakeResolutionSource({"0xmarket-1": 1.0}),
+        fill_store=fill_store,
+        eval_spool=spool,
+        source=source,
         decisions={
             "d-res-1": _StoredDecision(
                 decision=_decision(),
@@ -290,10 +296,22 @@ async def test_resolution_persistence_failure_continues_sweep() -> None:
             )
         },
     )
-    sweeper.resolution_store = cast(Any, FailingResolutionStore())
+    resolution_store = FailingResolutionStore()
+    sweeper.resolution_store = resolution_store
     result = await sweeper.sweep_once()
     assert result.persistence_failures == 1
-    assert result.fills_resolved == 1
+    assert result.fills_resolved == 0
+    assert result.eval_records_appended == 0
+    assert fill_store.fills["fill-res-1"].resolved_outcome is None
+    assert spool.processed == []
+
+    resolution_store.available = True
+    retried = await sweeper.sweep_once()
+    assert retried.persistence_failures == 0
+    assert retried.fills_resolved == 1
+    assert retried.eval_records_appended == 1
+    assert source.calls == [["0xmarket-1"], ["0xmarket-1"]]
+    assert fill_store.fills["fill-res-1"].resolved_outcome == 1.0
 
 
 class _CallLogEvalStore(InMemoryEvalStore):
@@ -1035,6 +1053,7 @@ async def test_resolution_sweep_loop_survives_transient_errors(
             fills_resolved=1,
             eval_records_appended=1,
             fills_failed=1 if calls == 2 else 0,
+            persistence_failures=1 if calls == 2 else 0,
         )
 
     monkeypatch.setattr(runner, "_resolution_sweep_once", flaky_sweep_once)
@@ -1050,7 +1069,7 @@ async def test_resolution_sweep_loop_survives_transient_errors(
     # Failures must increment a counter so /status can distinguish "Gamma
     # down for a week" from healthy idle: whole-sweep exceptions count 1
     # each, and per-fill processing failures (fills_failed) add on top.
-    assert runner.resolution_sweep_failures_total == 2
+    assert runner.resolution_sweep_failures_total == 3
 
 
 def test_resolution_poll_interval_defaults_to_five_minutes() -> None:
