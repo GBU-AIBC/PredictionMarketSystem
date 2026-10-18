@@ -1458,6 +1458,20 @@ class Runner:
     def worker_health_snapshot(self) -> dict[str, WorkerHealth]:
         return self._supervisor.snapshot()
 
+    def required_worker_names(self) -> tuple[str, ...]:
+        snapshot = self.worker_health_snapshot()
+        required = {
+            name for name in snapshot
+            if name in READINESS_REQUIRED_WORKERS or name.startswith("sensor:")
+        }
+        expected_strategies = {
+            strategy_id for strategy_id, _ in self._active_strategies_by_version
+        } | self._controller_runtimes.keys()
+        required.update(f"controller-pipeline:{strategy_id}" for strategy_id in expected_strategies)
+        if self.controller is not None:
+            required.update(name for name in snapshot if name.startswith("controller-pipeline:"))
+        return tuple(sorted(required))
+
     def worker_component_payload(self) -> dict[str, object]:
         return self._supervisor.component_payload()
 
@@ -1478,9 +1492,8 @@ class Runner:
     def _trading_workers_ok(self) -> bool:
         snapshot = self._supervisor.snapshot()
         return all(
-            health.state in ALIVE_WORKER_STATES
-            for name, health in snapshot.items()
-            if name in TRADING_REQUIRED_WORKERS or name.startswith("sensor:")
+            name in snapshot and snapshot[name].state in ALIVE_WORKER_STATES
+            for name in self.required_worker_names()
         )
 
     def _build_factor_service(self) -> FactorService:

@@ -24,7 +24,10 @@ from pms.runner import (
     WORKER_FACTOR_SERVICE,
     WORKER_RUNTIME_HEARTBEAT,
     Runner,
+    _default_active_strategy,
 )
+from pms.storage.strategy_registry import PostgresStrategyRegistry
+from pms.strategies.projections import ActiveStrategy
 from pms.sensor.stream import SignalSubscription
 
 
@@ -528,3 +531,107 @@ async def test_runner_restart_resets_supervision_state() -> None:
         assert snapshot[WORKER_CONTROLLER_DISPATCHER].restarts == 0
     finally:
         await runner.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_expected_controller_makes_api_unhealthy_until_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    app = create_app(runner, auto_start=False)
+    assert runner.controller is not None
+
+    async def fail_decision(
+        signal: MarketSignal, portfolio: Portfolio | None = None,
+    ) -> TradeDecision | None:
+        raise asyncpg.ConnectionDoesNotExistError("local controller storage outage")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(runner.controller, "decide", fail_decision)
+            await runner.start()
+            await runner.sensor_stream.queue.put(_signal())
+            await _wait_until(lambda: runner.worker_health_snapshot()[
+                "controller-pipeline:default"
+            ].state == "failed")
+            assert runner.controller_runtime_count == 0
+            assert not runner.sensor_stream.tasks[0].done()
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test",
+            ) as client:
+                status = (await client.get("/status")).json()
+                readiness = await client.get("/readiness")
+            assert status["running"] is True
+            assert status["healthy"] is False
+            assert readiness.status_code == 503
+            assert "controller-pipeline:default" in readiness.json()["workers"]["dead"]
+        await runner.stop()
+        await runner.start()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test",
+        ) as client:
+            assert (await client.get("/status")).json()["healthy"] is True
+            assert (await client.get("/readiness")).status_code == 200
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.asyncio
+async def test_zero_enabled_strategies_do_not_require_a_controller_worker() -> None:
+    runner = Runner(config=_settings(), sensors=[IdleSensor()])
+    await runner.ensure_pg_pool()
+    pool = runner.pg_pool
+    assert pool is not None
+    runner.bind_pg_pool(pool)
+    app = create_app(runner, auto_start=False)
+    try:
+        await runner.start()
+        assert runner.controller_runtime_count == 0
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test",
+        ) as client:
+            assert (await client.get("/status")).json()["healthy"] is True
+            assert (await client.get("/readiness")).status_code == 200
+    finally:
+        await runner.stop()
+        await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_archived_strategy_history_does_not_make_api_unhealthy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = Runner(config=_settings(), sensors=[IdleSensor()])
+    active = [_default_active_strategy(runner.config)]
+
+    async def list_active(registry: PostgresStrategyRegistry) -> list[ActiveStrategy]:
+        return list(active)
+
+    monkeypatch.setattr(PostgresStrategyRegistry, "list_active_strategies", list_active)
+    await runner.ensure_pg_pool()
+    pool = runner.pg_pool
+    assert pool is not None
+    runner.bind_pg_pool(pool)
+    app = create_app(runner, auto_start=False)
+    try:
+        await runner.start()
+        assert runner.controller_runtime_count == 1
+        registry = runner.strategy_registry
+        assert registry is not None
+        registry.register_change_callback(runner._sync_controller_runtimes)
+        active.clear()
+        await registry.archive_strategy("default")
+        assert runner.controller_runtime_count == 0
+        await _wait_until(lambda: runner.worker_health_snapshot()[
+            "controller-pipeline:default"
+        ].state == "cancelled")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test",
+        ) as client:
+            assert (await client.get("/status")).json()["healthy"] is True
+            readiness = await client.get("/readiness")
+            assert readiness.status_code == 200
+            assert "controller-pipeline:default" not in readiness.json()["workers"]["required"]
+    finally:
+        await runner.stop()
+        await pool.close()

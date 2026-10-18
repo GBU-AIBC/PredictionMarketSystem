@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from pms.runner import READINESS_REQUIRED_WORKERS, Runner
+from pms.runner import Runner
 from pms.supervision import ALIVE_WORKER_STATES
 
 
@@ -70,15 +70,13 @@ def _worker_readiness(
     if forced_running:
         return "ready", {"required": {}, "dead": []}
     snapshot = runner.worker_health_snapshot()
-    required = [name for name in READINESS_REQUIRED_WORKERS if name in snapshot]
-    required.extend(
-        name
-        for name in snapshot
-        if name.startswith("sensor:") and name not in required
-    )
+    required = runner.required_worker_names()
     if not required:
         return "not_started", {"required": {}, "dead": []}
-    states = {name: snapshot[name].state for name in required}
+    states = {
+        name: snapshot[name].state if name in snapshot else "not_started"
+        for name in required
+    }
     dead = [
         name
         for name, state in states.items()

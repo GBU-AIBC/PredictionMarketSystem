@@ -108,7 +108,7 @@ from pms.core.models import (
 from pms.evaluation.metrics import MetricsCollector, MetricsSnapshot
 from pms.evaluation.quote_metrics import QuoteMetricsCollector, QuoteMetricsSnapshot
 from pms.metrics import metrics_snapshot
-from pms.runner import READINESS_REQUIRED_WORKERS, Runner
+from pms.runner import Runner
 from pms.supervision import ALIVE_WORKER_STATES
 from pms.storage.schema_check import ensure_schema_current
 from pms.storage.decision_store import DecisionStore
@@ -2047,9 +2047,8 @@ def _runner_workers_healthy(runner: Runner) -> bool:
         return False
     snapshot = runner.worker_health_snapshot()
     return all(
-        snapshot[name].state in ALIVE_WORKER_STATES
-        for name in READINESS_REQUIRED_WORKERS
-        if name in snapshot
+        name in snapshot and snapshot[name].state in ALIVE_WORKER_STATES
+        for name in runner.required_worker_names()
     )
 
 
