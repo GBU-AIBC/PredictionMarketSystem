@@ -233,6 +233,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_BACKTEST_FIXTURE = Path("tests/fixtures/polymarket_7day_synthetic.jsonl")
 RUNNER_STATE_LIMIT = 1000
 CONTROLLER_SIGNAL_COOLESCE_LIMIT = 1_000
+CONTROLLER_SIGNAL_QUEUE_FALLBACK_LIMIT = 100  # Default sensor subscription cap.
 RESELECTION_INTERVAL_S = 300.0
 DECISION_PENDING_TTL = timedelta(minutes=15)
 DECISION_SWEEP_INTERVAL_S = 5.0
@@ -310,6 +311,42 @@ class StrategyControllerRuntime:
     strategy_version_id: str
     controller: IController
     asset_ids: frozenset[str] | None
+
+
+class _LatestControllerSignalQueue(asyncio.Queue[MarketSignal]):
+    _is_shutdown: bool
+
+    def __init__(self, maxsize: int) -> None:
+        super().__init__(maxsize=maxsize)
+        self._pending: dict[tuple[str, str], MarketSignal] = {}
+
+    def _replace_pending(self, signal: MarketSignal) -> bool:
+        if self._is_shutdown:
+            raise asyncio.QueueShutDown
+        key = _controller_signal_coalesce_key(signal)
+        current = self._pending.get(key)
+        if current is None:
+            return False
+        if _is_newer_controller_signal(signal, current):
+            self._pending[key] = signal
+        return True
+
+    async def put(self, item: MarketSignal) -> None:
+        if not self._replace_pending(item):
+            await super().put(item)
+
+    def put_nowait(self, item: MarketSignal) -> None:
+        if not self._replace_pending(item):
+            super().put_nowait(item)
+
+    def _put(self, item: MarketSignal) -> None:
+        # Replacements keep the token's original FIFO position for fairness.
+        self._pending[_controller_signal_coalesce_key(item)] = item
+        super()._put(item)
+
+    def _get(self) -> MarketSignal:
+        item = super()._get()
+        return self._pending.pop(_controller_signal_coalesce_key(item))
 
 
 @dataclass
@@ -857,6 +894,8 @@ class Runner:
         self._strategy_registry = None
         self._controller_runtimes = {}
         self._active_strategies_by_version = {}
+        for queue in self._controller_signal_queues.values():
+            queue.shutdown(immediate=True)
         self._controller_signal_queues = {}
         self._controller_pipeline_tasks = {}
         self._controller_release_cancel_point = None
@@ -1702,6 +1741,10 @@ class Runner:
         *,
         queue: asyncio.Queue[MarketSignal],
     ) -> MarketSignal:
+        if self.config.mode == RunMode.BACKTEST or isinstance(
+            queue, _LatestControllerSignalQueue,
+        ):
+            return signal
         selected_key = _controller_signal_coalesce_key(signal)
         selected_signal = signal
         deferred_signals: list[MarketSignal] = []
@@ -1777,7 +1820,11 @@ class Runner:
                     queue = self._controller_signal_queues.get(strategy_id)
                     if queue is None:
                         continue
-                    await queue.put(signal)
+                    try:
+                        await queue.put(signal)
+                    except asyncio.QueueShutDown:
+                        # A strategy can detach while bounded fanout is waiting.
+                        continue
             finally:
                 self.sensor_stream.queue.task_done()
 
@@ -1820,6 +1867,8 @@ class Runner:
                     signal = await asyncio.wait_for(queue.get(), 0.05)
                 except TimeoutError:
                     continue
+                except asyncio.QueueShutDown:
+                    return
 
                 try:
                     signal = self._coalesce_controller_signal_batch(
@@ -3314,6 +3363,8 @@ class Runner:
         self._strategy_registry = None
         self._controller_runtimes = {}
         self._active_strategies_by_version = {}
+        for queue in self._controller_signal_queues.values():
+            queue.shutdown(immediate=True)
         self._controller_signal_queues = {}
         self._controller_pipeline_tasks = {}
         self._controller_release_cancel_point = None
@@ -3812,7 +3863,17 @@ class Runner:
         )
 
     def _attach_controller_runtime(self, runtime: StrategyControllerRuntime) -> None:
-        signal_queue: asyncio.Queue[MarketSignal] = asyncio.Queue()
+        capacity = (
+            max(1, len(runtime.asset_ids))
+            if runtime.asset_ids is not None
+            else self.config.sensor.max_subscription_asset_ids
+            or CONTROLLER_SIGNAL_QUEUE_FALLBACK_LIMIT
+        )
+        signal_queue: asyncio.Queue[MarketSignal] = (
+            asyncio.Queue(maxsize=capacity)
+            if self.config.mode == RunMode.BACKTEST
+            else _LatestControllerSignalQueue(maxsize=capacity)
+        )
         self._controller_runtimes[runtime.strategy_id] = runtime
         self._controller_signal_queues[runtime.strategy_id] = signal_queue
         task = asyncio.create_task(
@@ -3932,6 +3993,8 @@ class Runner:
         task = self._controller_pipeline_tasks.pop(strategy_id, None)
         if runtime is None and queue is None and task is None:
             return None
+        if queue is not None:
+            queue.shutdown(immediate=True)
         current_task = asyncio.current_task()
         if task is not None and task is not current_task and not task.done():
             task.cancel()
@@ -4017,7 +4080,7 @@ class Runner:
         while True:
             try:
                 queue.get_nowait()
-            except asyncio.QueueEmpty:
+            except (asyncio.QueueEmpty, asyncio.QueueShutDown):
                 return
             queue.task_done()
 
