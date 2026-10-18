@@ -8,6 +8,7 @@ import asyncpg
 import pytest
 
 from pms.factors.service import FactorService
+from pms.factors.definitions import current_definition_version
 from pms.research.cache import FactorPanelCache, FactorPanelKey
 from pms.storage.market_data_store import PostgresMarketDataStore
 from tests.integration.test_market_data_store import _market as _md_market
@@ -79,13 +80,15 @@ async def test_factor_panel_cache_wraps_factor_service_with_single_pg_round_trip
         await seed_factor_catalog(connection, factor_ids=("orderbook_imbalance",))
         await connection.execute(
             """
-            INSERT INTO factor_values (factor_id, param, market_id, ts, value)
+            INSERT INTO factor_values (factor_id, param, market_id, ts, value, definition_version)
             VALUES
-                ('orderbook_imbalance', '', 'factor-cache-a', $1, 0.11),
-                ('orderbook_imbalance', '', 'factor-cache-b', $2, 0.22)
+                ('orderbook_imbalance', '', 'factor-cache-a', $1, 0.11, $3),
+                ('orderbook_imbalance', '', 'factor-cache-b', $2, 0.22, $3),
+                ('orderbook_imbalance', '', 'factor-cache-a', $1, -0.99, '1')
             """,
             ts_mid,
             ts_mid,
+            current_definition_version("orderbook_imbalance"),
         )
 
     counting_pool = _CountingPool(pg_pool)
@@ -118,6 +121,7 @@ async def test_factor_panel_cache_wraps_factor_service_with_single_pg_round_trip
             cache.put(key, panel)
 
         assert list(panel) == ["factor-cache-b", "factor-cache-a"]
+        assert len(panel["factor-cache-a"]) == 1
         assert panel["factor-cache-a"][0].value == 0.11
         assert panel["factor-cache-b"][0].value == 0.22
 

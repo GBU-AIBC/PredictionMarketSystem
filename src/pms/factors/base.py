@@ -12,6 +12,7 @@ __all__ = (
     "FactorDefinition",
     "FactorValueRow",
     "OuterRingReader",
+    "is_no_token_signal",
 )
 
 
@@ -50,3 +51,13 @@ class FactorDefinition(ABC):
         outer_ring: OuterRingReader,
     ) -> FactorValueRow | None:
         """Read current inputs from signal and optional history from outer_ring."""
+
+
+def is_no_token_signal(signal: MarketSignal) -> bool:
+    no_token_id = signal.external_signal.get("no_token_id")
+    yes_token_id = signal.external_signal.get("yes_token_id")
+    if no_token_id and signal.token_id == no_token_id:
+        return True
+    if yes_token_id and signal.token_id == yes_token_id:
+        return False
+    return str(signal.external_signal.get("signal_token_outcome", "YES")).upper() == "NO"

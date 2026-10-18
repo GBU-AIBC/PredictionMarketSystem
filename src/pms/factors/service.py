@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 import logging
 from typing import Any
@@ -11,7 +11,7 @@ import asyncpg
 
 from pms.core.models import Market, MarketSignal
 from pms.core.validation import validate_finite, validate_probability, validate_quantity
-from pms.factors.base import FactorDefinition, FactorValueRow
+from pms.factors.base import FactorDefinition, FactorValueRow, is_no_token_signal
 from pms.factors.catalog import ensure_factor_catalog, validate_registered_factor_catalog
 from pms.research.cache import FactorPanel, load_factor_panel
 from pms.storage.market_data_store import PostgresMarketDataStore
@@ -142,6 +142,9 @@ class FactorService:
         persisted = 0
         failed_market_ids: set[str] = set()
         for signal in signals:
+            # Prices are YES probabilities; orderbooks retain their token identity.
+            if is_no_token_signal(signal):
+                signal = replace(signal, yes_price=1.0 - signal.yes_price)
             try:
                 await self._ensure_market_shell(signal)
             except Exception:

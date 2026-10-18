@@ -19,6 +19,7 @@ class FavoriteLongshotBias(FactorDefinition):
     """
 
     factor_id = "favorite_longshot_bias"
+    definition_version = "2"
     required_inputs = ("yes_price",)
 
     def compute(

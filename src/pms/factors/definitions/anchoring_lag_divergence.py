@@ -20,6 +20,7 @@ class AnchoringLagDivergence(FactorDefinition):
     """
 
     factor_id = "anchoring_lag_divergence"
+    definition_version = "2"
     required_inputs = (
         "yes_price",
         "external_signal.llm_posterior",

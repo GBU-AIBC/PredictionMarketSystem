@@ -35,6 +35,7 @@ def test_factor_base_exports_expected_symbols() -> None:
         "FactorDefinition",
         "FactorValueRow",
         "OuterRingReader",
+        "is_no_token_signal",
     )
     assert getattr(FactorDefinition.compute, "__isabstractmethod__", False)
     assert inspect.iscoroutinefunction(OuterRingReader.read_latest_book_snapshot)

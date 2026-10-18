@@ -159,6 +159,7 @@ def test_versioned_reader_flags_legacy_hash_definition_drift(
 ) -> None:
     strategy = _strategy()
     config_json = json.loads(_strategy_to_config_json(strategy))
+    config_json.pop("factor_definition_versions", None)
     legacy_id = compute_legacy_strategy_version_id(*strategy.snapshot())
     monkeypatch.setattr(
         "pms.storage.strategy_registry.compute_strategy_version_id",

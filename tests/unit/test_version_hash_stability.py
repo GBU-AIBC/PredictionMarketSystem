@@ -116,7 +116,7 @@ def test_factor_definition_version_changes_strategy_hash(
     )
     baseline = compute_strategy_version_id(*strategy.snapshot())
 
-    monkeypatch.setattr(FavoriteLongshotBias, "definition_version", "2")
+    monkeypatch.setattr(FavoriteLongshotBias, "definition_version", "future-test-version")
     changed = compute_strategy_version_id(*strategy.snapshot())
 
     assert changed != baseline

@@ -12,7 +12,7 @@ import pytest
 from pms.core.enums import MarketStatus
 from pms.core.models import Market, MarketSignal
 from pms.factors.base import FactorDefinition, FactorValueRow
-from pms.factors.definitions import FavoriteLongshotBias
+from pms.factors.definitions import FavoriteLongshotBias, OrderbookImbalance
 from pms.factors.service import FactorService, persist_factor_value
 from pms.sensor.stream import SensorStream
 
@@ -722,3 +722,33 @@ async def test_factor_service_recovers_market_shell_after_fk_retry(
     assert calls == 2
     assert persisted == [row]
     assert signal.market_id in store.markets
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity", ["tokens", "outcome"])
+async def test_factor_service_no_quote_persists_yes_coordinate(
+    monkeypatch: pytest.MonkeyPatch, identity: str,
+) -> None:
+    persisted: dict[str, tuple[float, str]] = {}
+
+    async def capture(pool: object, row: FactorValueRow, *, definition_version: str = "1") -> None:
+        persisted[row.factor_id] = (row.value, definition_version)
+
+    monkeypatch.setattr("pms.factors.service.persist_factor_value", capture)
+    signal = replace(
+        _signal(yes_price=0.001), token_id="no-token",
+        external_signal=({"yes_token_id": "yes-token", "no_token_id": "no-token"}
+                         if identity == "tokens" else {"signal_token_outcome": "NO"}),
+        orderbook={"bids": [], "asks": [{"price": 0.001, "size": 100.0}]},
+    )
+    service = FactorService(
+        pool=cast(Any, object()), store=cast(Any, FakeStore()), cadence_s=0.1,
+        factors=(FavoriteLongshotBias, OrderbookImbalance),
+        signal_stream=SequenceSignalStream([]),
+    )
+    assert await service.compute_once([signal]) == 2
+    assert persisted["favorite_longshot_bias"][0] == pytest.approx(0.099)
+    assert persisted["orderbook_imbalance"][0] == pytest.approx(1.0)
+    assert {version for _, version in persisted.values()} == {"2"}
+    assert signal.yes_price == 0.001
+    assert signal.orderbook["bids"] == []

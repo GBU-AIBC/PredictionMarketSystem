@@ -8,6 +8,7 @@ from pms.factors.base import FactorDefinition, FactorValueRow, OuterRingReader
 
 class FairValueSpread(FactorDefinition):
     factor_id = "fair_value_spread"
+    definition_version = "2"
     required_inputs = ("external_signal.fair_value", "yes_price")
 
     def compute(

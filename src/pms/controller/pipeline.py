@@ -1940,10 +1940,7 @@ def _signal_factor_values(signal: MarketSignal) -> dict[tuple[str, str], float]:
     values: dict[tuple[str, str], float] = {("yes_price", ""): signal.yes_price}
     row = OrderbookImbalance().compute(signal, EMPTY_OUTER_RING)
     if row is not None:
-        value = row.value
-        if _signal_token_outcome(signal) == "NO":
-            value = -value
-        values[(row.factor_id, row.param)] = value
+        values[(row.factor_id, row.param)] = row.value
     return values
 
 
