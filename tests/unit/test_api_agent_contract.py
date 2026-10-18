@@ -691,8 +691,16 @@ async def test_explain_and_selection_explain_are_read_only_and_typed() -> None:
             headers={"Authorization": "Bearer legacy-secret"},
         )
     assert decision.status_code == 200
-    assert decision.json()["available"] is True
-    assert decision.json()["decision_id"] == "d-agent-contract"
+    decision_payload = decision.json()
+    assert decision_payload["available"] is True
+    assert decision_payload["decision_id"] == "d-agent-contract"
+    assert decision_payload["forecasts"] == {
+        "model_id": "claude-test",
+        "prob_estimate": 0.7,
+    }
+    assert decision_payload["gates"] == {"status": "passed"}
+    assert decision_payload["sizing"] == {"notional_usdc": 10.0}
+    assert decision_payload["risk"] == {"approved": True}
     assert selection.status_code == 503
     assert selection.json()["detail"] == "selector_not_running"
     assert runner.state.decisions == before_decisions
@@ -741,7 +749,14 @@ def _stored_decision(decision: TradeDecision) -> Any:
         updated_at=datetime.now(tz=UTC),
         expires_at=datetime.now(tz=UTC) + timedelta(minutes=5),
         opportunity=None,
-        decision_evidence={"decision_trace": {"risk": {"approved": True}}},
+        decision_evidence={
+            "decision_trace": {
+                "forecasts": {"model_id": "claude-test", "prob_estimate": 0.7},
+                "gates": {"status": "passed"},
+                "sizing": {"notional_usdc": 10.0},
+                "risk": {"approved": True},
+            }
+        },
     )
 
 
