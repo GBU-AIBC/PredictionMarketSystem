@@ -611,6 +611,62 @@ def test_llm_forecaster_reserves_budget_atomically_across_processes(tmp_path: An
     assert sorted(results.get(timeout=2) for _ in processes) == [False, True]
 
 
+def test_llm_forecaster_reloads_external_ledger_before_reserving(tmp_path: Any) -> None:
+    ledger_path = tmp_path / "llm-spend.json"
+    forecaster = LLMForecaster(
+        config=LLMSettings(
+            enabled=True,
+            provider="anthropic",
+            api_key="test-key",
+            model="claude-test",
+            max_daily_llm_cost_usdc=0.003,
+            spend_ledger_path=str(ledger_path),
+        )
+    )
+
+    assert forecaster._reserve_budget(Decimal("0.002")) is True  # noqa: SLF001
+    today = datetime.now(tz=UTC).date().isoformat()
+    ledger_path.write_text(
+        json.dumps({"date": today, "cost_usdc": "0.003"}),
+        encoding="utf-8",
+    )
+
+    assert forecaster._reserve_budget(Decimal("0.0005")) is False  # noqa: SLF001
+    assert json.loads(ledger_path.read_text(encoding="utf-8"))["cost_usdc"] == "0.003"
+
+
+def test_llm_forecaster_settle_preserves_reservation_day_at_utc_midnight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    ledger_path = tmp_path / "llm-spend.json"
+    reservation_day = date(2026, 10, 18)
+    settlement_day = date(2026, 10, 19)
+    days = iter((reservation_day, settlement_day))
+    monkeypatch.setattr(
+        "pms.controller.forecasters.llm._today_utc",
+        lambda: next(days),
+    )
+    forecaster = LLMForecaster(
+        config=LLMSettings(
+            enabled=True,
+            provider="anthropic",
+            api_key="test-key",
+            model="claude-test",
+            max_daily_llm_cost_usdc=0.003,
+            spend_ledger_path=str(ledger_path),
+        )
+    )
+
+    assert forecaster._reserve_budget(Decimal("0.002")) is True  # noqa: SLF001
+    forecaster._settle_budget(Decimal("0.002"), Decimal("0.001"))  # noqa: SLF001
+
+    assert json.loads(ledger_path.read_text(encoding="utf-8")) == {
+        "cost_usdc": "0.001",
+        "date": reservation_day.isoformat(),
+    }
+
+
 def test_llm_forecaster_shares_daily_budget_across_strategy_instances() -> None:
     first_client = FakeClaudeClient()
     second_client = FakeClaudeClient()
