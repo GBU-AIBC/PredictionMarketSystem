@@ -330,7 +330,8 @@ def _resolution_with_timestamp_from_gamma_row(
 
 
 def _gamma_resolution_timestamp(row: Mapping[str, Any]) -> datetime | None:
-    for key in ("resolvedAt", "resolved_at", "resolutionDate", "endDate"):
+    # Scheduled end/closure times do not prove when the settled label was known.
+    for key in ("resolvedAt", "resolved_at", "resolutionDate"):
         raw = row.get(key)
         if not isinstance(raw, str) or not raw.strip():
             continue

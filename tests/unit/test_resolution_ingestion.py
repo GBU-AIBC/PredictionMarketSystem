@@ -22,8 +22,10 @@ from pms.evaluation.resolution import (
 )
 from pms.evaluation.spool import EvalSpool
 from pms.runner import Runner
+from pms.research.replay import MarketUniverseReplayEngine, _MarketMetadata
 from pms.storage.eval_store import EvalStore
 from pms.storage.fill_store import FillStore
+from pms.storage.market_resolution_store import MarketResolutionStore
 from tests.support.fake_stores import InMemoryEvalStore
 
 
@@ -702,7 +704,10 @@ async def test_gamma_resolution_source_parses_settled_closed_markets() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gamma_resolution_source_retains_resolution_timestamp() -> None:
+@pytest.mark.parametrize("timestamp_key", ["resolvedAt", "resolved_at", "resolutionDate"])
+async def test_gamma_resolution_source_retains_resolution_timestamp(
+    timestamp_key: str,
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         del request
         return httpx.Response(
@@ -710,7 +715,8 @@ async def test_gamma_resolution_source_retains_resolution_timestamp() -> None:
             json=[
                 {
                     **_gamma_market_row("0xresolved-at", closed=True),
-                    "resolvedAt": "2026-03-01T00:00:00Z",
+                    timestamp_key: "2099-03-01T00:00:00Z",
+                    "endDate": "2026-03-01T00:00:00Z",
                 }
             ],
         )
@@ -721,8 +727,53 @@ async def test_gamma_resolution_source_retains_resolution_timestamp() -> None:
             "0xresolved-at": 1.0
         }
     assert source.resolved_at_by_market["0xresolved-at"] == datetime(
-        2026, 3, 1, tzinfo=UTC
+        2099, 3, 1, tzinfo=UTC
     )
+    engine = MarketUniverseReplayEngine()
+    engine._market_metadata_cache["0xresolved-at"] = _MarketMetadata(
+        title="explicit future resolution", venue="polymarket", resolves_at=None,
+        resolved_outcome=1.0,
+        resolved_at=source.resolved_at_by_market["0xresolved-at"],
+        observed_at=datetime(2026, 3, 1, tzinfo=UTC),
+    )
+    assert engine.resolution_for(
+        "0xresolved-at", as_of=datetime(2026, 3, 2, tzinfo=UTC),
+    ) is None
+
+
+@pytest.mark.parametrize("end_date", ["2026-03-01T00:00:00Z", "2099-03-01T00:00:00Z"])
+async def test_gamma_scheduled_end_date_does_not_backdate_resolution_availability(
+    end_date: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json=[{
+            **_gamma_market_row("0xobserved", closed=True),
+            "endDate": end_date,
+            "closedTime": "2026-03-01 00:00:00+00",
+        }])
+
+    before = datetime.now(tz=UTC)
+    async with _gamma_client(handler) as client:
+        source = GammaResolutionSource(http_client=client)
+        assert await source.fetch_resolutions(["0xobserved"]) == {"0xobserved": 1.0}
+    assert source.resolved_at_by_market["0xobserved"] is None
+    connection = _RecordingConnection()
+    await MarketResolutionStore(pool=cast(Any, connection)).upsert(
+        "0xobserved", resolved_outcome=1.0,
+        resolved_at=source.resolved_at_by_market["0xobserved"], source="gamma",
+    )
+    _, args = connection.execute_calls[0]
+    assert args[2] is None
+    observed_at = cast(datetime, args[4])
+    assert before <= observed_at <= datetime.now(tz=UTC)
+    engine = MarketUniverseReplayEngine()
+    engine._market_metadata_cache["0xobserved"] = _MarketMetadata(
+        title="first observed resolution", venue="polymarket", resolves_at=None,
+        resolved_outcome=1.0, resolved_at=None, observed_at=observed_at,
+    )
+    assert engine.resolution_for("0xobserved", as_of=before) is None
+    assert engine.resolution_for("0xobserved", as_of=observed_at) == 1.0
 
 
 @pytest.mark.asyncio
