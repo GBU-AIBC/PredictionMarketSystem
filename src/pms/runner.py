@@ -130,7 +130,7 @@ from pms.sensor.adapters.direct_book import (
 from pms.sensor.adapters.historical import HistoricalSensor
 from pms.sensor.adapters.market_data import MarketDataSensor
 from pms.sensor.adapters.market_discovery import MarketDiscoverySensor
-from pms.sensor.stream import SensorStream, SignalSubscription
+from pms.sensor.stream import DEFAULT_SIGNAL_BUFFER_CAPACITY, SensorStream, SignalSubscription
 from pms.storage.dedup_store import InMemoryDedupStore, PgDedupStore
 from pms.storage.decision_store import DecisionStore
 from pms.storage.eval_store import EvalStore
@@ -537,6 +537,9 @@ class Runner:
     )
 
     def __post_init__(self) -> None:
+        self.sensor_stream.configure_capacity(
+            self.config.sensor.max_subscription_asset_ids or DEFAULT_SIGNAL_BUFFER_CAPACITY
+        )
         if self.config.mode == RunMode.LIVE:
             self.portfolio = _portfolio_with_configured_budget(
                 self.portfolio,
@@ -802,7 +805,7 @@ class Runner:
                 self._resolution_sweep_task = asyncio.create_task(
                     self._resolution_sweep_loop()
                 )
-        except Exception:
+        except BaseException:
             self._live_preflight_artifact_validated = False
             self._live_preflight_active_strategies_fingerprint = None
             await self._cleanup_after_start_failure()
@@ -1788,6 +1791,8 @@ class Runner:
                 return
             try:
                 signal = await asyncio.wait_for(self.sensor_stream.queue.get(), 0.05)
+            except asyncio.QueueShutDown:
+                return
             except TimeoutError:
                 continue
 

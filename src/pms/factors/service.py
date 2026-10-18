@@ -14,6 +14,7 @@ from pms.core.validation import validate_finite, validate_probability, validate_
 from pms.factors.base import FactorDefinition, FactorValueRow, is_no_token_signal
 from pms.factors.catalog import ensure_factor_catalog, validate_registered_factor_catalog
 from pms.research.cache import FactorPanel, load_factor_panel
+from pms.sensor.stream import DEFAULT_SIGNAL_BUFFER_CAPACITY, SignalSubscription
 from pms.storage.market_data_store import PostgresMarketDataStore
 
 
@@ -66,10 +67,7 @@ class FactorService:
     cadence_s: float
     factors: tuple[type[FactorDefinition], ...]
     signal_stream: AsyncIterable[MarketSignal]
-    _signal_queue: asyncio.Queue[MarketSignal | None] = field(
-        init=False,
-        default_factory=asyncio.Queue,
-    )
+    _signal_queue: asyncio.Queue[MarketSignal] = field(init=False)
     _last_persisted_ts: dict[tuple[str, str, str], datetime] = field(
         init=False,
         default_factory=dict,
@@ -77,6 +75,9 @@ class FactorService:
     _stream_exhausted: bool = field(init=False, default=False)
     _known_market_ids: set[str] = field(init=False, default_factory=set)
     _last_failed_market_ids: set[str] = field(init=False, default_factory=set)
+    _shell_failures: dict[str, tuple[datetime, int]] = field(
+        init=False, default_factory=dict,
+    )
     _quarantined_compute: dict[tuple[str, str], datetime] = field(
         init=False,
         default_factory=dict,
@@ -95,13 +96,20 @@ class FactorService:
             msg = "cadence_s must be positive"
             raise ValueError(msg)
         validate_registered_factor_catalog()
+        capacity = (
+            self.signal_stream.capacity
+            if isinstance(self.signal_stream, SignalSubscription)
+            else DEFAULT_SIGNAL_BUFFER_CAPACITY
+        )
+        self._signal_queue = asyncio.Queue(maxsize=capacity)
 
     async def run(self) -> None:
         stream_task = asyncio.create_task(self._forward_signals())
         dirty_signals: dict[str, MarketSignal] = {}
         try:
             while True:
-                signals = self._drain_signal_buffer()
+                # Retry one bounded batch before accepting more pending work.
+                signals = self._drain_signal_buffer() if not dirty_signals else []
                 for signal in signals:
                     # Coalesce bursts for the same market and only recompute
                     # markets that received a new observation this tick.
@@ -114,7 +122,7 @@ class FactorService:
                         for market_id, signal in dirty_signals.items()
                         if market_id in failed_market_ids
                     }
-                if self._stream_exhausted:
+                if self._stream_exhausted and self._signal_queue.empty():
                     self._raise_stream_error(stream_task)
                     if not dirty_signals:
                         logger.warning(
@@ -136,6 +144,7 @@ class FactorService:
         finally:
             if not stream_task.done():
                 stream_task.cancel()
+            self._signal_queue.shutdown(immediate=True)
             await asyncio.gather(stream_task, return_exceptions=True)
 
     async def compute_once(self, signals: list[MarketSignal]) -> int:
@@ -147,13 +156,30 @@ class FactorService:
                 signal = replace(signal, yes_price=1.0 - signal.yes_price)
             try:
                 await self._ensure_market_shell(signal)
-            except Exception:
+            except Exception as error:
                 logger.exception(
-                    "market shell upsert failed market_id=%s; retrying next cadence",
+                    "market shell upsert failed market_id=%s",
                     signal.market_id,
                 )
-                failed_market_ids.add(signal.market_id)
+                if _is_transient_persistence_error(error):
+                    failed_market_ids.add(signal.market_id)
+                    continue
+                previous_ts, previous_attempts = self._shell_failures.get(
+                    signal.market_id, (signal.timestamp, 0),
+                )
+                attempts = (previous_attempts if previous_ts == signal.timestamp else 0) + 1
+                if attempts <= _MAX_PERSIST_RETRIES:
+                    self._shell_failures[signal.market_id] = (signal.timestamp, attempts)
+                    failed_market_ids.add(signal.market_id)
+                else:
+                    self._shell_failures.pop(signal.market_id, None)
+                    logger.error(
+                        "market shell observation quarantined after %d attempts "
+                        "market_id=%s ts=%s",
+                        attempts, signal.market_id, signal.timestamp.isoformat(),
+                    )
                 continue
+            self._shell_failures.pop(signal.market_id, None)
             for factor_cls in self.factors:
                 if _requires_open_yes_price(factor_cls) and not _has_open_yes_price(
                     signal
@@ -288,7 +314,6 @@ class FactorService:
                 await self._signal_queue.put(signal)
         finally:
             self._stream_exhausted = True
-            await self._signal_queue.put(None)
 
     def _drain_signal_buffer(self) -> list[MarketSignal]:
         signals: list[MarketSignal] = []
@@ -297,12 +322,7 @@ class FactorService:
                 item = self._signal_queue.get_nowait()
             except asyncio.QueueEmpty:
                 return signals
-            # None is the terminal FIFO sentinel from _forward_signals().
-            # Producers must never enqueue more items after it, or they will
-            # be orphaned once the service marks the stream exhausted here.
-            if item is None:
-                self._stream_exhausted = True
-                return signals
+            self._signal_queue.task_done()
             signals.append(item)
 
     def _raise_stream_error(self, stream_task: asyncio.Task[None]) -> None:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,6 +27,25 @@ class RecordingController:
         self.entered.set()
         await self.release.wait()
         return None
+
+
+class BurstSensor:
+    def __init__(self, count: int) -> None:
+        self.count = count
+        self.emitted = 0
+        self.closed = asyncio.Event()
+
+    def __aiter__(self) -> AsyncIterator[MarketSignal]:
+        return self._iterate()
+
+    async def _iterate(self) -> AsyncIterator[MarketSignal]:
+        try:
+            for tick in range(self.count):
+                self.emitted += 1
+                yield _signal(("a", "b", "c")[tick % 3], tick)
+                await asyncio.sleep(0)
+        finally:
+            self.closed.set()
 
 
 def _runner(mode: RunMode, *, limit: int | None = 3) -> Runner:
@@ -142,21 +161,30 @@ async def test_backtest_bounds_backlog_and_preserves_every_ordered_tick() -> Non
     queue = _attach(runner, controller)
     runner._controller_task = asyncio.create_task(runner._controller_loop())
     signals = [_signal("a" if tick % 2 else "b", tick) for tick in range(60)]
+    producer: asyncio.Task[None] | None = None
+
+    async def produce() -> None:
+        for signal in signals[1:]:
+            await runner.sensor_stream.queue.put(signal)
+
     try:
         await runner.sensor_stream.queue.put(signals[0])
         await asyncio.wait_for(controller.entered.wait(), 1)
-        for signal in signals[1:]:
-            await runner.sensor_stream.queue.put(signal)
+        producer = asyncio.create_task(produce())
         await _wait_until(lambda: queue.qsize() >= 2)
         await asyncio.sleep(0.01)
         assert queue.maxsize == 2
         assert queue.qsize() == 2
         assert len(runner.state.signals) == 4  # in flight, two queued, one blocked put
         controller.release.set()
+        await asyncio.wait_for(producer, 2)
         await asyncio.wait_for(runner.sensor_stream.queue.join(), 2)
         await asyncio.wait_for(queue.join(), 2)
         assert controller.signals == signals
     finally:
+        if producer is not None and not producer.done():
+            producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
         await runner.stop()
 
 
@@ -283,3 +311,162 @@ async def test_start_failure_closes_queues_and_releases_pending_work(
     assert runner._controller_signal_queues == {}
     assert queues[0].empty()
     await asyncio.wait_for(queues[0].join(), 1)
+
+
+async def test_actual_backtest_producer_is_bounded_and_delivers_every_tick() -> None:
+    runner = _runner(RunMode.BACKTEST, limit=2)
+    controller = RecordingController()
+    strategy_queue = _attach(runner, controller)
+    runner._controller_task = asyncio.create_task(runner._controller_loop())
+    sensor = BurstSensor(10_000)
+    try:
+        await runner.sensor_stream.start([sensor])
+        await asyncio.wait_for(controller.entered.wait(), 1)
+        await _wait_until(lambda: strategy_queue.full())
+        await asyncio.sleep(0.02)
+        shared = runner.sensor_stream.queue
+        assert shared.maxsize == 2
+        assert shared.qsize() == 2
+        # Two queues, one controller, one dispatcher, one blocked sensor put.
+        assert sensor.emitted == 7
+        assert not sensor.closed.is_set()
+        controller.release.set()
+        await asyncio.wait_for(asyncio.gather(*runner.sensor_stream.tasks), 10)
+        await asyncio.wait_for(shared.join(), 2)
+        await asyncio.wait_for(strategy_queue.join(), 2)
+        assert [s.external_signal["tick"] for s in controller.signals] == list(range(10_000))
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("mode", [RunMode.PAPER, RunMode.LIVE])
+async def test_actual_producer_stalled_dispatcher_has_bounded_pending_work(
+    mode: RunMode, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(mode)
+    controller = RecordingController()
+    queue = _attach(runner, controller, assets=frozenset({"a", "b", "c"}))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stalled_exit(_signal: MarketSignal) -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(runner, "_emit_position_exit_decisions", stalled_exit)
+    runner._controller_task = asyncio.create_task(runner._controller_loop())
+    sensor = BurstSensor(10_000)
+    try:
+        await runner.sensor_stream.start([sensor])
+        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.sleep(0.02)
+        assert runner.sensor_stream.queue.maxsize == 3
+        assert runner.sensor_stream.queue.qsize() <= 3
+        assert queue.qsize() <= 3
+        # All retained signals are in bounded queues or one in-flight slot per task.
+        assert sensor.emitted <= 5
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*runner.sensor_stream.tasks), 10)
+        await asyncio.wait_for(runner.sensor_stream.queue.join(), 2)
+        controller.release.set()
+        await asyncio.wait_for(queue.join(), 2)
+        latest = {s.token_id: s.external_signal["tick"] for s in controller.signals}
+        assert latest == {"a": 9999, "b": 9997, "c": 9998}
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("exit_path", ["stop", "failure", "cancellation"])
+async def test_blocked_sensor_put_cleanup_and_restart(
+    exit_path: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(RunMode.BACKTEST, limit=1)
+    sensor = BurstSensor(10_000)
+    runner.sensors = [sensor]
+    runner.controller = RecordingController()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_start = runner._evaluator_spool.start
+
+    async def stalled_start() -> None:
+        entered.set()
+        await release.wait()
+        if exit_path == "failure":
+            raise RuntimeError("startup after sensors")
+        await original_start()
+
+    monkeypatch.setattr(runner._evaluator_spool, "start", stalled_start)
+    start = asyncio.create_task(runner.start())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        await _wait_until(lambda: sensor.emitted == 2)
+        old_queue = runner.sensor_stream.queue
+        if exit_path == "cancellation":
+            start.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(start, 1)
+        elif exit_path == "failure":
+            release.set()
+            with pytest.raises(RuntimeError, match="startup after sensors"):
+                await asyncio.wait_for(start, 1)
+        else:
+            release.set()
+            await asyncio.wait_for(start, 1)
+            await asyncio.wait_for(runner.stop(), 1)
+        assert sensor.closed.is_set()
+        assert runner.sensor_stream.tasks == ()
+        assert old_queue.empty()
+        await asyncio.wait_for(old_queue.join(), 1)
+        with pytest.raises(asyncio.QueueShutDown):
+            await old_queue.put(_signal("stale"))
+        monkeypatch.setattr(runner._evaluator_spool, "start", original_start)
+        runner.sensors = []
+        await runner.start()
+        assert runner.sensor_stream.queue is not old_queue
+        assert runner.sensor_stream.queue.empty()
+    finally:
+        if not start.done():
+            start.cancel()
+            await asyncio.gather(start, return_exceptions=True)
+        await runner.stop()
+
+
+@pytest.mark.parametrize("mode", [RunMode.PAPER, RunMode.LIVE])
+async def test_ingress_backpressure_preserves_existing_stale_book_gate(
+    mode: RunMode, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(mode, limit=1)
+    controller = RecordingController()
+    controller.release.set()
+    queue = _attach(runner, controller)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    now = datetime.now(tz=UTC)
+    stale = replace(_signal("a"), external_signal={
+        "book_received_at": (now - timedelta(minutes=1)).isoformat(),
+    })
+    fresh = replace(_signal("b"), external_signal={"book_received_at": now.isoformat()})
+
+    class Sensor:
+        async def __aiter__(self) -> AsyncIterator[MarketSignal]:
+            for signal in (stale, fresh):
+                yield signal
+
+    async def stalled_exit(_signal: MarketSignal) -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(runner, "_emit_position_exit_decisions", stalled_exit)
+    runner._controller_task = asyncio.create_task(runner._controller_loop())
+    try:
+        await runner.sensor_stream.start([Sensor()])
+        await asyncio.wait_for(entered.wait(), 1)
+        assert runner.sensor_stream.queue.maxsize == 1
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*runner.sensor_stream.tasks), 1)
+        await asyncio.wait_for(runner.sensor_stream.queue.join(), 1)
+        await asyncio.wait_for(queue.join(), 1)
+        assert controller.signals == [fresh]
+        assert any(d.code == "router_gate:book_too_stale" for d in runner.state.controller_diagnostics)
+    finally:
+        await runner.stop()
