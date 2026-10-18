@@ -307,7 +307,9 @@ async def test_get_backtest_run_returns_503_when_pg_pool_unset() -> None:
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",
     ) as client:
-        response = await client.get("/research/backtest/any-id")
+        response = await client.get(
+            "/research/backtest/11111111-1111-1111-1111-111111111111"
+        )
     assert response.status_code == 503
 
 
@@ -361,7 +363,7 @@ async def test_compare_backtest_run_returns_503_when_pg_pool_unset() -> None:
         base_url="http://test",
     ) as client:
         response = await client.post(
-            "/research/backtest/any-id/compare",
+            "/research/backtest/11111111-1111-1111-1111-111111111111/compare",
             json={"denominator": "backtest_set"},
         )
     assert response.status_code == 503

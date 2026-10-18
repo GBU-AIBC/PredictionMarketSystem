@@ -155,3 +155,31 @@ async def test_research_backtest_list_route_returns_recent_runs(
             "worker_host": None,
         },
     ]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize(
+    "run_id",
+    [
+        "{99999999-9999-9999-9999-999999999999}",
+        "urn:uuid:99999999-9999-9999-9999-999999999999",
+        "uuid:99999999999999999999999999999999",
+        "not-a-uuid",
+    ],
+)
+async def test_research_run_id_spellings_are_typed_4xx(
+    pg_pool: asyncpg.Pool,
+    run_id: str,
+) -> None:
+    async with _app_client(pg_pool) as client:
+        detail = await client.get(f"/research/backtest/{run_id}")
+        strategies = await client.get(f"/research/backtest/{run_id}/strategies")
+        comparison = await client.post(
+            f"/research/backtest/{run_id}/compare",
+            json={},
+        )
+
+    expected_status = 404 if run_id.startswith(("{", "urn:")) else 422
+    assert detail.status_code == expected_status
+    assert strategies.status_code == expected_status
+    assert comparison.status_code == expected_status
