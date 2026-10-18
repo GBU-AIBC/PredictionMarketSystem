@@ -84,7 +84,10 @@ class ControllerPipelineFactory:
                     fallback=self.settings.risk,
                 )
             ),
-            router=Router(self.settings.controller),
+            router=Router(
+                self.settings.controller,
+                allow_extreme_prices=self.settings.mode == RunMode.BACKTEST,
+            ),
             settings=self.settings,
         )
 
