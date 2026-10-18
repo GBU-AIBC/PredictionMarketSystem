@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
 from uuid import uuid4
@@ -11,8 +12,16 @@ import httpx
 import pytest
 
 from pms.api.app import create_app
-from pms.config import DatabaseSettings, PMSSettings
+from pms.config import ControllerSettings, DatabaseSettings, PMSSettings
+from pms.controller.factory import ControllerPipelineFactory
+from pms.research.runner import BacktestRunner
 from pms.runner import Runner
+from tests.integration.test_research_runner_cp04b import (
+    StaticReplayEngine,
+    _active_strategy,
+    _load_strategies,
+    _signal,
+)
 
 
 PMS_TEST_DATABASE_URL = os.environ.get("PMS_TEST_DATABASE_URL")
@@ -80,7 +89,9 @@ def _app_client(pg_pool: asyncpg.Pool) -> httpx.AsyncClient:
     )
 
 
-async def _insert_strategy_run(pool: asyncpg.Pool, *, run_id: str) -> None:
+async def _insert_strategy_run(
+    pool: asyncpg.Pool, *, run_id: str, rejection_counts: dict[str, int]
+) -> None:
     async with pool.acquire() as connection:
         await connection.execute(
             """
@@ -99,7 +110,8 @@ async def _insert_strategy_run(pool: asyncpg.Pool, *, run_id: str) -> None:
                 fill_count,
                 portfolio_target_json,
                 started_at,
-                finished_at
+                finished_at,
+                controller_rejection_counts_json
             ) VALUES (
                 $1::uuid,
                 $2::uuid,
@@ -115,7 +127,8 @@ async def _insert_strategy_run(pool: asyncpg.Pool, *, run_id: str) -> None:
                 $12,
                 $13::jsonb,
                 $14,
-                $15
+                $15,
+                $16::jsonb
             )
             """,
             str(uuid4()),
@@ -133,12 +146,18 @@ async def _insert_strategy_run(pool: asyncpg.Pool, *, run_id: str) -> None:
             json.dumps([]),
             datetime(2026, 4, 10, 9, 0, tzinfo=UTC),
             datetime(2026, 4, 10, 10, 0, tzinfo=UTC),
+            json.dumps(rejection_counts),
         )
 
 
 @pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("rejection_counts", [
+    {},
+    {"router_gate:yes_price_out_of_band": 57, "calibration_clamp_rejected": 90},
+])
 async def test_research_backtest_post_and_get_routes_roundtrip(
     pg_pool: asyncpg.Pool,
+    rejection_counts: dict[str, int],
 ) -> None:
     async with _app_client(pg_pool) as client:
         create_response = await client.post(
@@ -169,7 +188,7 @@ async def test_research_backtest_post_and_get_routes_roundtrip(
     assert run_response.json()["finished_at"] is None
     assert run_response.json()["failure_reason"] is None
 
-    await _insert_strategy_run(pg_pool, run_id=run_id)
+    await _insert_strategy_run(pg_pool, run_id=run_id, rejection_counts=rejection_counts)
 
     async with _app_client(pg_pool) as client:
         strategies_response = await client.get(f"/research/backtest/{run_id}/strategies")
@@ -190,10 +209,81 @@ async def test_research_backtest_post_and_get_routes_roundtrip(
             "decision_count": 3,
             "fill_count": 2,
             "portfolio_target_json": [],
+            "controller_rejection_counts": rejection_counts,
             "started_at": "2026-04-10T09:00:00+00:00",
             "finished_at": "2026-04-10T10:00:00+00:00",
         }
     ]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_zero_trade_backtest_persists_controller_rejections_through_api(
+    pg_pool: asyncpg.Pool,
+) -> None:
+    async with _app_client(pg_pool) as client:
+        response = await client.post(
+            "/research/backtest",
+            content=_SWEEP_YAML,
+            headers={"content-type": "application/x-yaml"},
+        )
+    assert response.status_code == 200
+    run_id = response.json()["run_ids"][0]
+    strategy_key = ("alpha", "alpha-v1")
+    strategies = {
+        strategy_key: _active_strategy(
+            strategy_id=strategy_key[0], strategy_version_id=strategy_key[1],
+        ),
+    }
+    backtest = BacktestRunner(
+        writable_pool=pg_pool,
+        readonly_pool=pg_pool,
+        replay_engine=StaticReplayEngine([
+            replace(_signal(), volume_24h=0.0),
+            replace(_signal(), volume_24h=0.0),
+            replace(_signal(), market_status="closed"),
+        ]),
+        strategy_loader=lambda keys: _load_strategies(strategies, keys),
+        controller_factory=ControllerPipelineFactory(
+            settings=_settings().model_copy(
+                update={"controller": ControllerSettings(min_volume=500.0)},
+            ),
+        ),
+    )
+    assert await backtest.execute(run_id) is True
+    expected_counts = {
+        "router_gate:min_volume_too_low": 2,
+        "router_gate:market_status_not_open": 1,
+    }
+    async with pg_pool.acquire() as connection:
+        rows = await connection.fetch(
+            "SELECT controller_rejection_counts_json FROM strategy_runs "
+            "WHERE run_id = $1::uuid",
+            run_id,
+        )
+        execution_count = await connection.fetchval(
+            "SELECT COUNT(*) FROM backtest_execution_rows WHERE run_id = $1::uuid",
+            run_id,
+        )
+    assert len(rows) == 1
+    assert json.loads(rows[0]["controller_rejection_counts_json"]) == expected_counts
+    assert execution_count == 0
+
+    async with _app_client(pg_pool) as client:
+        run_response = await client.get(f"/research/backtest/{run_id}")
+        strategies_response = await client.get(f"/research/backtest/{run_id}/strategies")
+    assert run_response.status_code == 200
+    assert run_response.json()["status"] == "completed"
+    assert run_response.json()["failure_reason"] is None
+    assert strategies_response.status_code == 200
+    results = strategies_response.json()
+    assert len(results) == 1
+    result = results[0]
+    assert result["controller_rejection_counts"] == expected_counts
+    assert result["opportunity_count"] == 0
+    assert result["decision_count"] == 0
+    assert result["fill_count"] == 0
+    assert result["brier"] is None
+    assert result["pnl_cum"] is None
 
 
 @pytest.mark.asyncio(loop_scope="session")
