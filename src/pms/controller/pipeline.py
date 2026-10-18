@@ -201,7 +201,10 @@ class ControllerPipeline:
                 )
             )
         if self.router is None:
-            self.router = Router(self.settings.controller)
+            self.router = Router(
+                self.settings.controller,
+                allow_extreme_prices=self.settings.mode == RunMode.BACKTEST,
+            )
 
     def _set_drop_diagnostic(
         self,
@@ -737,7 +740,7 @@ class ControllerPipeline:
             decision_outcome = "NO"
             opportunity_side = "no"
             decision_probability = 1.0 - yes_probability
-            decision_price = max(1e-6, min(1.0 - 1e-6, 1.0 - yes_reference_price))
+            decision_price = 1.0 - yes_reference_price
             if signal_outcome.signal_outcome == "NO":
                 decision_price = _direct_signal_reference_price(
                     raw_signal,
@@ -810,6 +813,25 @@ class ControllerPipeline:
                     emitted_count=0,
                 )
                 return None
+        if not isfinite(decision_price) or not 0.0 < decision_price < 1.0:
+            self._set_drop_diagnostic(
+                signal,
+                code="decision_price_out_of_domain",
+                message=(
+                    "Skipping decision because the selected execution price "
+                    "is outside the open probability domain."
+                ),
+                metadata={
+                    "decision_price": decision_price,
+                    "decision_outcome": decision_outcome,
+                },
+            )
+            _log_pipeline_funnel(
+                signal,
+                forecasted_count=len(probabilities),
+                emitted_count=0,
+            )
+            return None
         if decision_edge <= 0.0:
             self._set_drop_diagnostic(
                 signal,
@@ -1095,25 +1117,6 @@ class ControllerPipeline:
                     "book_age_ms": final_book_age_ms,
                 },
             )
-        if not isfinite(decision_price) or not 0.0 < decision_price < 1.0:
-            self._set_drop_diagnostic(
-                signal,
-                code="decision_price_out_of_domain",
-                message=(
-                    "Skipping decision because the selected execution price "
-                    "is outside the open probability domain."
-                ),
-                metadata={
-                    "decision_price": decision_price,
-                    "decision_outcome": decision_outcome,
-                },
-            )
-            _log_pipeline_funnel(
-                signal,
-                forecasted_count=len(probabilities),
-                emitted_count=0,
-            )
-            return None
         self._last_decision_emitted_at[cooldown_key] = signal.timestamp
         _log_pipeline_funnel(
             signal,

@@ -428,6 +428,29 @@ async def test_backtest_pipeline_drops_zero_execution_price_before_decision_enti
 
 
 @pytest.mark.asyncio
+async def test_backtest_pipeline_drops_one_execution_price_before_decision_entity() -> None:
+    pipeline = ControllerPipeline(
+        strategy_id="alpha",
+        strategy_version_id="alpha-v1",
+        forecasters=[StaticForecaster()],
+        calibrator=NetcalCalibrator(),
+        sizer=StaticSizer(),
+        router=Router(ControllerSettings(min_volume=100.0), allow_extreme_prices=True),
+        outcome_token_resolver=StaticOutcomeTokenResolver(),
+        settings=PMSSettings(mode=RunMode.BACKTEST),
+    )
+
+    emission = await pipeline.on_signal(
+        replace(_signal(), yes_price=1.0),
+        portfolio=_portfolio(),
+    )
+
+    assert emission is None
+    assert pipeline.last_diagnostic is not None
+    assert pipeline.last_diagnostic.code == "decision_price_out_of_domain"
+
+
+@pytest.mark.asyncio
 async def test_controller_pipeline_decide_returns_notional_decision() -> None:
     pipeline = ControllerPipeline(
         strategy_id="alpha",
