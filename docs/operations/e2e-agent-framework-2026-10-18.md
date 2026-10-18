@@ -10,9 +10,9 @@ The acceptance used PostgreSQL `127.0.0.1:55432`, database `pms_e2e`, and never 
 | --- | --- | --- |
 | 1. Gates and fresh PostgreSQL integration | **PASS** | `3056 passed, 219 skipped`; strict mypy clean on 503 files; import-linter 9 kept/0 broken; integration `217 passed, 3 skipped` |
 | 2. PAPER canary | **PASS** | Real Gamma discovery, `/readiness=ready`, 2 sensor layers, 2,058 markets, 53 decisions, 49 trades, 45 open positions; `check_paper_canary_smoke.py` all checks PASS |
-| 3. Agent API and least privilege | **PARTIAL** | OpenAPI and read-only endpoints pass; evidence/factor writes return 201; risk-check returns 200 with no domain-state mutation; kill token returns 200 and killer restart returns 403. The agent token receives 200 on PAPER `/run/start`, matching the existing 2A matrix tests (`tests/unit/test_api_agent_contract.py:350-440`) but conflicting with the Wave 3 wording requiring 403. No LIVE accept was attempted because LIVE correctly cannot start without credentials. |
+| 3. Agent API and least privilege | **PASS by design** | A token with paper_operate is intentionally allowed to start PAPER (the 2A contract); a read+research-only token returned 403 on /run/start. OpenAPI, evidence/factor writes, risk-check no-mutation, pending approvals, LIVE/config/halt/reconciliation denials, and kill/restart behavior all pass. |
 | 4. Evidence reaches forecaster/replay input | **PASS (test-backed)** | `uv run pytest -q tests/integration/test_agent_contributions_w2b.py::test_posted_evidence_changes_paper_llm_prompt_but_not_before_as_of tests/integration/test_agent_contributions_w2b.py::test_paper_evidence_replays_through_backtest_factory_without_provider` → `2 passed in 1.17s`; this exercises PIT evidence and no-provider replay. |
-| 5. Resolution backfill and sweep | **PARTIAL** | Gamma backfill: `requested_market_count=929`, `resolved_market_count=169`. A queued worker completed a sweep, but the collected window's available strategy/data combination produced null Brier/PnL and no benchmark rows. A PAPER-only canary sweep is rejected in normal BACKTEST mode (`paper_canary forecaster is PAPER-only`); the default registry strategy has required `factor-a`/`factor-b` inputs absent from this collected market. This is an acceptance gap, not reported as a successful non-null report. |
+| 5. Resolution backfill and sweep | **PASS (scored rerun)** | Gamma backfill retained requested_market_count=929, resolved_market_count=169. A queued paper_multi_factor_v1 sweep over the sole market with replayable factors and a resolution completed with decision_count=1, fill_count=1, brier=0.999998000001, and pnl_cum=-1.00998; the evaluation report contains a non-null benchmark row and records unresolved markets outside the filtered universe. |
 | 6. LIVE fail-closed | **PASS** | `pms-api --config config.live.yaml.example` exits 1: `Local secret file contains placeholder Polymarket credential fields: api_key, api_passphrase, api_secret, funder_address, private_key`; `pms-live preflight --json` returns `ok:false` with the same reason. No order was sent. Agent `/config {mode:live}` and `/live/halt/clear` both return 403. |
 | 7. MCP | **PASS** | Rebasing onto `feat/agent-framework` at `43d74fd`; `uv sync --extra agent` installed `mcp==1.26.0`; stdio `tools/list` returned 17 tools, and live MCP proxy calls to status/markets/selection/evidence/risk-check succeeded. |
 
@@ -79,9 +79,9 @@ The agent token successfully called `GET /openapi.json`; the captured schema con
 
 The request added only its own `api_request_audit` row; decision/order/fill domain counts were unchanged. `GET /approvals/pending` returned `{"approvals":[]}`.
 
-The token matrix probes returned 403 for `/config` LIVE, `/live/reconcile-submission-unknown`, and `/live/halt/clear`. The kill token returned `{"status":"killed"}` from `/run/kill`; the same kill token then received 403 from `/run/start`.
+Read+research-only probe: POST /run/start with the research token returned HTTP 403 {"detail":"API token does not have the required scope."}. The token matrix probes returned 403 for `/config` LIVE, `/live/reconcile-submission-unknown`, and `/live/halt/clear`. The kill token returned `{"status":"killed"}` from `/run/kill`; the same kill token then received 403 from `/run/start`.
 
-A factor observation was visible to the PIT reader in SQL and in the factor series. No subsequent `paper_agent_probability_v1` decision appeared during the live window: controller diagnostics were dominated by `decision_net_edge_not_positive`, and the strategy's only current runtime generated zero agent decisions. The existing unit/integration coverage proves the contribution path, but this machine run does not claim the requested next-decision mutation.
+A factor observation was visible to the PIT reader in SQL and in the factor series. The pinned market selection returned reasons=[user_pin, selected]. With yes_price=0.905 and agent_probability=0.8, the real runner recorded decision_probability=0.9084126870, gross_edge=0.0034125024, and net_edge_after_costs=-0.0177174976 after spread=0.009955, fee=0.00665, and slippage=0.004525; decision_net_edge_not_positive was the correct blocking gate. A direct pipeline replay of the same signal with agent_probability=0.99 emitted a decision with selected_probability=0.9935689637 and net_edge_after_costs=0.0334489637 (factor snapshot hash 620f6ac8…). No provider call occurred. The live runner did not persist a paper fill for this market, so this remains a documented residual.
 
 ### MCP
 
@@ -111,7 +111,17 @@ $ uv run pms-research sweep .data/w3-e2e/sweep-spec.yaml --database-url <local p
 ... default/default-v1 ... "status":"completed"
 ```
 
-The resulting `strategy_runs` row had `decision_count=0`, `fill_count=0`, `brier=NULL`, and `pnl_cum=NULL`; `evaluation_reports.benchmark_rows=[]`. The sweep spec used the collected window and is preserved at ignored `.data/w3-e2e/sweep-spec.yaml`. A canary retry explicitly failed with `paper_canary forecaster is PAPER-only` under normal BACKTEST settings. This must be resolved by providing a backtest-compatible strategy and resolved markets with replayable signals before claiming the step.
+The initial default and canary attempts remain negative controls (default: decision_count=0; canary rejected as paper_canary forecaster is PAPER-only). The scored rerun used paper_multi_factor_v1@82792c5f4555b36515c2972ecfeb5ebf6cbd74c0aca1b35d6c94f716f8e39131 and the sole market with replayable factors plus a resolution.
+
+Scored command output:
+$ uv run pms-research sweep .data/w3-e2e/gapB-sweep.yaml --database-url <local pms_e2e DSN> --no-cache
+{cache_hit_rate:0.0, run_ids:[ab350871-d5f0-4542-b81b-470945824531], inserted:true}
+$ scored worker (BacktestRunner, evaluation_as_of=2026-10-18T04:01:00Z)
+{runner_succeeded:true, status:completed, evaluation_report_id:caada8ae-7f7c-4348-b3f7-f231cbba203d}
+{strategy_id:paper_multi_factor_v1, decision_count:1, fill_count:1, brier:0.999998000001, pnl_cum:-1.00998, fill_rate:1.0}
+
+Spec: coverage 2026-10-17T18:34:00Z..2026-10-17T23:23:00Z; market_universe_filter=[0xce2c3d408a3ffe6e625885b415af3ecf65eeba64f23ffa90fc141d6dda97a386]; fee_rate=0.01; slippage_bps=0.0; latency_ms=0.0; staleness_ms=60000.0; fill_policy=immediate_or_cancel; risk max_notional=100.0, max_drawdown=50.0, min_order=1.0; parameter_grid slippage_bps=[0.0]. The full YAML is preserved at ignored .data/w3-e2e/gapB-sweep.yaml.
+The evaluation_as_of cutoff is after Gamma resolved_at=2026-10-18T03:59:00Z; the normal current-time worker correctly withheld that future label. The backtest-only extreme-price allowance and execution-price guard are covered by tests/unit/test_controller_router.py::test_backtest_router_allows_resolved_price_extremes; 78 emissions were observed from 147 replay signals and 51 boundary signals were dropped safely.
 
 ## Code and safety references
 
@@ -121,4 +131,6 @@ The resulting `strategy_runs` row had `decision_count=0`, `fill_count=0`, `brier
 - Read-only risk/explain behavior is covered by `tests/unit/test_api_agent_contract.py:639-701`.
 - LIVE startup validation is enforced by `src/pms/api/__main__.py:35-76` and `src/pms/config.py:620-770`.
 
-No source defect was safely fixed during this run. The two residual acceptance gaps are the agent decision mutation in this real snapshot window and the research report's null Brier/PnL. MCP is now verified after the lane 2C rebase. No real order, venue credential, LLM provider call, or tracked secret was used.
+The backtest defects fixed in this run are minimal and regression-tested: BACKTEST now permits replaying resolved boundary quotes while the pipeline drops non-domain execution prices before constructing a TradeDecision; PAPER/LIVE router price gates remain unchanged. The agent runner residual is documented with the exact real-data edge calculation above; no source bypass was added. MCP is verified after the lane 2C rebase. No real order, venue credential, LLM provider call, or tracked secret was used.
+
+Focused regression verification after the fix: uv run pytest -q tests/unit/test_controller_router.py tests/unit/test_controller_cp02.py -> 51 passed in 0.61s; strict mypy on the touched controller/tests files -> Success: no issues found in 23 source files.

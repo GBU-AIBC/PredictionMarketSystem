@@ -1095,6 +1095,25 @@ class ControllerPipeline:
                     "book_age_ms": final_book_age_ms,
                 },
             )
+        if not isfinite(decision_price) or not 0.0 < decision_price < 1.0:
+            self._set_drop_diagnostic(
+                signal,
+                code="decision_price_out_of_domain",
+                message=(
+                    "Skipping decision because the selected execution price "
+                    "is outside the open probability domain."
+                ),
+                metadata={
+                    "decision_price": decision_price,
+                    "decision_outcome": decision_outcome,
+                },
+            )
+            _log_pipeline_funnel(
+                signal,
+                forecasted_count=len(probabilities),
+                emitted_count=0,
+            )
+            return None
         self._last_decision_emitted_at[cooldown_key] = signal.timestamp
         _log_pipeline_funnel(
             signal,
