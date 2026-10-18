@@ -13,6 +13,7 @@ import pytest
 from pms.config import ControllerSettings, PMSSettings, RiskSettings
 from pms.core.enums import MarketStatus, RunMode, Side, TimeInForce
 from pms.core.models import (
+    BookSide,
     MarketSignal,
     Opportunity,
     Portfolio,
@@ -591,6 +592,7 @@ def test_decision_evidence_drops_non_finite_orderbook_values() -> None:
 
     evidence = _decision_evidence_from_signal(
         signal,
+        settings=_settings(),
         decision=_decision(),
         factor_snapshot_hash="snapshot-cp07",
         quote_source="postgres_snapshot",
@@ -616,6 +618,7 @@ def test_decision_evidence_computes_book_age_for_live_market_data_signal() -> No
     )
     evidence = _decision_evidence_from_signal(
         signal,
+        settings=_settings(),
         decision=_decision(),
         factor_snapshot_hash="snapshot-cp07",
         quote_source="postgres_snapshot",
@@ -639,6 +642,7 @@ def test_decision_evidence_records_submitted_token_when_buy_no_uses_yes_book() -
 
     evidence = _decision_evidence_from_signal(
         signal,
+        settings=_settings(),
         decision=decision,
         factor_snapshot_hash="snapshot-cp07",
         quote_source="postgres_snapshot",
@@ -697,6 +701,7 @@ def test_decision_evidence_prefers_recent_target_token_signal_for_flipped_side()
     )
     evidence = _decision_evidence_from_signal(
         evidence_signal,
+        settings=_settings(),
         decision=decision,
         factor_snapshot_hash="snapshot-cp07",
         quote_source="postgres_snapshot",
@@ -765,6 +770,7 @@ def test_decision_evidence_prefers_controller_execution_signal() -> None:
     )
     evidence = _decision_evidence_from_signal(
         evidence_signal,
+        settings=_settings(),
         decision=decision,
         factor_snapshot_hash="snapshot-cp07",
         quote_source="postgres_snapshot",
@@ -800,6 +806,7 @@ def test_decision_evidence_records_secondary_baseline_probabilities() -> None:
 
     evidence = _decision_evidence_from_signal(
         signal,
+        settings=_settings(),
         decision=decision,
         factor_snapshot_hash="snapshot-cp07",
         quote_source="postgres_snapshot",
@@ -835,6 +842,7 @@ def test_decision_evidence_records_cost_basis_at_decision_time() -> None:
 
     evidence = _decision_evidence_from_signal(
         signal,
+        settings=_settings(),
         decision=decision,
         factor_snapshot_hash="snapshot-cp07",
         quote_source="postgres_snapshot",
@@ -873,6 +881,7 @@ def test_decision_evidence_excludes_spread_when_already_in_price() -> None:
 
     evidence = _decision_evidence_from_signal(
         signal,
+        settings=_settings(),
         decision=decision,
         factor_snapshot_hash="snapshot-cp07",
         quote_source="postgres_snapshot",
@@ -907,6 +916,7 @@ def test_decision_evidence_records_ask_frame_without_spread_bps() -> None:
 
     evidence = _decision_evidence_from_signal(
         signal,
+        settings=_settings(),
         decision=decision,
         factor_snapshot_hash="snapshot-cp07",
         quote_source="postgres_snapshot",
@@ -946,6 +956,7 @@ def test_decision_evidence_projects_direct_no_book_baselines_to_yes_probability(
 
     evidence = _decision_evidence_from_signal(
         signal,
+        settings=_settings(),
         decision=decision,
         factor_snapshot_hash="snapshot-cp07",
         quote_source="postgres_snapshot",
@@ -1041,3 +1052,73 @@ def test_decision_uses_ask_pricing_is_false_for_unknown_strategy() -> None:
     ask_priced = replace(_decision(), limit_price=0.42)
 
     assert runner._decision_uses_ask_pricing(ask_priced, _signal()) is False  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", [Side.BUY.value, Side.SELL.value])
+@pytest.mark.parametrize(
+    ("venue_fee_bps", "strategy_fee", "expected_rate"),
+    [(None, None, 0.07), (None, 0.02, 0.02), (1000.0, 0.02, 0.10), (0.0, 0.02, 0.0)],
+)
+async def test_controller_persistence_keeps_fee_inclusive_costs(
+    action: BookSide,
+    venue_fee_bps: float | None,
+    strategy_fee: float | None,
+    expected_rate: float,
+) -> None:
+    # Price/size/edge reproduce the public PAPER fill from 2026-10-18.
+    metadata: tuple[tuple[str, str], ...] = (("price_reference", "best_ask"),)
+    if strategy_fee is not None:
+        metadata += (("fee_rate", str(strategy_fee)),)
+    strategy = _active_strategy_with_metadata(metadata)
+
+    class CostedController(_OpportunityAwareControllerDouble):
+        strategy: ActiveStrategy
+
+        async def on_signal(
+            self, signal: MarketSignal, portfolio: Portfolio | None = None,
+        ) -> tuple[Opportunity, TradeDecision] | None:
+            return (
+                replace(_opportunity(), target_size_usdc=1.0),
+                replace(
+                    _decision(), side=action, action=action, notional_usdc=1.0,
+                    prob_estimate=0.99, limit_price=0.978,
+                    expected_edge=0.012, spread_bps_at_decision=20,
+                ),
+            )
+
+    controller = CostedController()
+    controller.strategy = strategy
+    runner = _runner()
+    runner._active_strategies_by_version[("default", "default-v1")] = strategy
+    queue: asyncio.Queue[MarketSignal] = asyncio.Queue()
+    runner._controller_runtimes["default"] = StrategyControllerRuntime(
+        strategy_id="default", strategy_version_id="default-v1",
+        controller=cast(Any, controller), asset_ids=None,
+    )
+    runner._controller_signal_queues["default"] = queue
+    runner.opportunity_store = cast(Any, _RecordingOpportunityStore(runner))
+    store = _RecordingDecisionStore(runner)
+    runner.decision_store = cast(Any, store)
+    runner._controller_task = asyncio.create_task(asyncio.sleep(0))
+    await runner._controller_task
+    external: dict[str, Any] = {}
+    if venue_fee_bps is not None:
+        external["fee_rate_bps"] = venue_fee_bps
+    await queue.put(replace(
+        _signal(), yes_price=0.977, external_signal=external,
+        orderbook={"bids": [{"price": 0.976, "size": 979.0}],
+                   "asks": [{"price": 0.978, "size": 55.0}]},
+    ))
+
+    await asyncio.wait_for(runner._controller_pipeline_loop("default"), timeout=1.0)
+
+    assert store.decision_evidence is not None
+    evidence = store.decision_evidence
+    fee_edge = expected_rate * (1.0 - 0.978)
+    assert evidence["fee_rate"] == pytest.approx(expected_rate)
+    assert evidence["fee_edge_at_decision"] == pytest.approx(fee_edge)
+    assert evidence["spread_edge_at_decision"] == 0.0
+    assert evidence["slippage_edge_at_decision"] == pytest.approx(0.00489)
+    assert evidence["total_cost_edge_at_decision"] == pytest.approx(fee_edge + 0.00489)
+    assert evidence["net_edge_after_costs"] == pytest.approx(0.012 - fee_edge - 0.00489)

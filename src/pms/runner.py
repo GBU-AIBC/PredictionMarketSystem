@@ -60,6 +60,7 @@ from pms.controller.factor_snapshot import (
     PostgresFactorSnapshotReader,
 )
 from pms.controller.outcome_tokens import MarketDataOutcomeTokenResolver
+from pms.controller.pipeline import _decision_cost_edges
 from pms.controller.sizers.kelly import KellySizer
 from pms.core.enums import OrderStatus, RunMode, Side, TimeInForce
 from pms.core.exceptions import SensorDataQualityError
@@ -1958,6 +1959,8 @@ class Runner:
                         )
                         decision_evidence = _decision_evidence_from_signal(
                             decision_signal,
+                            settings=self.config,
+                            fee_rate=self._paper_fill_fee_rate(decision),
                             decision=decision,
                             factor_snapshot_hash=factor_snapshot_hash,
                             quote_source=self.config.controller.quote_source,
@@ -2235,6 +2238,8 @@ class Runner:
                         )
                         decision_evidence = _decision_evidence_from_signal(
                             evidence_signal,
+                            settings=self.config,
+                            fee_rate=self._paper_fill_fee_rate(decision),
                             decision=decision,
                             factor_snapshot_hash=None,
                             quote_source=self.config.controller.quote_source,
@@ -5263,11 +5268,13 @@ def _raw_factor_steps(
 def _decision_evidence_from_signal(
     signal: MarketSignal,
     *,
+    settings: PMSSettings,
     decision: TradeDecision,
     factor_snapshot_hash: str | None,
     quote_source: str,
     decision_created_at: datetime,
     spread_already_in_price: bool = False,
+    fee_rate: float | None = None,
 ) -> dict[str, object]:
     book_top_levels = _top_orderbook_levels(signal.orderbook)
     book_token_outcome = _book_token_outcome(signal, decision)
@@ -5335,6 +5342,8 @@ def _decision_evidence_from_signal(
         **_decision_cost_evidence(
             signal,
             decision,
+            settings=settings,
+            fee_rate=fee_rate,
             spread_already_in_price=spread_already_in_price,
         ),
         "external_signal_keys": sorted(str(key) for key in signal.external_signal),
@@ -5345,56 +5354,44 @@ def _decision_cost_evidence(
     signal: MarketSignal,
     decision: TradeDecision,
     *,
+    settings: PMSSettings,
+    fee_rate: float | None = None,
     spread_already_in_price: bool = False,
 ) -> dict[str, float | bool]:
     price = Decimal(str(decision.limit_price))
     if not price.is_finite() or price < 0:
         return {}
-
-    evidence: dict[str, float | bool] = {}
-    total_cost_edge = Decimal("0")
-    has_cost_evidence = False
-
+    costs = _decision_cost_edges(
+        decision_price=decision.limit_price,
+        spread_bps=(
+            max(0, decision.spread_bps_at_decision)
+            if decision.spread_bps_at_decision is not None
+            else None
+        ),
+        settings=settings,
+        fee_rate=market_fee_rate_from_metadata(
+            signal.external_signal,
+            fallback_rate=(
+                settings.strategies.flb_fee_rate if fee_rate is None else fee_rate
+            ),
+        ),
+        max_slippage_bps=max(0, decision.max_slippage_bps),
+        spread_already_in_price=spread_already_in_price,
+    )
+    evidence: dict[str, float | bool] = {
+        "fee_rate": costs.fee_rate,
+        "fee_edge_at_decision": costs.fee_edge,
+        "spread_edge_at_decision": costs.spread_edge,
+        "slippage_edge_at_decision": costs.slippage_edge,
+        "total_cost_edge_at_decision": costs.total_edge,
+    }
     fee_rate_bps = _optional_float(signal.external_signal.get("fee_rate_bps"))
     if fee_rate_bps is not None and 0.0 <= fee_rate_bps <= 10_000.0:
-        fee_rate = Decimal(str(fee_rate_bps)) / Decimal("10000")
-        fee_edge = fee_rate * (Decimal("1.0") - price)
         evidence["fee_rate_bps"] = fee_rate_bps
-        evidence["fee_rate"] = float(fee_rate)
-        evidence["fee_edge_at_decision"] = float(fee_edge)
-        total_cost_edge += fee_edge
-        has_cost_evidence = True
-
-    spread_bps = _optional_float(decision.spread_bps_at_decision)
     if spread_already_in_price:
-        # Ask-frame decisions already paid the spread inside expected_edge;
-        # keep the key present (the h1_flb smoke check requires it) but
-        # charge zero so net_edge_after_costs matches the gate arithmetic.
-        spread_edge = Decimal("0")
-        evidence["spread_edge_at_decision"] = float(spread_edge)
         evidence["spread_already_in_price"] = True
-        total_cost_edge += spread_edge
-        has_cost_evidence = True
-    elif spread_bps is not None and spread_bps >= 0.0:
-        spread_edge = (Decimal(str(spread_bps)) / Decimal("10000")) * price
-        evidence["spread_edge_at_decision"] = float(spread_edge)
-        total_cost_edge += spread_edge
-        has_cost_evidence = True
-
-    slippage_bps = _optional_float(decision.max_slippage_bps)
-    if slippage_bps is not None and slippage_bps >= 0.0:
-        slippage_edge = (Decimal(str(slippage_bps)) / Decimal("10000")) * price
-        evidence["slippage_edge_at_decision"] = float(slippage_edge)
-        total_cost_edge += slippage_edge
-        has_cost_evidence = True
-
-    if not has_cost_evidence:
-        return evidence
-
-    evidence["total_cost_edge_at_decision"] = float(total_cost_edge)
-    expected_edge = Decimal(str(decision.expected_edge))
-    if expected_edge.is_finite():
-        evidence["net_edge_after_costs"] = float(expected_edge - total_cost_edge)
+    if isfinite(decision.expected_edge):
+        evidence["net_edge_after_costs"] = decision.expected_edge - costs.total_edge
     return evidence
 
 
