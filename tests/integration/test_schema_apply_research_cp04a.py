@@ -91,6 +91,7 @@ EXPECTED_NULLABILITY: dict[str, list[tuple[str, str]]] = {
         ("portfolio_target_json", "YES"),
         ("started_at", "NO"),
         ("finished_at", "YES"),
+        ("controller_rejection_counts_json", "NO"),
     ],
 }
 
@@ -325,6 +326,14 @@ def test_schema_sql_applies_research_backtest_tables() -> None:
             """,
         )
 
+        rejection_counts = _run_psql(
+            temp_database_url,
+            "-At",
+            "-c",
+            "SELECT controller_rejection_counts_json FROM strategy_runs",
+        )
+        assert rejection_counts.stdout.strip() == "{}"
+
         explain_result = _run_psql(
             temp_database_url,
             "-At",
@@ -339,6 +348,89 @@ def test_schema_sql_applies_research_backtest_tables() -> None:
         )
         assert "idx_strategy_runs_run_id" in explain_result.stdout
         assert "Seq Scan on strategy_runs" not in explain_result.stdout
+    finally:
+        _run_psql(
+            admin_database_url,
+            "-c",
+            f"DROP DATABASE IF EXISTS {temp_database} WITH (FORCE)",
+        )
+
+
+def test_controller_rejections_migration_preserves_research_inputs() -> None:
+    assert PMS_TEST_DATABASE_URL is not None
+    admin_database_url = _replace_database(PMS_TEST_DATABASE_URL, "postgres")
+    temp_database = f"pms_rejection_counts_{uuid.uuid4().hex[:8]}"
+    temp_database_url = _replace_database(PMS_TEST_DATABASE_URL, temp_database)
+
+    def run_alembic(*args: str) -> None:
+        env = os.environ.copy()
+        env["DATABASE_URL"] = temp_database_url
+        env.pop("PMS_DATABASE_URL", None)
+        result = subprocess.run(
+            ["uv", "run", "alembic", *args],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+    snapshot_sql = """
+        SELECT to_jsonb(s) - 'controller_rejection_counts_json', to_jsonb(b)
+        FROM strategy_runs s JOIN backtest_runs b USING (run_id)
+    """
+
+    try:
+        _run_psql(admin_database_url, "-c", f"CREATE DATABASE {temp_database}")
+        run_alembic("upgrade", "0028_strategy_share_opt_in")
+        # Reconstruct the deployed schema before the new output column existed.
+        _run_psql(
+            temp_database_url,
+            "-c",
+            """
+            ALTER TABLE strategy_runs DROP COLUMN IF EXISTS controller_rejection_counts_json;
+            INSERT INTO backtest_runs (
+                run_id, spec_hash, status, strategy_ids, date_range_start, date_range_end,
+                exec_config_json, spec_json
+            ) VALUES (
+                '11111111-1111-1111-1111-111111111111', 'retained', 'completed', ARRAY['alpha'],
+                '2026-01-01', '2026-01-31', '{"chunk_days":7}', '{}'
+            );
+            INSERT INTO strategy_runs (
+                strategy_run_id, run_id, strategy_id, strategy_version_id, portfolio_target_json
+            ) VALUES (
+                '22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111',
+                'alpha', 'alpha-v1', '[{"market_id":"retained"}]'
+            );
+            """,
+        )
+        before = _run_psql(temp_database_url, "-At", "-c", snapshot_sql).stdout
+        run_alembic("upgrade", "head")
+        assert _run_psql(temp_database_url, "-At", "-c", snapshot_sql).stdout == before
+        counts = _run_psql(
+            temp_database_url,
+            "-At",
+            "-c",
+            "SELECT controller_rejection_counts_json FROM strategy_runs",
+        )
+        assert counts.stdout.strip() == "{}"
+        _run_psql(
+            temp_database_url,
+            "-c",
+            """
+            UPDATE strategy_runs SET controller_rejection_counts_json = '{"no_positive_edge":3}';
+            """,
+        )
+        run_alembic("upgrade", "head")
+        counts = _run_psql(
+            temp_database_url,
+            "-At",
+            "-c",
+            "SELECT controller_rejection_counts_json FROM strategy_runs",
+        )
+        assert counts.stdout.strip() == '{"no_positive_edge": 3}'
+        run_alembic("downgrade", "0028_strategy_share_opt_in")
+        assert _run_psql(temp_database_url, "-At", "-c", snapshot_sql).stdout == before
     finally:
         _run_psql(
             admin_database_url,

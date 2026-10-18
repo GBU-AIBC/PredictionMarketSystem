@@ -600,6 +600,7 @@ CREATE TABLE IF NOT EXISTS strategy_runs (
     portfolio_target_json JSONB,
     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at TIMESTAMPTZ,
+    controller_rejection_counts_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     CONSTRAINT strategy_runs_strategy_identity_check
         CHECK (strategy_id != '' AND strategy_version_id != '')
 );
