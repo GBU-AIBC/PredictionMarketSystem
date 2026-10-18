@@ -886,6 +886,7 @@ class BacktestRunner:
                         eval_spec=strategy.eval_spec,
                         forecaster=strategy.forecaster,
                         market_selection=strategy.market_selection,
+                        calibration=strategy.calibration,
                     )
                 )
         finally:

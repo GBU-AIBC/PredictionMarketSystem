@@ -25,12 +25,14 @@ from pms.research.specs import (
 )
 from pms.strategies.projections import (
     ActiveStrategy,
+    CalibrationSpec,
     EvalSpec,
     ForecasterSpec,
     MarketSelectionSpec,
     RiskParams,
     StrategyConfig,
 )
+from pms.strategies.versioning import serialize_strategy_config_json
 
 
 def test_portfolio_target_round_trips_through_json() -> None:
@@ -423,6 +425,47 @@ class _InsertTrackingPool:
 
     async def release(self, connection: _InsertTrackingConnection) -> None:
         del connection
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_default_strategy_loader_preserves_calibration_and_row_identity(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool,
+) -> None:
+    strategy = replace(
+        _active_strategy(),
+        calibration=CalibrationSpec(
+            enabled=enabled,
+            shrinkage_factor=0.73,
+            shrinkage_bias=-0.11,
+            extreme_clamp_low=0.06,
+            extreme_clamp_high=0.94,
+            min_resolved_for_extreme=37,
+        ),
+    )
+    pool = _InsertTrackingPool([])
+
+    async def fetchrow(query: str, *args: object) -> dict[str, object]:
+        assert "FROM strategy_versions" in query
+        assert args == ("alpha", "stored-v1")
+        return {
+            "strategy_id": "alpha",
+            "strategy_version_id": "stored-v1",
+            "config_json": serialize_strategy_config_json(
+                strategy.config, strategy.risk, strategy.eval_spec,
+                strategy.forecaster, strategy.market_selection, strategy.calibration,
+            ),
+        }
+
+    monkeypatch.setattr(pool._connection, "fetchrow", fetchrow, raising=False)
+    runner = BacktestRunner(
+        writable_pool=cast(Any, pool), readonly_pool=cast(Any, pool),
+    )
+
+    loaded = await runner._load_strategies((("alpha", "stored-v1"),))
+
+    assert loaded == [replace(
+        strategy, strategy_version_id="stored-v1",
+    )]
 
 
 @pytest.mark.asyncio
