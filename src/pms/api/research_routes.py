@@ -10,6 +10,7 @@ from uuid import UUID
 
 import asyncpg
 import yaml
+from yaml import YAMLError
 
 from pms.research.comparison import BacktestLiveComparisonTool
 from pms.research.policies import (
@@ -348,7 +349,10 @@ def _float_field(
 
 
 def _load_yaml_payload(sweep_yaml: str) -> dict[str, object]:
-    loaded = yaml.safe_load(sweep_yaml)
+    try:
+        loaded = yaml.safe_load(sweep_yaml)
+    except YAMLError as exc:
+        raise ValueError(f"sweep spec is malformed YAML: {exc}") from exc
     if not isinstance(loaded, dict):
         msg = "sweep spec must decode to a mapping"
         raise TypeError(msg)

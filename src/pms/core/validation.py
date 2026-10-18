@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import SupportsFloat, SupportsIndex, cast
 
 from pms.core.exceptions import (
@@ -128,6 +128,25 @@ def validate_quantity(value: object, *, field_name: str = "quantity") -> float:
     """Return a finite non-negative quantity."""
 
     return _non_negative(value, field_name=field_name)
+
+
+_NOTIONAL_TOLERANCE_USDC = Decimal("0.01")
+_NOTIONAL_TOLERANCE_RATIO = Decimal("0.005")
+
+
+def notional_matches_quantity_price(
+    *, quantity: object, notional: object, price: object
+) -> bool:
+    """Check notional against quantity × price with the economics tolerance."""
+    try:
+        quantity_dec = Decimal(str(validate_positive(quantity, field_name="fill_quantity")))
+        notional_dec = Decimal(str(validate_notional(notional, field_name="fill_notional_usdc")))
+        price_dec = Decimal(str(validate_price(price, field_name="fill_price")))
+    except (InvalidOperation, RuntimeError, TypeError, ValueError):
+        return False
+    expected = quantity_dec * price_dec
+    tolerance = max(_NOTIONAL_TOLERANCE_USDC, abs(expected) * _NOTIONAL_TOLERANCE_RATIO)
+    return abs(notional_dec - expected) <= tolerance
 
 
 def normalize_resolved_outcome(raw: object) -> float | None:

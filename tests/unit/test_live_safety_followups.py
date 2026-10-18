@@ -1570,6 +1570,26 @@ async def test_submission_unknown_reconciliation_store_marks_incident_resolved()
 
 
 @pytest.mark.asyncio
+async def test_submission_unknown_reconciliation_rejects_inconsistent_fill_before_write() -> None:
+    connection = _Connection()
+    store = SubmissionUnknownReconciliationStore(cast(asyncpg.Pool, _Pool(connection)))
+
+    with pytest.raises(ValueError, match="fill_notional_usdc does not match"):
+        await store.reconcile_submission_unknown(
+            decision_id="d-unknown",
+            venue_order_id="pm-123",
+            status="filled",
+            reconciled_by="operator",
+            fill_price=0.5,
+            fill_notional_usdc=4.0,
+            fill_quantity=10.0,
+        )
+
+    assert connection.fetchrow_calls == []
+    assert connection.execute_calls == []
+
+
+@pytest.mark.asyncio
 async def test_submission_unknown_reconciliation_requires_matching_decision_state() -> None:
     connection = _Connection()
     connection.fetchrow_result = {"decision_id": "d-unknown"}
