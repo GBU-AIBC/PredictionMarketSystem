@@ -5,13 +5,14 @@ import json
 import math
 import os
 import stat
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from pms.core.models import OrderState, TradeDecision
+from pms.actuator.risk import HaltState
 
 
 EmergencyRestartMode = Literal["paper", "backtest"]
@@ -39,6 +40,101 @@ class LiveEmergencyAuditWriter:
         )
         await asyncio.to_thread(_append_jsonl, self.path, record)
 
+    async def append_fee_reconcile(
+        self,
+        *,
+        fill_id: str,
+        fees: float | None,
+        fee_bps: int | None,
+        slippage_bps: float | None,
+        reconciled_by: str,
+        evidence: str,
+        override: bool = False,
+    ) -> None:
+        if not fill_id.strip():
+            raise ValueError("fill_id is required")
+        if fees is not None and (not math.isfinite(fees) or fees < 0.0):
+            raise ValueError("fees must be finite and non-negative")
+        if fee_bps is not None and (
+            isinstance(fee_bps, bool)
+            or not isinstance(fee_bps, int)
+            or fee_bps < 0
+        ):
+            raise ValueError("fee_bps must be a non-negative integer")
+        if slippage_bps is not None and not math.isfinite(slippage_bps):
+            raise ValueError("slippage_bps must be finite")
+        record = {
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+            "phase": "live_fee_reconcile",
+            "event": "fee_overridden" if override else "fee_reconciled",
+            "fill_id": fill_id.strip(),
+            "fees": fees,
+            "fee_bps": fee_bps,
+            "slippage_bps": slippage_bps,
+            "reconciled_by": _require_operator_id(reconciled_by, "reconciled_by"),
+            "evidence": _require_operator_text(evidence, "evidence"),
+        }
+        await asyncio.to_thread(_append_jsonl, self.path, record)
+
+    async def append_provenance_tag(
+        self,
+        *,
+        mode: str,
+        tagged_count: int,
+        operator: str,
+        evidence: str,
+        attestation: str,
+        fill_ids: Sequence[str] = (),
+    ) -> None:
+        if mode not in {"paper", "live"}:
+            raise ValueError("mode must be paper or live")
+        if tagged_count < 0:
+            raise ValueError("tagged_count must be non-negative")
+        if attestation not in {"all", "explicit"}:
+            raise ValueError("attestation must be all or explicit")
+        record = {
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+            "phase": "live_fill_provenance_tag",
+            "event": "fill_provenance_tagged",
+            "mode": mode,
+            "tagged_count": tagged_count,
+            "operator": _require_operator_id(operator, "operator"),
+            "evidence": _require_operator_text(evidence, "evidence"),
+            "attestation": attestation,
+            "fill_ids": list(fill_ids),
+        }
+        await asyncio.to_thread(_append_jsonl, self.path, record)
+
+    async def append_fill_economics_reconcile(
+        self,
+        *,
+        fill_id: str,
+        side: str,
+        venue: str,
+        token_id: str,
+        fill_price: float,
+        executed_at: datetime,
+        operator: str,
+        evidence: str,
+        override: bool = False,
+    ) -> None:
+        record = {
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+            "phase": "live_fill_economics_reconcile",
+            "event": "fill_economics_reconciled",
+            "override": override,
+            "fill_id": fill_id,
+            "linkage": f"reconciled:{fill_id}",
+            "side": side,
+            "venue": venue,
+            "token_id": token_id,
+            "fill_price": fill_price,
+            "executed_at": executed_at.isoformat(),
+            "operator": _require_operator_id(operator, "operator"),
+            "evidence": _require_operator_text(evidence, "evidence"),
+        }
+        await asyncio.to_thread(_append_jsonl, self.path, record)
+
     async def append_manual_stop(
         self,
         *,
@@ -62,6 +158,113 @@ class LiveEmergencyAuditWriter:
             restart_mode=restart_mode,
         )
         await asyncio.to_thread(_append_jsonl, self.path, record)
+
+    async def append_halt(self, state: HaltState) -> None:
+        """Persist the active breaker so a restart cannot silently resume."""
+        await asyncio.to_thread(
+            _append_jsonl,
+            self.path,
+            {
+                "timestamp": datetime.now(tz=UTC).isoformat(),
+                "phase": "risk_halt",
+                "event": "risk_halt",
+                "reason": state.reason,
+                "trigger_kind": state.trigger_kind,
+                "triggered_at": state.triggered_at.isoformat(),
+            },
+        )
+
+    async def append_halt_clear(
+        self,
+        *,
+        cleared_by: str,
+        token_id: str | None = None,
+    ) -> None:
+        record: dict[str, object] = {
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+            "phase": "risk_halt_clear",
+            "event": "risk_halt_clear",
+            "cleared_by": _require_operator_id(cleared_by, "cleared_by"),
+        }
+        if token_id is not None:
+            record["token_id"] = token_id
+        await asyncio.to_thread(
+            _append_jsonl,
+            self.path,
+            record,
+        )
+
+
+def read_active_halt(path: Path) -> HaltState | None:
+    """Read the last durable halt/clear pair without trusting malformed lines."""
+    try:
+        raw_lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return None
+    active: HaltState | None = None
+    for line in raw_lines:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        phase = payload.get("phase")
+        if phase == "risk_halt_clear":
+            active = None
+            continue
+        if phase != "risk_halt":
+            continue
+        try:
+            triggered_at = datetime.fromisoformat(
+                str(payload["triggered_at"]).replace("Z", "+00:00")
+            )
+            if triggered_at.tzinfo is None:
+                triggered_at = triggered_at.replace(tzinfo=UTC)
+            trigger_kind = payload["trigger_kind"]
+            if trigger_kind not in {
+                "consecutive_losses",
+                "slippage_spike",
+                "credential_failure",
+                "order_without_fill",
+                "rate_limit_exceeded",
+                "drawdown_circuit_breaker",
+                "daily_loss_limit",
+            }:
+                continue
+            active = HaltState(
+                halted=True,
+                reason=str(payload["reason"]),
+                triggered_at=triggered_at,
+                trigger_kind=trigger_kind,
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return active
+
+
+def read_last_halt_clear(path: Path) -> datetime | None:
+    """Return the latest durable operator clear timestamp, if any."""
+    try:
+        raw_lines = path.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, OSError):
+        return None
+    latest: datetime | None = None
+    for line in raw_lines:
+        try:
+            payload = json.loads(line)
+            if not isinstance(payload, Mapping) or payload.get("phase") != "risk_halt_clear":
+                continue
+            value = datetime.fromisoformat(
+                str(payload["timestamp"]).replace("Z", "+00:00")
+            )
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=UTC)
+            if latest is None or value > latest:
+                latest = value
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return latest
 
 
 def _manual_stop_record(

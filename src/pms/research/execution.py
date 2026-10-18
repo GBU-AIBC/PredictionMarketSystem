@@ -11,6 +11,7 @@ from uuid import uuid4
 from pms.actuator.risk import InsufficientLiquidityError
 from pms.core.enums import OrderStatus, Side, TimeInForce, Venue
 from pms.core.models import MarketSignal, OrderState, Portfolio, TradeDecision
+from pms.core.validation import validate_finite, validate_positive, validate_price
 from pms.core.venue_support import kalshi_stub_error
 from pms.research.specs import ExecutionModel
 
@@ -45,6 +46,7 @@ class _OpenOrderState:
     submitted_at: datetime
     last_updated_at: datetime
     requested_notional_usdc: float
+    resolves_at: datetime | None = None
     filled_notional_usdc: float = 0.0
     filled_quantity: float = 0.0
     remaining_notional_usdc: float = 0.0
@@ -158,6 +160,7 @@ class BacktestExecutionSimulator:
                     submitted_at=submitted_at,
                     last_updated_at=submitted_at,
                     requested_notional_usdc=decision.notional_usdc,
+                    resolves_at=signal.resolves_at,
                     remaining_notional_usdc=decision.notional_usdc,
                 )
                 self.open_orders_ledger[order_id] = open_order
@@ -224,6 +227,7 @@ class BacktestExecutionSimulator:
                 submitted_at=submitted_at,
                 last_updated_at=submitted_at,
                 requested_notional_usdc=decision.notional_usdc,
+                resolves_at=signal.resolves_at,
                 filled_notional_usdc=fill.filled_notional_usdc,
                 filled_quantity=fill.filled_quantity,
                 remaining_notional_usdc=fill.remaining_notional_usdc,
@@ -268,6 +272,26 @@ class BacktestExecutionSimulator:
         results: list[OrderState] = []
         for order_id, open_order in list(self.open_orders_ledger.items()):
             evaluated_at = _fill_timestamp(signal, execution_model)
+            if _same_market(open_order.decision, signal) and signal.resolves_at is not None:
+                open_order.resolves_at = signal.resolves_at
+            if open_order.resolves_at is not None and evaluated_at >= open_order.resolves_at:
+                results.append(
+                    _order_state(
+                        order_id=order_id,
+                        decision=open_order.decision,
+                        status=OrderStatus.CANCELED_MARKET_RESOLVED.value,
+                        submitted_at=open_order.submitted_at,
+                        last_updated_at=evaluated_at,
+                        requested_notional_usdc=open_order.requested_notional_usdc,
+                        filled_notional_usdc=open_order.filled_notional_usdc,
+                        remaining_notional_usdc=open_order.remaining_notional_usdc,
+                        filled_quantity=open_order.filled_quantity,
+                        fill_price=open_order.last_fill_price,
+                        raw_status="market_resolved_before_execution",
+                    )
+                )
+                self.open_orders_ledger.pop(order_id, None)
+                continue
             if evaluated_at - open_order.submitted_at >= timedelta(
                 milliseconds=execution_model.order_ttl_ms
             ):
@@ -463,6 +487,16 @@ def _walk_book(
     adverse_selection_bps: float,
 ) -> _FillComputation:
     requested_notional_usdc = _decision_notional_usdc(target_notional_usdc)
+    try:
+        displayed_depth_fill_ratio = validate_finite(
+            displayed_depth_fill_ratio, field_name="displayed_depth_fill_ratio"
+        )
+        slippage_bps = validate_finite(slippage_bps, field_name="slippage_bps")
+        adverse_selection_bps = validate_finite(
+            adverse_selection_bps, field_name="adverse_selection_bps"
+        )
+    except ValueError as exc:
+        raise InsufficientLiquidityError("execution parameters must be finite") from exc
     side_key = _side_key(decision)
     levels = orderbook.get(side_key)
     if not isinstance(levels, list) or not levels:
@@ -476,7 +510,12 @@ def _walk_book(
     for raw_level in levels:
         if not isinstance(raw_level, dict):
             continue
-        level_size = float(cast(str | int | float, raw_level.get("size", 0.0)))
+        try:
+            level_size = validate_finite(
+                raw_level.get("size", 0.0), field_name="orderbook level size"
+            )
+        except (TypeError, ValueError):
+            continue
         level_size *= displayed_depth_fill_ratio
         if level_size <= 0.0:
             continue
@@ -490,8 +529,10 @@ def _walk_book(
             action=action,
             slippage_bps=slippage_bps,
         )
-        if level_price <= 0.0:
-            raise InsufficientLiquidityError("fill_price must be positive")
+        try:
+            level_price = validate_price(level_price)
+        except (TypeError, ValueError):
+            raise InsufficientLiquidityError("fill_price must be finite and positive")
         if not _is_limit_eligible(
             action=action,
             fill_price=level_price,
@@ -552,7 +593,13 @@ def _best_available_price(
     for raw_level in levels:
         if not isinstance(raw_level, dict):
             continue
-        if float(cast(str | int | float, raw_level.get("size", 0.0))) <= 0.0:
+        try:
+            raw_size = validate_finite(
+                raw_level.get("size", 0.0), field_name="orderbook level size"
+            )
+        except (TypeError, ValueError):
+            continue
+        if raw_size <= 0.0:
             continue
         return _apply_adverse_selection(
             _effective_level_price(decision, raw_level),
@@ -564,7 +611,12 @@ def _best_available_price(
 
 def _effective_level_price(decision: TradeDecision, raw_level: dict[str, Any]) -> float:
     del decision
-    return float(cast(str | int | float, raw_level["price"]))
+    try:
+        return validate_price(raw_level["price"], field_name="orderbook level price")
+    except (TypeError, ValueError) as exc:
+        raise InsufficientLiquidityError(
+            "orderbook level price must be finite and in (0, 1)"
+        ) from exc
 
 
 def _apply_slippage(price: float, *, action: str, slippage_bps: float) -> float:
@@ -598,15 +650,20 @@ def _fill_timestamp(signal: MarketSignal, execution_model: ExecutionModel) -> da
 
 def _latency_ms(signal: MarketSignal, execution_model: ExecutionModel) -> float:
     if execution_model.latency_model is not None:
-        return float(execution_model.latency_model(signal.fetched_at.timestamp()))
-    return execution_model.latency_ms
+        return validate_finite(
+            execution_model.latency_model(signal.fetched_at.timestamp()),
+            field_name="latency_ms",
+        )
+    return validate_finite(execution_model.latency_ms, field_name="latency_ms")
 
 
 def _decision_notional_usdc(raw_notional_usdc: float) -> float:
-    notional_usdc = float(raw_notional_usdc)
-    if notional_usdc <= 0.0:
-        raise InsufficientLiquidityError("decision notional must be positive")
-    return notional_usdc
+    try:
+        return validate_positive(raw_notional_usdc, field_name="decision notional")
+    except (TypeError, ValueError) as exc:
+        raise InsufficientLiquidityError(
+            "decision notional must be finite and positive"
+        ) from exc
 
 
 def _action(decision: TradeDecision) -> str:

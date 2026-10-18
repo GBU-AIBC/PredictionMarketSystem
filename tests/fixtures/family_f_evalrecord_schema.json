@@ -26,7 +26,8 @@
         {"column_name": "strategy_id", "data_type": "text", "is_nullable": "NO"},
         {"column_name": "strategy_version_id", "data_type": "text", "is_nullable": "NO"},
         {"column_name": "edge_at_decision", "data_type": "double precision", "is_nullable": "NO", "column_default": "0.0"},
-        {"column_name": "spread_bps_at_decision", "data_type": "integer", "is_nullable": "YES"}
+        {"column_name": "spread_bps_at_decision", "data_type": "integer", "is_nullable": "YES"},
+        {"column_name": "calibration_prob_estimate", "data_type": "double precision", "is_nullable": "YES"}
       ]
     },
     {
@@ -64,6 +65,7 @@
     {"column_name": "strategy_id", "data_type": "text", "is_nullable": "NO"},
     {"column_name": "strategy_version_id", "data_type": "text", "is_nullable": "NO"},
     {"column_name": "edge_at_decision", "data_type": "double precision", "is_nullable": "NO", "column_default": "0.0"},
-    {"column_name": "spread_bps_at_decision", "data_type": "integer", "is_nullable": "YES"}
+    {"column_name": "spread_bps_at_decision", "data_type": "integer", "is_nullable": "YES"},
+    {"column_name": "calibration_prob_estimate", "data_type": "double precision", "is_nullable": "YES"}
   ]
 }

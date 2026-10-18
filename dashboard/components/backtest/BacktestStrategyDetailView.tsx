@@ -81,6 +81,17 @@ export function BacktestStrategyDetailView({
               </section>
             </div>
 
+            {Object.keys(strategyRun.controller_rejection_counts ?? {}).length > 0 && (
+              <section className="card detail-section">
+                <h3>Controller rejections</h3>
+                <ul>
+                  {Object.entries(strategyRun.controller_rejection_counts ?? {})
+                    .sort(([codeA, countA], [codeB, countB]) => countB - countA || codeA.localeCompare(codeB))
+                    .map(([code, count]) => <li key={code}>{code}: {count}</li>)}
+                </ul>
+              </section>
+            )}
+
             <section className="card detail-section">
               <div className="section-heading">
                 <h3>Portfolio targets</h3>

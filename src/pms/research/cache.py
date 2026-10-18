@@ -8,6 +8,7 @@ from typing import Any, TypeAlias, cast
 import asyncpg
 
 from pms.factors.base import FactorValueRow
+from pms.factors.definitions import current_definition_version
 
 
 FactorPanel: TypeAlias = Mapping[str, tuple[FactorValueRow, ...]]
@@ -109,6 +110,7 @@ async def load_factor_panel(
       AND market_id = ANY($3::text[])
       AND ts >= $4
       AND ts <= $5
+      AND definition_version = $6
     ORDER BY ts ASC, id ASC
     """
     async with pool.acquire() as connection:
@@ -119,6 +121,7 @@ async def load_factor_panel(
             list(ordered_market_ids),
             ts_start,
             ts_end,
+            current_definition_version(factor_id),
         )
 
     grouped: dict[str, list[FactorValueRow]] = {

@@ -11,6 +11,7 @@ import pytest
 from pms.api.app import create_app
 from pms.config import DatabaseSettings, PMSSettings
 from pms.runner import Runner
+from pms.factors.definitions import current_definition_version
 from tests.support.strategy_catalog import seed_factor_catalog
 
 
@@ -89,17 +90,20 @@ async def _seed_catalog_and_series(
     )
     await connection.execute(
         """
-        INSERT INTO factor_values (factor_id, param, market_id, ts, value)
+        INSERT INTO factor_values (factor_id, param, market_id, ts, value, definition_version)
         VALUES
-            ('orderbook_imbalance', '', 'factor-route-market', $1, 0.25),
-            ('orderbook_imbalance', '', 'factor-route-market', $2, 0.10),
-            ('orderbook_imbalance', '', 'factor-route-market', $3, 0.15),
-            ('orderbook_imbalance', '', 'other-market', $2, -0.15),
-            ('metaculus_prior', '', 'factor-route-market', $3, 0.72)
+            ('orderbook_imbalance', '', 'factor-route-market', $1, 0.25, $4),
+            ('orderbook_imbalance', '', 'factor-route-market', $2, 0.10, $4),
+            ('orderbook_imbalance', '', 'factor-route-market', $3, 0.15, $4),
+            ('orderbook_imbalance', '', 'other-market', $2, -0.15, $4),
+            ('metaculus_prior', '', 'factor-route-market', $3, 0.72, $5),
+            ('orderbook_imbalance', '', 'factor-route-market', $2, -0.99, '1')
         """,
         ts_1,
         ts_2,
         ts_3,
+        current_definition_version("orderbook_imbalance"),
+        current_definition_version("metaculus_prior"),
     )
     return ts_1, ts_2, ts_3
 

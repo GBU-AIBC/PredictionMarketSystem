@@ -85,8 +85,14 @@ def _row_value(row: object, key: str) -> object | None:
 
 
 class PostgresMarketDataStore:
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        *,
+        market_freshness_s: float = 900.0,
+    ) -> None:
         self._pool = pool
+        self._market_freshness_s = market_freshness_s
 
     @property
     def pool(self) -> asyncpg.Pool:
@@ -471,6 +477,11 @@ class PostgresMarketDataStore:
                     AND markets.volume_24h >= $4
                 )
           )
+          AND COALESCE(markets.closed, false) = false
+          AND COALESCE(markets.active, true) = true
+          AND markets.last_seen_at >= (
+                $2::timestamptz - ($5::double precision * INTERVAL '1 second')
+          )
           AND (
                 (
                     $3::timestamptz IS NULL
@@ -494,7 +505,14 @@ class PostgresMarketDataStore:
             tokens.token_id ASC
         """
         async with self._pool.acquire() as connection:
-            rows = await connection.fetch(query, venue, now, upper_bound, min_volume_usdc)
+            rows = await connection.fetch(
+                query,
+                venue,
+                now,
+                upper_bound,
+                min_volume_usdc,
+                self._market_freshness_s,
+            )
 
         eligible_markets: list[tuple[Market, list[Token]]] = []
         current_market_id: str | None = None
@@ -820,7 +838,11 @@ class PostgresMarketDataStore:
         WITH latest_snapshot AS (
             SELECT id, ts
             FROM book_snapshots
-            WHERE market_id = $1
+            INNER JOIN tokens
+                ON tokens.token_id = book_snapshots.token_id
+               AND tokens.condition_id = book_snapshots.market_id
+               AND tokens.outcome = 'YES'
+            WHERE book_snapshots.market_id = $1
             ORDER BY ts DESC, id DESC
             LIMIT 1
         )

@@ -35,6 +35,7 @@ _CREATED_TABLES: Final[tuple[str, ...]] = (
     "strategy_versions",
     "strategies",
     "market_relations",
+    "market_resolutions",
     "factor_values",
     "factors",
     "trades",
@@ -48,6 +49,14 @@ _CREATED_TABLES: Final[tuple[str, ...]] = (
 )
 
 _DEFERRED_SCHEMA_STATEMENT_PREFIXES: Final[tuple[str, ...]] = (
+    # Wave 2 contribution tables are created by their own revision so an
+    # upgrade from the pre-Wave-2 head and a fresh schema stay equivalent.
+    "CREATE TABLE IF NOT EXISTS agent_evidence",
+    "CREATE INDEX IF NOT EXISTS idx_agent_evidence_market_captured",
+    "CREATE TABLE IF NOT EXISTS agent_factor_provenance",
+    "CREATE INDEX IF NOT EXISTS idx_agent_factor_provenance_market_ts",
+    "CREATE TABLE IF NOT EXISTS llm_replay_records",
+    "CREATE INDEX IF NOT EXISTS idx_llm_replay_records_recorded_at",
     "CREATE TABLE IF NOT EXISTS strategy_judgement_artifacts",
     "CREATE TABLE IF NOT EXISTS strategy_execution_artifacts",
     "CREATE INDEX IF NOT EXISTS idx_strategy_judgement_artifacts",

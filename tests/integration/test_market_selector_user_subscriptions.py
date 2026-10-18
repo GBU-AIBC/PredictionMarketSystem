@@ -336,7 +336,6 @@ async def test_live_reselection_reads_user_subscriptions_without_restart(
         subscribed = await client.post(f"/markets/{token_id}/subscribe")
         assert subscribed.status_code == 200
 
-        await runner._request_reselection()  # noqa: SLF001
         await _wait_for_subscription_update(sensors.market_data_sensors[-1], token_id)
 
         markets = await client.get(

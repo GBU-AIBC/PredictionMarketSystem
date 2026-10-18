@@ -1,0 +1,854 @@
+{
+  "financial_scope": "Real public inputs; PAPER and retrospective simulated execution only; no funded trades.",
+  "review_source_head": "97dbee522e156fc56087a50c2b742e78f38ebb46",
+  "historical": {
+    "quoted_depth": {
+      "brier_denominator": 6,
+      "cold_label_fills": 0,
+      "controller_rejection_counts": {
+        "decision_edge_not_positive": 10,
+        "decision_net_edge_not_positive": 133,
+        "direct_outcome_orderbook_required": 133,
+        "market_position_capacity_below_minimum": 334,
+        "order_size_below_minimum": 5,
+        "router_gate:resolves_at_in_past": 4,
+        "router_gate:yes_price_out_of_band": 57
+      },
+      "db": "pms_e2e_scored_20261018b",
+      "decisions": 6,
+      "decisions_cold_label": 0,
+      "eligible_label_markets": 8,
+      "evaluation_as_of": "2026-10-18 08:09:49.944337+00:00",
+      "execute_return": true,
+      "execution_model": {
+        "adverse_selection_bps": 0.0,
+        "calibration_source": "manual",
+        "displayed_depth_fill_ratio": 1.0,
+        "fee_rate": 0.07,
+        "fill_policy": "immediate_or_cancel",
+        "latency_ms": 250.0,
+        "order_ttl_ms": 60000,
+        "price_invalidation_streak": 10,
+        "replay_window_ms": 86400000,
+        "slippage_bps": 0.0,
+        "staleness_ms": 120000.0
+      },
+      "execution_rows": 6,
+      "failure_reason": null,
+      "filled_markets": 6,
+      "fills": 6,
+      "http_metrics_status": 200,
+      "http_run_status": 200,
+      "independent_brier": 0.1862137609571239,
+      "independent_net_pnl": -2.99201671957672,
+      "persisted_brier": 0.18621376095712389,
+      "persisted_net_pnl": -2.99201671957672,
+      "raw_label_markets": 8,
+      "resolved_cost": 6.0,
+      "resolved_fills": 6,
+      "resolved_gross_pnl": -2.71957671957672,
+      "resolved_modeled_fees": 0.27244,
+      "resolved_payout": 3.28042328042328,
+      "risk_policy": {
+        "max_daily_drawdown_pct": 50.0,
+        "max_position_notional_usdc": 1.0,
+        "min_order_size_usdc": 1.0
+      },
+      "run_id": "0de6a56b-8818-4354-ab8b-bef8bf2cc37e",
+      "signals": 682,
+      "source_head": "d62eae966ee98708359258b3e99c50d9c6e14737",
+      "spec_hash": "2fe5b602f4ce26db23779896aaaae9d49e437df5c62cb79d36352a27607317b3",
+      "strategy_versions": [
+        [
+          "e2e_retrospective_contrarian_book_v1",
+          "2f6a96b5b0592467d9679160466e2d0810bf732143ffe14f4438b847a202aac5"
+        ]
+      ],
+      "terminal_status": "completed",
+      "total_filled_cost": 6.0
+    },
+    "conservative_control": {
+      "brier_denominator": 340,
+      "cold_label_fills": 0,
+      "controller_rejection_counts": {
+        "decision_edge_not_positive": 10,
+        "decision_net_edge_not_positive": 133,
+        "direct_outcome_orderbook_required": 133,
+        "order_size_below_minimum": 5,
+        "router_gate:resolves_at_in_past": 4,
+        "router_gate:yes_price_out_of_band": 57
+      },
+      "db": "pms_e2e_scored_20261018b",
+      "decisions": 340,
+      "decisions_cold_label": 0,
+      "eligible_label_markets": 8,
+      "evaluation_as_of": "2026-10-18 08:09:38.346415+00:00",
+      "execute_return": true,
+      "execution_model": {
+        "adverse_selection_bps": 5.0,
+        "calibration_source": "static_live_estimate",
+        "displayed_depth_fill_ratio": 1.0,
+        "fee_rate": 0.07,
+        "fill_policy": "immediate_or_cancel",
+        "latency_ms": 250.0,
+        "order_ttl_ms": 60000,
+        "price_invalidation_streak": 10,
+        "replay_window_ms": 86400000,
+        "slippage_bps": 10.0,
+        "staleness_ms": 120000.0
+      },
+      "execution_rows": 340,
+      "failure_reason": null,
+      "filled_markets": 0,
+      "fills": 0,
+      "http_metrics_status": 200,
+      "http_run_status": 200,
+      "independent_brier": 0.19387063801298116,
+      "independent_net_pnl": null,
+      "persisted_brier": 0.19387063801298116,
+      "persisted_net_pnl": null,
+      "raw_label_markets": 8,
+      "resolved_cost": 0,
+      "resolved_fills": 0,
+      "resolved_gross_pnl": 0,
+      "resolved_modeled_fees": 0,
+      "resolved_payout": 0,
+      "risk_policy": {
+        "max_daily_drawdown_pct": 50.0,
+        "max_position_notional_usdc": 1.0,
+        "min_order_size_usdc": 1.0
+      },
+      "run_id": "cb1fdec8-a004-43b1-964b-6b9cff8ebc01",
+      "signals": 682,
+      "source_head": "d62eae966ee98708359258b3e99c50d9c6e14737",
+      "spec_hash": "30f0490d95dfea9c84acef26a4fd110d169ad9f6d3289c5eae6ed0d93f7aad6d",
+      "strategy_versions": [
+        [
+          "e2e_retrospective_contrarian_book_v1",
+          "2f6a96b5b0592467d9679160466e2d0810bf732143ffe14f4438b847a202aac5"
+        ]
+      ],
+      "terminal_status": "completed",
+      "total_filled_cost": 0
+    },
+    "fills": [
+      {
+        "brier": 0.19571263277076087,
+        "cost": 1.0,
+        "decision_at": "2026-10-17 22:03:01.558000+00:00",
+        "decision_id": "decision-b22947339b57433da19fbf1e48424ddb",
+        "execution_at": "2026-10-17 22:03:01.808000+00:00",
+        "gross_settlement_pnl": -1.0,
+        "label_eligible": true,
+        "label_observed_at": "2026-10-18 08:09:27.245269+00:00",
+        "label_source": "gamma",
+        "limit_price": 0.096,
+        "market_id": "0x01df96c4f4d8af93e41d87039ef328d4edd3986076f345eb31ece0de30299e35",
+        "modeled_fee": 0.06328,
+        "net_settlement_pnl": -1.06328,
+        "outcome": "YES",
+        "p_token": 0.44239420517312483,
+        "p_yes": 0.44239420517312483,
+        "payout": 0.0,
+        "price": 0.096,
+        "quantity": 10.416666666666666,
+        "raw_source_label": 0.0,
+        "reason": "matched",
+        "requested_cost": 1.0,
+        "resolved_at": null,
+        "resolved_yes": 0.0,
+        "source_snapshot_at": "2026-10-17 22:03:01.558000+00:00",
+        "source_snapshot_hash": "b26163ff6d25de673d652c0048f4772fe7f083e5",
+        "source_snapshot_id": 145,
+        "status": "matched",
+        "token_id": "11628568885014249932232454764148473554538632406092821157240914619726844587755",
+        "used_ask_levels": [
+          {
+            "consumed_cost": 1.0,
+            "consumed_quantity": 10.416666666666666,
+            "displayed_quantity": 3000.0,
+            "price": 0.096
+          }
+        ]
+      },
+      {
+        "brier": 0.07438685353170275,
+        "cost": 1.0,
+        "decision_at": "2026-10-17 22:34:23.440000+00:00",
+        "decision_id": "decision-e0eeba1c57054ab197136ec18f55511a",
+        "execution_at": "2026-10-17 22:34:23.690000+00:00",
+        "gross_settlement_pnl": 0.4285714285714286,
+        "label_eligible": true,
+        "label_observed_at": "2026-10-18 08:09:27.231138+00:00",
+        "label_source": "gamma",
+        "limit_price": 0.7,
+        "market_id": "0x1df550a33fe4667c4a4d30f6d0287665021a6993d0cbb3bcedcb4dd3c2ea259e",
+        "modeled_fee": 0.021000000000000005,
+        "net_settlement_pnl": 0.4075714285714286,
+        "outcome": "NO",
+        "p_token": 0.72726046577054,
+        "p_yes": 0.27273953422945996,
+        "payout": 1.4285714285714286,
+        "price": 0.7,
+        "quantity": 1.4285714285714286,
+        "raw_source_label": 0.0,
+        "reason": "matched",
+        "requested_cost": 1.0,
+        "resolved_at": null,
+        "resolved_yes": 0.0,
+        "source_snapshot_at": "2026-10-17 22:34:23.440000+00:00",
+        "source_snapshot_hash": "9c450a03ddda3837e0872712b32b3f347bbef0e8",
+        "source_snapshot_id": 5406,
+        "status": "matched",
+        "token_id": "103096706028566766042909791851023775684186564798878459221752201817135387679232",
+        "used_ask_levels": [
+          {
+            "consumed_cost": 1.0,
+            "consumed_quantity": 1.4285714285714286,
+            "displayed_quantity": 23395.51,
+            "price": 0.7
+          }
+        ]
+      },
+      {
+        "brier": 0.25142176399930133,
+        "cost": 1.0,
+        "decision_at": "2026-10-17 22:58:25.205000+00:00",
+        "decision_id": "decision-0d55a02ec4954461af69dce1ed9d41eb",
+        "execution_at": "2026-10-17 22:58:25.455000+00:00",
+        "gross_settlement_pnl": -1.0,
+        "label_eligible": true,
+        "label_observed_at": "2026-10-18 08:09:27.241100+00:00",
+        "label_source": "gamma",
+        "limit_price": 0.002,
+        "market_id": "0xce2c3d408a3ffe6e625885b415af3ecf65eeba64f23ffa90fc141d6dda97a386",
+        "modeled_fee": 0.06986,
+        "net_settlement_pnl": -1.06986,
+        "outcome": "NO",
+        "p_token": 0.5014197483140261,
+        "p_yes": 0.49858025168597386,
+        "payout": 0.0,
+        "price": 0.002,
+        "quantity": 500.0,
+        "raw_source_label": 1.0,
+        "reason": "matched",
+        "requested_cost": 1.0,
+        "resolved_at": null,
+        "resolved_yes": 1.0,
+        "source_snapshot_at": "2026-10-17 22:58:25.205000+00:00",
+        "source_snapshot_hash": "f0bc88dce00832d60e2a1c5ec99977b17923dd8b",
+        "source_snapshot_id": 9529,
+        "status": "matched",
+        "token_id": "95954370437617858516010466476736395051969674042469603208087881439839018700695",
+        "used_ask_levels": [
+          {
+            "consumed_cost": 1.0,
+            "consumed_quantity": 500.0,
+            "displayed_quantity": 32251.18,
+            "price": 0.002
+          }
+        ]
+      },
+      {
+        "brier": 0.29707630628864057,
+        "cost": 1.0,
+        "decision_at": "2026-10-17 23:37:28.074000+00:00",
+        "decision_id": "decision-c587ca4e05a34b1d87426a025fd7ec6d",
+        "execution_at": "2026-10-17 23:37:28.324000+00:00",
+        "gross_settlement_pnl": -1.0,
+        "label_eligible": true,
+        "label_observed_at": "2026-10-18 08:09:27.220113+00:00",
+        "label_source": "gamma",
+        "limit_price": 0.41,
+        "market_id": "0x361d0825fd5d45ed9f9fffca2764928f720727ea72d2576db6974c6d2de1fcba",
+        "modeled_fee": 0.0413,
+        "net_settlement_pnl": -1.0413000000000001,
+        "outcome": "NO",
+        "p_token": 0.5450470679571082,
+        "p_yes": 0.4549529320428918,
+        "payout": 0.0,
+        "price": 0.41000000000000003,
+        "quantity": 2.4390243902439024,
+        "raw_source_label": 1.0,
+        "reason": "matched",
+        "requested_cost": 1.0,
+        "resolved_at": null,
+        "resolved_yes": 1.0,
+        "source_snapshot_at": "2026-10-17 23:37:28.074000+00:00",
+        "source_snapshot_hash": "3cdd3b601873d733baef47c2a6922997e3d510d5",
+        "source_snapshot_id": 14534,
+        "status": "matched",
+        "token_id": "1030493650994977346532431338422365022877747257593702868830280775001242017493",
+        "used_ask_levels": [
+          {
+            "consumed_cost": 1.0,
+            "consumed_quantity": 2.4390243902439024,
+            "displayed_quantity": 1667.0,
+            "price": 0.41
+          }
+        ]
+      },
+      {
+        "brier": 0.12976550496705136,
+        "cost": 1.0,
+        "decision_at": "2026-10-17 23:42:43.539000+00:00",
+        "decision_id": "decision-f5842ec85c564e50b135f33280b53f66",
+        "execution_at": "2026-10-17 23:42:43.789000+00:00",
+        "gross_settlement_pnl": 0.8518518518518516,
+        "label_eligible": true,
+        "label_observed_at": "2026-10-18 08:09:27.228284+00:00",
+        "label_source": "gamma",
+        "limit_price": 0.54,
+        "market_id": "0x8af899e8ab9965549a7c217de0856061623d823c6a0f4894803dcccde3e4200f",
+        "modeled_fee": 0.0322,
+        "net_settlement_pnl": 0.8196518518518516,
+        "outcome": "NO",
+        "p_token": 0.6397702053313034,
+        "p_yes": 0.36022979466869665,
+        "payout": 1.8518518518518516,
+        "price": 0.54,
+        "quantity": 1.8518518518518516,
+        "raw_source_label": 0.0,
+        "reason": "matched",
+        "requested_cost": 1.0,
+        "resolved_at": null,
+        "resolved_yes": 0.0,
+        "source_snapshot_at": "2026-10-17 23:42:43.539000+00:00",
+        "source_snapshot_hash": "e108eb7e26596884edb1a88b4db62cc6aa6dddca",
+        "source_snapshot_id": 15528,
+        "status": "matched",
+        "token_id": "5919006265768730036007723585722125112972667175612491518607383681249631394486",
+        "used_ask_levels": [
+          {
+            "consumed_cost": 1.0,
+            "consumed_quantity": 1.8518518518518516,
+            "displayed_quantity": 4222.26,
+            "price": 0.54
+          }
+        ]
+      },
+      {
+        "brier": 0.16891950418528648,
+        "cost": 1.0,
+        "decision_at": "2026-10-17 23:57:57.578000+00:00",
+        "decision_id": "decision-13bd8495c38a4bb1a857de65f9914c12",
+        "execution_at": "2026-10-17 23:57:57.828000+00:00",
+        "gross_settlement_pnl": -1.0,
+        "label_eligible": true,
+        "label_observed_at": "2026-10-18 08:09:27.233735+00:00",
+        "label_source": "gamma",
+        "limit_price": 0.36,
+        "market_id": "0x34f22a5bef53c3e97c82c6270b371885f2f977be207747518a200fea4a5d1e8d",
+        "modeled_fee": 0.044800000000000006,
+        "net_settlement_pnl": -1.0448,
+        "outcome": "NO",
+        "p_token": 0.41099818027004265,
+        "p_yes": 0.5890018197299574,
+        "payout": 0.0,
+        "price": 0.36,
+        "quantity": 2.7777777777777777,
+        "raw_source_label": 1.0,
+        "reason": "matched",
+        "requested_cost": 1.0,
+        "resolved_at": null,
+        "resolved_yes": 1.0,
+        "source_snapshot_at": "2026-10-17 23:57:57.578000+00:00",
+        "source_snapshot_hash": "0a2236dddab3dbbf3f7f97a85d3af425bf53dbbb",
+        "source_snapshot_id": 16547,
+        "status": "matched",
+        "token_id": "60980721949327341201835755895396724490619546003430244442089854791858744239724",
+        "used_ask_levels": [
+          {
+            "consumed_cost": 1.0,
+            "consumed_quantity": 2.7777777777777777,
+            "displayed_quantity": 20891.69,
+            "price": 0.36
+          }
+        ]
+      }
+    ],
+    "resolution_public_response_projection": [
+      {
+        "fetched_at": "2026-10-18 08:09:27.219174+00:00",
+        "http_status": 200,
+        "markets": [
+          {
+            "conditionId": "0x361d0825fd5d45ed9f9fffca2764928f720727ea72d2576db6974c6d2de1fcba",
+            "question": "New York City FC vs. Los Angeles FC: Both Teams to Score",
+            "closed": true,
+            "umaResolutionStatus": "resolved",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"1\", \"0\"]",
+            "clobTokenIds": "[\"20723443914589606286229508059437014263092258091591741326631978319882039250836\", \"1030493650994977346532431338422365022877747257593702868830280775001242017493\"]",
+            "closedTime": "2026-10-18 03:37:48+00",
+            "endDate": "2026-11-05T00:30:00Z"
+          },
+          {
+            "conditionId": "0x8af899e8ab9965549a7c217de0856061623d823c6a0f4894803dcccde3e4200f",
+            "question": "Will Houston Dynamo win on 2026-10-17?",
+            "closed": true,
+            "umaResolutionStatus": "resolved",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0\", \"1\"]",
+            "clobTokenIds": "[\"38401037029655130592045908602211530328992656162112809356512287374196426528419\", \"5919006265768730036007723585722125112972667175612491518607383681249631394486\"]",
+            "closedTime": "2026-10-18 03:15:02+00",
+            "endDate": "2026-10-18T00:30:00Z"
+          },
+          {
+            "conditionId": "0x1df550a33fe4667c4a4d30f6d0287665021a6993d0cbb3bcedcb4dd3c2ea259e",
+            "question": "Will FC Dallas win on 2026-10-17?",
+            "closed": true,
+            "umaResolutionStatus": "resolved",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0\", \"1\"]",
+            "clobTokenIds": "[\"57100810526920260852796696973652310031471513841740183337522996181054667415246\", \"103096706028566766042909791851023775684186564798878459221752201817135387679232\"]",
+            "closedTime": "2026-10-18 03:15:02+00",
+            "endDate": "2026-10-18T00:30:00Z"
+          },
+          {
+            "conditionId": "0x34f22a5bef53c3e97c82c6270b371885f2f977be207747518a200fea4a5d1e8d",
+            "question": "Will Vancouver Whitecaps FC win on 2026-10-17?",
+            "closed": true,
+            "umaResolutionStatus": "resolved",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"1\", \"0\"]",
+            "clobTokenIds": "[\"110798278917739108171167175436523900439244912003048072637068121267599052575954\", \"60980721949327341201835755895396724490619546003430244442089854791858744239724\"]",
+            "closedTime": "2026-10-18 03:05:06+00",
+            "endDate": "2026-10-18T00:30:00Z"
+          },
+          {
+            "conditionId": "0xb111a0980090eebe0c345eff33b5e64edc8a9bbe8aee6b8c2edd3bec24239eb9",
+            "question": "Will CF América win on 2026-10-17?",
+            "closed": true,
+            "umaResolutionStatus": "resolved",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"1\", \"0\"]",
+            "clobTokenIds": "[\"103389021367012068901515502813628019296546347818901128621774878573514568662262\", \"54180087317241037654224063464196533885688096611456870924825520953000353359090\"]",
+            "closedTime": "2026-10-18 05:26:33+00",
+            "endDate": "2026-10-18T01:00:00Z"
+          },
+          {
+            "conditionId": "0xe918d4c0ddab7012183e98fd0cf604db916a0da72772d49edf7e81a3d8ee6fc6",
+            "question": "Exact Score: São Paulo FC 2 - 2 CR Vasco da Gama?",
+            "closed": true,
+            "umaResolutionStatus": "resolved",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0\", \"1\"]",
+            "clobTokenIds": "[\"101465107889483957129968040987319306695686186219319754045234717989650465706111\", \"5049509335388540963657732105653095390706774680409291001711363484688193236604\"]",
+            "closedTime": "2026-10-18 04:06:18+00",
+            "endDate": "2026-10-18T00:00:00Z"
+          },
+          {
+            "conditionId": "0xce2c3d408a3ffe6e625885b415af3ecf65eeba64f23ffa90fc141d6dda97a386",
+            "question": "US x Iran ceasefire continues through October 17?",
+            "closed": true,
+            "umaResolutionStatus": "resolved",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"1\", \"0\"]",
+            "clobTokenIds": "[\"76136086773721979642859940862292264934972834931434975992074705040536274369192\", \"95954370437617858516010466476736395051969674042469603208087881439839018700695\"]",
+            "closedTime": "2026-10-17 23:08:47+00",
+            "endDate": "2026-10-18T03:59:00Z"
+          },
+          {
+            "conditionId": "0x01df96c4f4d8af93e41d87039ef328d4edd3986076f345eb31ece0de30299e35",
+            "question": "Will Bitcoin dip to $80,000 on October 17?",
+            "closed": true,
+            "umaResolutionStatus": "resolved",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "outcomePrices": "[\"0\", \"1\"]",
+            "clobTokenIds": "[\"11628568885014249932232454764148473554538632406092821157240914619726844587755\", \"107885791958226473190150206674439229395104488201226161385074182694790439971069\"]",
+            "closedTime": "2026-10-18 04:12:35+00",
+            "endDate": "2026-10-18T04:00:00Z"
+          }
+        ]
+      }
+    ],
+    "source_copy_integrity": {
+      "book_levels": {
+        "rows": 36893,
+        "sha256": "dabf56f6e601079f37f744dc06f6d3ca39852795e9a0f4ed756b5b5dfae14938"
+      },
+      "book_snapshots": {
+        "rows": 638,
+        "sha256": "3347b5e5eb7875207fd08b56e2e591a67782067cf861bbfb871c12d507f31e24"
+      },
+      "market_resolutions": {
+        "rows": 1,
+        "sha256": "1a9d4a494cd52df22db083a1b2c87014244e20b91de0772ce40229f216ea7603"
+      },
+      "markets": {
+        "rows": 8,
+        "sha256": "cc2148558bd33d06d1fac8c1ae3180b6a0a26c8cad545174a917c0bf0ea6d40c"
+      },
+      "price_changes": {
+        "rows": 0,
+        "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      },
+      "tokens": {
+        "rows": 16,
+        "sha256": "dda9f1246573f54e3e5cb05ebd95ed27bded66183577d383f100c7fc45b6103b"
+      },
+      "trades": {
+        "rows": 44,
+        "sha256": "d3d0155faaea442e9b0ab36492f3a08fa31f60d6dab302ab2a48509dac60334c"
+      }
+    },
+    "final_data_hashes": {
+      "book_levels": {
+        "rows": 36893,
+        "sha256": "dabf56f6e601079f37f744dc06f6d3ca39852795e9a0f4ed756b5b5dfae14938"
+      },
+      "book_snapshots": {
+        "rows": 638,
+        "sha256": "3347b5e5eb7875207fd08b56e2e591a67782067cf861bbfb871c12d507f31e24"
+      },
+      "market_resolutions": {
+        "rows": 8,
+        "sha256": "6c50310da472332b10b977546b7417f7a464191e7f6e7e7ecd971ab2600d6637"
+      },
+      "markets": {
+        "rows": 8,
+        "sha256": "cc2148558bd33d06d1fac8c1ae3180b6a0a26c8cad545174a917c0bf0ea6d40c"
+      },
+      "price_changes": {
+        "rows": 0,
+        "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      },
+      "tokens": {
+        "rows": 16,
+        "sha256": "dda9f1246573f54e3e5cb05ebd95ed27bded66183577d383f100c7fc45b6103b"
+      },
+      "trades": {
+        "rows": 44,
+        "sha256": "d3d0155faaea442e9b0ab36492f3a08fa31f60d6dab302ab2a48509dac60334c"
+      }
+    }
+  },
+  "prospective_paper": {
+    "source_ref": "e68cbd216460202e89a316781c45c7626e2678cd",
+    "counts": {
+      "markets": 397,
+      "tokens": 794,
+      "book_snapshots": 8,
+      "book_levels": 630,
+      "price_changes": 1084,
+      "trades": 0,
+      "factor_values": 316,
+      "agent_factor_provenance": 10,
+      "decisions": 1,
+      "orders": 1,
+      "fills": 1,
+      "eval_records": 0,
+      "market_resolutions": 0
+    },
+    "fill_witness": {
+      "decision_id": "decision-3bb70e1b6afc4d32affd47ad65f144ee",
+      "fill_id": "paper-a1328d0e37434e86a8d724fc265c8ff1",
+      "order_id": "paper-a1328d0e37434e86a8d724fc265c8ff1",
+      "strategy_version_id": "40af3e2c0499597d59c410ae63e2165c9b75d156da22e1e1d9f0d4b7bcf190c6",
+      "factor_snapshot_hash": "d888e0abd5e78dcf29d56ab40403b5fe6ecb7c257dfc33c8d0a3789ea95a335c",
+      "agent_input_probability": 0.99,
+      "model_probability": 0.99,
+      "calibration_probability": 0.99,
+      "limit_and_fill_price": 0.978,
+      "quantity": 1.0224948875255624,
+      "notional_usdc": 1,
+      "modeled_fee_rate": 0.07,
+      "modeled_entry_fee_usdc": 0.0015400000000000014,
+      "execution_slippage_bps": 0,
+      "venue_event_at": "2026-10-18 08:03:24.751000+00:00",
+      "local_reception_at": "2026-10-18T08:03:30.036921+00:00",
+      "observed_event_age_at_reception_ms": 5285.921,
+      "stored_book_age_ms": 10.083,
+      "pnl_realized": null,
+      "brier": null
+    },
+    "open_position_bid_mark": {
+      "bid": 0.976,
+      "venue_event_at": "2026-10-18 08:05:12.073000+00:00",
+      "local_reception_at": "2026-10-18T08:05:17.416684+00:00",
+      "gross_unrealized_usdc": -0.002044989775051076,
+      "unrealized_after_modeled_entry_fee_usdc": -0.0035849897750510774,
+      "modeled_exit_fee_included": false,
+      "settled": false,
+      "funded": false
+    },
+    "fee_public_observation": {
+      "observed_at": "2026-10-18T07:58:06.239807+00:00",
+      "market_id": "0x7b0ac4dbaec820a12f16b7b3e01d5886bb08fef30a47fa9fb552854ed842c960",
+      "token_id": "36888865665513095383715642612443034294363634100237905155826596309559673963896",
+      "client": "PolymarketPublicBookClient.read_fee_rate_bps",
+      "fee_rate_bps": 1000.0
+    }
+  },
+  "fixed_lifecycle_probes": {
+    "actuator": [
+      {
+        "kind": "stop_with_stalled_actuator_storage",
+        "produced": 30,
+        "decision_queue_maxsize": 0,
+        "queue_before_stop": 10,
+        "queue_after_stop": 0,
+        "remaining_runner_tasks": 0,
+        "pool_size": 4,
+        "pool_idle": 4
+      },
+      {
+        "kind": "restart_without_new_source_events",
+        "new_source_produced": 0,
+        "previous_pending": 0,
+        "queue_after_restart": 0,
+        "old_market_simulated_fills": 0
+      },
+      {
+        "kind": "persisted_shutdown_statuses",
+        "statuses": [
+          {
+            "status": "cancelled",
+            "count": 10
+          },
+          {
+            "status": "submitted",
+            "count": 1
+          }
+        ]
+      },
+      {
+        "kind": "cleanup",
+        "new_pending_tasks": [],
+        "pool_closed": true
+      }
+    ],
+    "health": [
+      {
+        "kind": "decision_store_transient_failure",
+        "injected_errors": 1,
+        "produced": 175,
+        "controller_runtimes": [],
+        "controller_pipeline_tasks": [],
+        "pipeline_error": "ConnectionDoesNotExistError('injected single local decision-store connection failure')",
+        "worker_health": {
+          "factor_service": {
+            "state": "running",
+            "restarts": 0,
+            "last_error_class": null,
+            "last_transition_at": "2026-10-18 08:11:41.185171+00:00"
+          },
+          "controller-pipeline:paper_canary_v1": {
+            "state": "failed",
+            "restarts": 0,
+            "last_error_class": "ConnectionDoesNotExistError",
+            "last_transition_at": "2026-10-18 08:11:41.288818+00:00"
+          },
+          "sensor:0:HoldingSensor": {
+            "state": "running",
+            "restarts": 0,
+            "last_error_class": null,
+            "last_transition_at": "2026-10-18 08:11:41.243000+00:00"
+          },
+          "controller_dispatcher": {
+            "state": "running",
+            "restarts": 0,
+            "last_error_class": null,
+            "last_transition_at": "2026-10-18 08:11:41.243479+00:00"
+          },
+          "actuator": {
+            "state": "running",
+            "restarts": 0,
+            "last_error_class": null,
+            "last_transition_at": "2026-10-18 08:11:41.243502+00:00"
+          },
+          "decision_expiry": {
+            "state": "running",
+            "restarts": 0,
+            "last_error_class": null,
+            "last_transition_at": "2026-10-18 08:11:41.243510+00:00"
+          },
+          "runtime_heartbeat": {
+            "state": "running",
+            "restarts": 0,
+            "last_error_class": null,
+            "last_transition_at": "2026-10-18 08:11:41.243517+00:00"
+          }
+        },
+        "tag": "storage-failure-1792311100878679000",
+        "sql_decisions": 0,
+        "sql_opportunities": 1
+      },
+      {
+        "kind": "failure_api_visibility",
+        "status_http": 200,
+        "status": {
+          "mode": "paper",
+          "runner_started_at": "2026-10-18T08:11:41.170615+00:00",
+          "running": true,
+          "healthy": false,
+          "workers": {
+            "factor_service": {
+              "state": "running",
+              "restarts": 0,
+              "last_error_class": null
+            },
+            "controller-pipeline:paper_canary_v1": {
+              "state": "failed",
+              "restarts": 0,
+              "last_error_class": "ConnectionDoesNotExistError"
+            },
+            "sensor:0:HoldingSensor": {
+              "state": "running",
+              "restarts": 0,
+              "last_error_class": null
+            },
+            "controller_dispatcher": {
+              "state": "running",
+              "restarts": 0,
+              "last_error_class": null
+            },
+            "actuator": {
+              "state": "running",
+              "restarts": 0,
+              "last_error_class": null
+            },
+            "decision_expiry": {
+              "state": "running",
+              "restarts": 0,
+              "last_error_class": null
+            },
+            "runtime_heartbeat": {
+              "state": "running",
+              "restarts": 0,
+              "last_error_class": null
+            }
+          },
+          "autostart_attempted": false,
+          "autostart_error": null,
+          "runtime_continuity": {
+            "run_id": "b171d63107416afcfba792a3d3994152150305a027ecd3357eae63bdbc8dbfb4",
+            "source": "postgres_runtime_heartbeats",
+            "first_observed_at": "2026-10-18T08:11:41.243527+00:00",
+            "last_observed_at": "2026-10-18T08:11:41.243527+00:00",
+            "heartbeat_count": 1,
+            "healthy_days": 0,
+            "max_gap_seconds": 1.092468,
+            "unhealthy_heartbeat_count": 0,
+            "min_controller_runtimes": 1
+          },
+          "sensors": [
+            {
+              "name": "HoldingSensor",
+              "status": "running",
+              "last_signal_at": "2026-10-18T08:11:42.333000+00:00",
+              "last_signal_age_seconds": 0.005815,
+              "stale_after_seconds": 300.0,
+              "task_done": false
+            }
+          ],
+          "controller": {
+            "current_runtimes_total": 0,
+            "decisions_total": 0,
+            "diagnostics_total": 0,
+            "diagnostic_counts": {}
+          },
+          "actuator": {
+            "fills_total": 0,
+            "mode": "paper",
+            "halt_recovery_cycles_7d": 0,
+            "halted": false,
+            "halt_reason": null,
+            "halt_trigger_kind": null,
+            "halt_triggered_at": null
+          },
+          "evaluator": {
+            "eval_records_total": 0,
+            "brier_overall": null,
+            "baseline_brier_overall": null,
+            "brier_improvement_overall": null,
+            "brier_14d": null,
+            "baseline_brier_14d": null,
+            "brier_improvement_14d": null,
+            "resolution_sweeps_total": 0,
+            "resolution_fills_resolved_total": 0,
+            "resolution_sweep_failures_total": 0
+          },
+          "supervision": {
+            "unresolved_feedback_total": 0
+          },
+          "quality": {
+            "final_brier": {
+              "record_count": 0,
+              "brier_overall": null
+            },
+            "mark_to_market": {
+              "open_positions": 0,
+              "locked_usdc": 0.0,
+              "unrealized_pnl": 0.0
+            },
+            "quote_calibration": {
+              "record_count": 0,
+              "quote_score_overall": null,
+              "mtm_pnl": 0.0
+            }
+          }
+        },
+        "readiness_http": 503,
+        "readiness": {
+          "status": "not_ready",
+          "checks": {
+            "sensors": "ready",
+            "event_loop": "ready",
+            "workers": "not_ready",
+            "halt_subscriber": "disabled",
+            "eod_scheduler": "disabled"
+          },
+          "workers": {
+            "required": {
+              "actuator": "running",
+              "controller-pipeline:paper_canary_v1": "failed",
+              "controller_dispatcher": "running",
+              "factor_service": "running",
+              "runtime_heartbeat": "running",
+              "sensor:0:HoldingSensor": "running"
+            },
+            "dead": [
+              "controller-pipeline:paper_canary_v1"
+            ]
+          }
+        }
+      },
+      {
+        "kind": "recovered_api",
+        "healthy": true,
+        "readiness_http": 200
+      },
+      {
+        "kind": "explicit_restart_recovery",
+        "tag": "storage-recovered-1792311100878679000",
+        "produced": 100,
+        "simulated_fills": 100,
+        "pipeline_error": "None"
+      },
+      {
+        "kind": "cleanup",
+        "new_pending_tasks": [],
+        "pool_closed": true
+      }
+    ]
+  },
+  "coordinator_decimal_check": {
+    "net_pnl": "-2.992016719576719811",
+    "brier": "0.1862137609571238762335581398",
+    "rows": 6
+  },
+  "source_artifact_sha256": {
+    "pms-e2e-20261018-scored-final-quoted-result.json": "67a0974bb18a9792d55ebe5c09e2e6f441076c443e86377fb5ac1789637c305c",
+    "pms-e2e-20261018-scored-final-conservative-result.json": "070c2ef16beb230fa7d291cf7ea2505486b4da92f3452ac76b94d168df0aaec3",
+    "pms-e2e-20261018-scored-final-quoted-arithmetic.json": "05c2022bfc4087531b90fb64f549b2dcb585ddfe4f3918a2966809ef61b95dbb",
+    "pms-e2e-20261018-scored-final-data-hashes.json": "0d46866d90a93fd981bb72623afe56440e7a6c58f83fd189722bb68fa54fda07",
+    "pms-e2e-20261018-scored-source-hashes.json": "47d7be1a65bfa168f644539e00bb14b6a6c5067f2ab28150599a90119972404f",
+    "pms-e2e-20261018-scored-final-ingestion.json": "4e5b591f4a818972629016c4fdc993b15d82d267b7ca1d821ca8b5681a140852",
+    "pms-e2e-20261018-scored-final-network-http.json": "58db0962febc7358461c57bb468d770717955461e72019bee64d858670c49746",
+    "pms-e2e-20261018-paper-sample.json": "8a4a9c1447ab723933b08393682295ae30974d94b261800b5948a377c1044b18",
+    "pms-e2e-20261018-load-actuator-fixed.json": "4c56a3fb125f0da4ed7a90edb644075fde0cf5816846c07ba67dea28e955f560",
+    "pms-e2e-20261018-load-health-fixed.json": "582ac5b9a4c2d2d3bde6a9a7e672eac14603f109a996875c1846c3bfaa06794e"
+  }
+}

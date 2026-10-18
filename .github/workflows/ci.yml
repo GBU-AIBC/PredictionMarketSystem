@@ -59,6 +59,11 @@ jobs:
       - name: Run default pytest suite
         run: uv run pytest -q
 
+      - name: Run MCP optional-extra tests
+        run: |
+          uv sync --extra agent
+          uv run pytest -q tests/unit/test_agent_mcp.py
+
       - name: Run PostgreSQL integration tests
         timeout-minutes: 10
         env:

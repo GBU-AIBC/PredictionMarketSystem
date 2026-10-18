@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta
 import importlib
 import logging
@@ -852,3 +852,62 @@ async def test_market_selector_bypasses_book_query_when_book_filters_are_disable
             asset_ids=frozenset({"missing-book-yes", "missing-book-no"}),
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_explain_reuses_eligible_candidate_row_for_subscribed_market() -> None:
+    selector_module = importlib.import_module("pms.market_selection.selector")
+    market_selector_cls = getattr(selector_module, "MarketSelector")
+    candidate, tokens = _eligible_market(
+        "subscribed-candidate",
+        token_ids=("subscribed-yes", "subscribed-no"),
+        liquidity=500.0,
+    )
+
+    class FakeRegistry:
+        async def list_market_selections(
+            self,
+        ) -> list[tuple[str, str, MarketSelectionSpec]]:
+            return [
+                (
+                    "alpha",
+                    "alpha-v1",
+                    MarketSelectionSpec(
+                        venue="polymarket",
+                        resolution_time_max_horizon_days=7,
+                        volume_min_usdc=500.0,
+                        liquidity_min_usdc=400.0,
+                    ),
+                )
+            ]
+
+    class FakeSubscriptions:
+        async def read_user_subscriptions(self) -> set[str]:
+            return {"subscribed-yes"}
+
+    class FakeStore:
+        async def read_eligible_markets(
+            self,
+            venue: str,
+            max_horizon_days: int | None,
+            min_volume_usdc: float,
+        ) -> list[tuple[Market, list[Token]]]:
+            del venue, max_horizon_days, min_volume_usdc
+            return [(candidate, tokens)]
+
+        async def read_market(self, market_id: str) -> Market | None:
+            assert market_id == candidate.condition_id
+            return replace(candidate, liquidity=None)
+
+    selector = market_selector_cls(
+        store=FakeStore(),
+        registry=FakeRegistry(),
+        merge_policy=_load_symbol("pms.market_selection.merge", "UnionMergePolicy")(),
+        market_subscription_store=FakeSubscriptions(),
+    )
+
+    explanation = await selector.explain(candidate.condition_id)
+
+    assert explanation.strategy_reasons == {"alpha": "selected"}
+    assert "selected" in explanation.reasons
+    assert explanation.pinned_token_ids == ("subscribed-yes",)

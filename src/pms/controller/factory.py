@@ -1,33 +1,38 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal, cast
+from dataclasses import dataclass, field
 
 from pms.artifact_path_safety import (
     require_path_outside_working_tree,
     require_private_parent,
 )
-from pms.config import PMSSettings, RiskSettings
+from pms.config import LLMSettings, PMSSettings
 from pms.controller.calibrators.netcal import NetcalCalibrator
 from pms.controller.factor_snapshot import (
     FactorSnapshotReader,
     NullFactorSnapshotReader,
 )
 from pms.controller.forecasters.llm import (
+    EvidenceReader,
     LLMForecaster,
+    LLMReplayStore,
+    durable_spend_ledger_path,
     validate_llm_runtime_dependencies,
 )
 from pms.controller.forecasters.flb import FlbForecaster
 from pms.controller.forecasters.paper_canary import PaperCanaryForecaster
 from pms.controller.forecasters.rules import RulesForecaster
 from pms.controller.forecasters.statistical import StatisticalForecaster
+from pms.factors.catalog import is_agent_factor
 from pms.core.enums import RunMode
 from pms.controller.outcome_tokens import (
     NullOutcomeTokenResolver,
     OutcomeTokenResolver,
 )
-from pms.controller.pipeline import ControllerPipeline, DirectBookSnapshotReader
+from pms.controller.pipeline import ControllerPipeline, DirectBookSnapshotReader, HistoricalBookReader
 from pms.controller.router import Router
 from pms.controller.sizers.kelly import KellySizer
 from pms.core.interfaces import IForecaster
@@ -37,6 +42,7 @@ from pms.strategies.flb.artifacts import (
 )
 from pms.strategies.flb.source import load_flb_calibration_csv
 from pms.strategies.projections import ActiveStrategy, FactorCompositionStep
+from pms.strategies.economics import strategy_risk_settings
 
 
 @dataclass
@@ -49,6 +55,9 @@ class ControllerPipelineFactory:
         default_factory=NullOutcomeTokenResolver
     )
     direct_book_reader: DirectBookSnapshotReader | None = None
+    historical_book_reader: HistoricalBookReader | None = None
+    evidence_reader: EvidenceReader | None = None
+    replay_store: LLMReplayStore | None = None
 
     def build_many(
         self,
@@ -68,15 +77,19 @@ class ControllerPipelineFactory:
             factor_reader=self.factor_reader,
             outcome_token_resolver=self.outcome_token_resolver,
             direct_book_reader=self.direct_book_reader,
+            historical_book_reader=self.historical_book_reader,
             forecasters=self._build_forecasters(strategy),
             calibrator=NetcalCalibrator(),
             sizer=KellySizer(
-                risk=_risk_settings(
+                risk=strategy_risk_settings(
                     strategy,
                     fallback=self.settings.risk,
                 )
             ),
-            router=Router(self.settings.controller),
+            router=Router(
+                self.settings.controller,
+                allow_extreme_prices=self.settings.mode == RunMode.BACKTEST,
+            ),
             settings=self.settings,
         )
 
@@ -94,6 +107,12 @@ class ControllerPipelineFactory:
                 factor_composition=strategy.config.factor_composition,
                 strategy_id=strategy.strategy_id,
                 strategy_version_id=strategy.strategy_version_id,
+                evidence_reader=(
+                    self.evidence_reader if self.settings.mode != RunMode.LIVE else None
+                ),
+                replay_store=(
+                    self.replay_store if self.settings.mode != RunMode.LIVE else None
+                ),
             )
             for name, raw_params in strategy.forecaster.forecasters
         )
@@ -109,6 +128,8 @@ def _build_forecaster(
     factor_composition: tuple[FactorCompositionStep, ...],
     strategy_id: str,
     strategy_version_id: str,
+    evidence_reader: EvidenceReader | None = None,
+    replay_store: LLMReplayStore | None = None,
 ) -> IForecaster:
     params = dict(raw_params)
     if name == "rules":
@@ -130,14 +151,49 @@ def _build_forecaster(
             prior_strength=2.0 if prior_strength is None else float(prior_strength),
         )
     if name == "llm":
-        if raw_params:
-            msg = (
-                "LLMForecaster does not yet accept per-strategy params: "
-                f"{raw_params!r}"
+        allowed = {"model", "provider", "prompt_version", "max_tokens"}
+        unknown = set(params) - allowed
+        if unknown:
+            raise ValueError(
+                "LLMForecaster does not yet accept per-strategy params "
+                f"{sorted(unknown)!r}"
             )
-            raise ValueError(msg)
-        validate_llm_runtime_dependencies(settings.llm)
-        return LLMForecaster(config=settings.llm)
+        updates: dict[str, object] = {
+            key: value for key, value in params.items() if key in allowed
+        }
+        if "max_tokens" in updates:
+            updates["max_tokens"] = int(cast(str, updates["max_tokens"]))
+        llm_payload = {**settings.llm.model_dump(), **updates}
+        if llm_payload.get("spend_ledger_path") is None:
+            # Keep the restart-safe ledger scoped to the configured database,
+            # rather than placing a process/environment-shared file in HOME.
+            # API keys are deliberately excluded from this identity.
+            llm_payload["spend_ledger_path"] = durable_spend_ledger_path(
+                database_dsn=settings.database.dsn,
+                data_path=settings.live_emergency_audit_path,
+                scope=settings.mode.value,
+            )
+        llm_config = LLMSettings.model_validate(llm_payload)
+        replay_mode = cast(
+            Literal["off", "record", "replay"],
+            {
+            RunMode.BACKTEST: "replay",
+            RunMode.PAPER: "record",
+            RunMode.LIVE: "off",
+            }[mode],
+        )
+        # Replay must be provider-free: a recorded response is sufficient and
+        # the optional SDK/credentials may not exist in research environments.
+        if replay_mode != "replay":
+            validate_llm_runtime_dependencies(llm_config)
+        return LLMForecaster(
+            config=llm_config,
+            record_replay_mode=replay_mode,
+            evidence_reader=evidence_reader,
+            replay_store=replay_store,
+            strategy_id=strategy_id,
+            strategy_version_id=strategy_version_id,
+        )
     if name == "flb":
         if raw_params:
             msg = (
@@ -188,28 +244,13 @@ def _build_forecaster(
     raise ValueError(msg)
 
 
-def _risk_settings(
-    strategy: ActiveStrategy,
-    *,
-    fallback: RiskSettings,
-) -> RiskSettings:
-    return RiskSettings(
-        max_position_per_market=strategy.risk.max_position_notional_usdc,
-        max_total_exposure=fallback.max_total_exposure,
-        max_drawdown_pct=strategy.risk.max_daily_drawdown_pct,
-        max_daily_loss_usdc=fallback.max_daily_loss_usdc,
-        max_open_positions=fallback.max_open_positions,
-        max_exposure_per_risk_group=fallback.max_exposure_per_risk_group,
-        min_order_usdc=max(
-            strategy.risk.min_order_size_usdc,
-            fallback.min_order_usdc,
-        ),
-        slippage_threshold_bps=fallback.slippage_threshold_bps,
-        max_quantity_shares=fallback.max_quantity_shares,
-    )
-
-
 def _assert_strategy_mode_allowed(strategy: ActiveStrategy, *, mode: RunMode) -> None:
+    if mode == RunMode.LIVE and any(
+        _is_agent_factor(step.factor_id)
+        for step in strategy.config.factor_composition
+        if step.enabled
+    ):
+        raise ValueError("agent-owned factors are prohibited in LIVE mode")
     if mode != RunMode.LIVE:
         return
     metadata = dict(strategy.config.metadata)
@@ -240,6 +281,10 @@ def _assert_strategy_mode_allowed(strategy: ActiveStrategy, *, mode: RunMode) ->
 
 def _live_strategy_has_non_llm_forecaster(strategy: ActiveStrategy) -> bool:
     return any(name != "llm" for name, _raw_params in strategy.forecaster.forecasters)
+
+
+def _is_agent_factor(factor_id: str) -> bool:
+    return is_agent_factor(factor_id)
 
 
 def _assert_live_strategy_metadata_ready(

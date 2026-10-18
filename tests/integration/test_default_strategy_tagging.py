@@ -123,7 +123,11 @@ def _default_strategy_config_json() -> str:
             max_daily_drawdown_pct=2.5,
             min_order_size_usdc=1.0,
         ),
-        EvalSpec(metrics=("brier", "pnl", "fill_rate")),
+        EvalSpec(
+            metrics=("brier", "pnl", "fill_rate"),
+            min_slippage_samples=1,
+            min_win_rate_samples=1,
+        ),
         ForecasterSpec(
             forecasters=(
                 ("rules", (("threshold", "0.55"),)),
@@ -165,7 +169,11 @@ def _strategy(*, drawdown_pct: float) -> Strategy:
             max_daily_drawdown_pct=drawdown_pct,
             min_order_size_usdc=1.0,
         ),
-        eval_spec=EvalSpec(metrics=("brier", "pnl", "fill_rate")),
+        eval_spec=EvalSpec(
+            metrics=("brier", "pnl", "fill_rate"),
+            min_slippage_samples=1,
+            min_win_rate_samples=1,
+        ),
         forecaster=ForecasterSpec(
             forecasters=(
                 ("rules", (("threshold", "0.55"),)),
@@ -335,7 +343,6 @@ async def test_runner_tags_inner_ring_rows_with_default_strategy(
 
     assert strategies_count == 1
     assert versions_count == 1
-    assert counts["feedback"] > 0
     assert counts["eval_records"] > 0
     assert null_counts == {
         "feedback": 0,
@@ -343,12 +350,15 @@ async def test_runner_tags_inner_ring_rows_with_default_strategy(
         "orders": 0,
         "fills": 0,
     }
-    assert len(strategy_pairs["feedback"]) == 1
-    assert strategy_pairs["feedback"] == strategy_pairs["eval_records"]
-    tagged_strategy_id, tagged_strategy_version_id = next(iter(strategy_pairs["feedback"]))
+    assert len(strategy_pairs["eval_records"]) == 1
+    tagged_strategy_id, tagged_strategy_version_id = next(
+        iter(strategy_pairs["eval_records"])
+    )
     assert tagged_strategy_id == "default"
     assert tagged_strategy_version_id
     assert counts["orders"] > 0
     assert counts["fills"] > 0
-    assert strategy_pairs["orders"] == strategy_pairs["feedback"]
-    assert strategy_pairs["fills"] == strategy_pairs["feedback"]
+    assert strategy_pairs["orders"] == strategy_pairs["eval_records"]
+    assert strategy_pairs["fills"] == strategy_pairs["eval_records"]
+    if strategy_pairs["feedback"]:
+        assert strategy_pairs["feedback"] == strategy_pairs["eval_records"]

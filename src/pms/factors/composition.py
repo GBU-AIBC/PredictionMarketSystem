@@ -1,7 +1,31 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from math import isclose, isfinite
 from typing import Protocol
+
+from pms.core.validation import validate_finite
+from pms.factors.catalog import FACTOR_CATALOG_ROWS, catalog_entry
+
+
+COMPOSITION_ROLES = frozenset(
+    {
+        "weighted",
+        "precedence_rank",
+        "threshold_edge",
+        "posterior_prior",
+        "posterior_success",
+        "posterior_failure",
+        "rule_delta",
+        "runtime_probability",
+        "blend_weighted",
+    }
+)
+COMPOSITION_PSEUDO_FACTORS = frozenset({"yes_price", "subset_price", "rules", "statistical", "llm"})
+# Existing registry fixtures use these neutral placeholders to exercise JSON
+# round-tripping.  They are retained for back-compat; production installers
+# still validate against the catalog before activation.
+_LEGACY_BACKCOMPAT_FACTOR_IDS = frozenset({"factor-a", "factor-b"})
 
 
 class FactorCompositionStep(Protocol):
@@ -33,39 +57,67 @@ class FactorCompositionStep(Protocol):
     def enabled(self) -> bool: ...
 
 
+def validate_composition(composition: Sequence[FactorCompositionStep]) -> None:
+    """Validate composition references before a strategy can be registered."""
+
+    known_factor_ids = {
+        entry.factor_id
+        for entry in FACTOR_CATALOG_ROWS
+        if entry.owner != "deferred"
+    } | COMPOSITION_PSEUDO_FACTORS | _LEGACY_BACKCOMPAT_FACTOR_IDS
+    for step in composition:
+        if step.role not in COMPOSITION_ROLES:
+            raise ValueError(f"unknown composition role: {step.role!r}")
+        if step.factor_id not in known_factor_ids:
+            raise ValueError(f"unknown composition factor id: {step.factor_id!r}")
+        if (
+            step.factor_id == "orderbook_imbalance"
+            and step.role == "threshold_edge"
+        ):
+            raise ValueError(
+                "orderbook_imbalance is a raw depth factor, not a probability edge; "
+                "scale it through a strategy rule_delta step"
+            )
+
+
 def apply_composition(
     composition: Sequence[FactorCompositionStep],
     factor_values: Mapping[tuple[str, str], float],
 ) -> float:
+    # Validate the complete input boundary before any threshold comparison.
+    # ``abs(nan) < threshold`` is false and would otherwise let NaN reach the
+    # probability clamp where Python's min/max turn it into 0.999999.
+    for key, value in factor_values.items():
+        validate_finite(value, field_name=f"factor {key[0]}:{key[1]}")
     composition = _enabled_steps(composition)
     weighted_steps = _eligible_weighted_steps(composition, factor_values)
     non_weighted_steps = tuple(step for step in composition if step.role != "weighted")
     if weighted_steps and not non_weighted_steps:
-        return _apply_weighted(weighted_steps, factor_values)
+        return _bounded_probability(_apply_weighted(weighted_steps, factor_values))
 
     branch_probabilities = evaluate_branch_probabilities(composition, factor_values)
     blended_probability = _apply_blend_weighted(composition, branch_probabilities)
     if blended_probability is not None:
-        return blended_probability
+        return _bounded_probability(blended_probability)
 
     precedence_probability = branch_probabilities.get("rules")
     if precedence_probability is not None:
-        return precedence_probability
+        return _bounded_probability(precedence_probability)
 
     posterior_probability = branch_probabilities.get("statistical")
     if posterior_probability is not None:
-        return posterior_probability
+        return _bounded_probability(posterior_probability)
 
     runtime_probability = _first_runtime_probability(composition, branch_probabilities)
     if runtime_probability is not None:
-        return runtime_probability
+        return _bounded_probability(runtime_probability)
 
     if weighted_steps:
-        return _apply_weighted(weighted_steps, factor_values)
+        return _bounded_probability(_apply_weighted(weighted_steps, factor_values))
 
     fallback = factor_values.get(("yes_price", ""))
     if fallback is not None:
-        return fallback
+        return _bounded_probability(fallback)
 
     msg = "composition could not resolve a probability"
     raise KeyError(msg)
@@ -87,7 +139,7 @@ def _eligible_weighted_steps(
         threshold = threshold_gates.get((step.factor_id, step.param))
         if threshold is not None:
             value = factor_values.get((step.factor_id, step.param))
-            if value is None or abs(value) < threshold:
+            if value is None or _below_threshold(value, threshold):
                 continue
         eligible_steps.append(step)
     return tuple(eligible_steps)
@@ -97,6 +149,8 @@ def evaluate_branch_probabilities(
     composition: Sequence[FactorCompositionStep],
     factor_values: Mapping[tuple[str, str], float],
 ) -> dict[str, float]:
+    for key, value in factor_values.items():
+        validate_finite(value, field_name=f"factor {key[0]}:{key[1]}")
     composition = _enabled_steps(composition)
     branch_probabilities: dict[str, float] = {}
 
@@ -181,22 +235,26 @@ def _apply_threshold_precedence(
 
         threshold = 0.0 if step.threshold is None else step.threshold
         if step.factor_id == "fair_value_spread":
-            if abs(edge) < threshold:
+            if _below_threshold(edge, threshold):
                 continue
-            return _required_factor_value(factor_values, "yes_price", "") + edge
+            return _bounded_probability(
+                _required_factor_value(factor_values, "yes_price", "") + edge
+            )
         if step.factor_id == "subset_pricing_violation":
             if edge < threshold:
                 continue
-            return _required_factor_value(factor_values, "subset_price", "") - edge
+            return _bounded_probability(
+                _required_factor_value(factor_values, "subset_price", "") - edge
+            )
         if step.factor_id == "orderbook_imbalance":
             msg = (
                 "orderbook_imbalance is a raw depth factor, not a probability "
                 "edge; scale it through a strategy rule_delta step"
             )
             raise ValueError(msg)
-        if abs(edge) < threshold:
+        if _below_threshold(edge, threshold):
             continue
-        return edge
+        return _bounded_probability(edge)
 
     return None
 
@@ -217,7 +275,9 @@ def _apply_rule_delta(
         if factor_value is None:
             continue
         delta = _rule_delta(step.factor_id, factor_value, market_price=yes_price)
-        if step.threshold is not None and abs(delta) < step.threshold:
+        if delta == 0.0:
+            continue
+        if step.threshold is not None and _below_threshold(delta, step.threshold):
             continue
         probability += step.weight * delta
         applied = True
@@ -263,11 +323,16 @@ def _rule_delta(
     *,
     market_price: float,
 ) -> float:
-    if factor_id == "metaculus_prior":
+    if _catalog_output_type(factor_id) == "probability":
         return factor_value - market_price
     if factor_id == "subset_pricing_violation":
         return -factor_value
     return factor_value
+
+
+def _catalog_output_type(factor_id: str) -> str | None:
+    entry = catalog_entry(factor_id)
+    return None if entry is None else entry.output_type
 
 
 def _first_runtime_probability(
@@ -350,4 +415,14 @@ def _required_factor_value(
 
 
 def _bounded_probability(value: float) -> float:
+    if not isfinite(value):
+        raise ValueError("probability must be finite")
     return max(1e-6, min(1.0 - 1e-6, value))
+
+
+def _below_threshold(value: float, threshold: float) -> bool:
+    """Compare a gate with a tiny tolerance for binary-float boundaries."""
+
+    return abs(value) < threshold and not isclose(
+        abs(value), threshold, rel_tol=0.0, abs_tol=1e-12
+    )

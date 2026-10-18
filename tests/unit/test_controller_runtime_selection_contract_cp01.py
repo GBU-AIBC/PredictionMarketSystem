@@ -8,12 +8,13 @@ from typing import Any
 
 import pytest
 
-from pms.config import ControllerSettings, RiskSettings
+from pms.config import ControllerSettings, PMSSettings, RiskSettings
 from pms.controller.calibrators.netcal import NetcalCalibrator
 from pms.controller.pipeline import ControllerPipeline
 from pms.controller.router import Router
 from pms.controller.sizers.kelly import KellySizer
 from pms.core.models import MarketSignal, Portfolio
+from pms.core.enums import RunMode
 from pms.strategies.projections import (
     ActiveStrategy,
     EvalSpec,
@@ -189,6 +190,16 @@ async def test_controller_pipeline_uses_strategy_factor_composition_not_forecast
     opportunity, decision = emission
     assert decision.prob_estimate == pytest.approx(0.72)
     assert decision.expected_edge == pytest.approx(0.32)
+    assert [result["probability"] for result in pipeline.last_forecaster_results] == [
+        pytest.approx(0.10),
+        pytest.approx(0.90),
+    ]
+    assert [result["name"] for result in pipeline.last_forecaster_results] == ["rules", "llm"]
+    assert {outcome["name"] for outcome in pipeline.last_gate_outcomes} >= {
+        "router",
+        "factor_gates",
+    }
+    assert all(outcome["passed"] is True for outcome in pipeline.last_gate_outcomes)
     assert opportunity.expected_edge == pytest.approx(0.32)
     assert opportunity.selected_factor_values == {
         "orderbook_imbalance": pytest.approx(0.0),
@@ -232,6 +243,41 @@ async def test_controller_pipeline_uses_strategy_factor_composition_not_forecast
             "strategy_version_id": "alpha-v1",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_controller_pipeline_drops_non_finite_factor_without_decision() -> None:
+    factor_snapshot_cls = _load_symbol(
+        "pms.controller.factor_snapshot",
+        "FactorSnapshot",
+    )
+    strategy = _active_strategy(
+        factor_composition=(
+            _step("snapshot_probability", role="runtime_probability"),
+        ),
+        forecaster_names=("rules",),
+    )
+    pipeline = ControllerPipeline(
+        strategy=strategy,
+        factor_reader=RecordingFactorReader(
+            factor_snapshot_cls(
+                values={("snapshot_probability", ""): float("nan")},
+                missing_factors=(),
+                snapshot_hash="nan-factor",
+            )
+        ),
+        forecasters=(StaticForecaster(0.7),),
+        calibrator=NetcalCalibrator(),
+        sizer=KellySizer(risk=RiskSettings(max_position_per_market=100.0)),
+        router=Router(ControllerSettings(min_volume=0.0)),
+        settings=PMSSettings(mode=RunMode.PAPER),
+    )
+
+    emission = await pipeline.on_signal(_signal(), portfolio=_portfolio())
+
+    assert emission is None
+    assert pipeline.last_diagnostic is not None
+    assert pipeline.last_diagnostic.code == "composition_resolution_failed"
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from hashlib import sha256
 import json
 import math
@@ -9,6 +9,21 @@ from typing import Literal
 from typing import Any, cast
 
 import asyncpg
+
+from pms.core.validation import (
+    notional_matches_quantity_price,
+    validate_finite,
+    validate_positive,
+    validate_price,
+)
+
+
+_CREATE_FILL_PAYLOADS_TABLE = """
+CREATE TABLE IF NOT EXISTS fill_payloads (
+    fill_id TEXT PRIMARY KEY REFERENCES fills(fill_id) ON DELETE CASCADE,
+    payload JSONB NOT NULL
+)
+"""
 
 
 SubmissionUnknownResolutionStatus = Literal["filled", "not_found", "open"]
@@ -80,6 +95,12 @@ class SubmissionUnknownReconciliationStore:
         status: SubmissionUnknownResolutionStatus,
         reconciled_by: str,
         note: str | None = None,
+        fill_price: float | None = None,
+        fill_notional_usdc: float | None = None,
+        fill_quantity: float | None = None,
+        filled_at: datetime | None = None,
+        fees: float | None = None,
+        fee_bps: int | None = None,
     ) -> bool:
         normalized_decision_id = normalize_submission_unknown_decision_id(decision_id)
         normalized_venue_order_id = normalize_submission_unknown_venue_order_id(
@@ -89,6 +110,57 @@ class SubmissionUnknownReconciliationStore:
         normalized_reconciled_by = normalize_submission_unknown_reconciled_by(
             reconciled_by
         )
+        has_fill_evidence = any(
+            value is not None
+            for value in (
+                fill_price,
+                fill_notional_usdc,
+                fill_quantity,
+                filled_at,
+                fees,
+                fee_bps,
+            )
+        )
+        if status == "filled" and not has_fill_evidence and isinstance(
+            self.pool,
+            asyncpg.Pool,
+        ):
+            raise ValueError(
+                "filled reconciliation requires fill_price, "
+                "fill_notional_usdc, and fill_quantity"
+            )
+        if status == "filled" and has_fill_evidence:
+            if fill_price is None or fill_notional_usdc is None or fill_quantity is None:
+                raise ValueError(
+                    "filled reconciliation requires fill_price, "
+                    "fill_notional_usdc, and fill_quantity"
+                )
+            fill_price = validate_price(fill_price, field_name="fill_price")
+            fill_notional_usdc = validate_positive(
+                fill_notional_usdc,
+                field_name="fill_notional_usdc",
+            )
+            fill_quantity = validate_positive(
+                fill_quantity,
+                field_name="fill_quantity",
+            )
+            if fees is not None:
+                fees = validate_finite(fees, field_name="fees")
+                if fees < 0.0:
+                    raise ValueError("fees must be >= 0")
+            if fee_bps is not None:
+                fee_bps = int(validate_finite(fee_bps, field_name="fee_bps"))
+                if fee_bps < 0:
+                    raise ValueError("fee_bps must be >= 0")
+            if not notional_matches_quantity_price(
+                quantity=fill_quantity,
+                notional=fill_notional_usdc,
+                price=fill_price,
+            ):
+                raise ValueError(
+                    "fill_notional_usdc does not match fill_quantity * fill_price"
+                )
+            filled_at = filled_at or datetime.now(tz=UTC)
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 row = await connection.fetchrow(
@@ -118,6 +190,22 @@ class SubmissionUnknownReconciliationStore:
                 )
                 if row is None:
                     return False
+                if status == "filled" and has_fill_evidence:
+                    assert venue_order_id is not None
+                    assert fill_price is not None
+                    assert fill_notional_usdc is not None
+                    assert fill_quantity is not None
+                    await _insert_reconciled_fill(
+                        connection,
+                        decision_id=normalized_decision_id,
+                        venue_order_id=venue_order_id,
+                        fill_price=fill_price,
+                        fill_notional_usdc=fill_notional_usdc,
+                        fill_quantity=fill_quantity,
+                        filled_at=filled_at or datetime.now(tz=UTC),
+                        fees=fees,
+                        fee_bps=fee_bps,
+                    )
                 decision_status = await connection.execute(
                     """
                     UPDATE decisions
@@ -276,6 +364,93 @@ def _command_tag_row_count(status: str) -> int | None:
         return int(parts[-1])
     except ValueError:
         return None
+
+
+async def _insert_reconciled_fill(
+    connection: asyncpg.Connection,
+    *,
+    decision_id: str,
+    venue_order_id: str,
+    fill_price: float,
+    fill_notional_usdc: float,
+    fill_quantity: float,
+    filled_at: datetime,
+    fees: float | None,
+    fee_bps: int | None,
+) -> None:
+    """Insert the venue-confirmed fill exactly once inside reconciliation."""
+    await connection.execute(_CREATE_FILL_PAYLOADS_TABLE)
+    fill_id = f"reconciled:{decision_id}:{venue_order_id}"
+    await connection.execute(
+        """
+        INSERT INTO fills (
+            fill_id, order_id, market_id, ts, fill_notional_usdc,
+            fill_quantity, strategy_id, strategy_version_id
+        )
+        SELECT
+            $1::text,
+            $2::text,
+            decision_payloads.payload->>'market_id',
+            $3::timestamptz,
+            $4::double precision,
+            $5::double precision,
+            decisions.strategy_id,
+            decisions.strategy_version_id
+        FROM decisions
+        LEFT JOIN decision_payloads
+            ON decision_payloads.decision_id = decisions.decision_id
+        WHERE decisions.decision_id = $6::text
+        ON CONFLICT (fill_id) DO NOTHING
+        """,
+        fill_id,
+        venue_order_id,
+        filled_at,
+        fill_notional_usdc,
+        fill_quantity,
+        decision_id,
+    )
+    await connection.execute(
+        """
+        INSERT INTO fill_payloads (fill_id, payload)
+        SELECT
+            $1::text,
+            jsonb_build_object(
+                'trade_id', $1::text,
+                'decision_id', $2::text,
+                'token_id', decision_payloads.payload->>'token_id',
+                'venue', COALESCE(decision_payloads.payload->>'venue', 'polymarket'),
+                'side', COALESCE(
+                    decision_payloads.payload->>'action',
+                    decision_payloads.payload->>'side',
+                    'BUY'
+                ),
+                'fill_price', $3::double precision,
+                'executed_at', $4::text,
+                'status', 'filled',
+                'anomaly_flags', jsonb_build_array(
+                    'reconciled_from_submission_unknown',
+                    'execution_slippage_bps=0.000000000',
+                    'run_mode=live'
+                ),
+                'fee_bps', $5::integer,
+                'fees', $6::double precision,
+                'liquidity_side', NULL,
+                'transaction_ref', $7::text,
+                'resolved_outcome', NULL,
+                'risk_group_id', decision_payloads.payload->'risk_group_id'
+            )
+        FROM decision_payloads
+        WHERE decision_payloads.decision_id = $2::text
+        ON CONFLICT (fill_id) DO NOTHING
+        """,
+        fill_id,
+        decision_id,
+        fill_price,
+        filled_at.isoformat(),
+        fee_bps,
+        fees,
+        venue_order_id,
+    )
 
 
 def _live_order_record_from_row(row: asyncpg.Record) -> LiveOrderReconciliationRecord:

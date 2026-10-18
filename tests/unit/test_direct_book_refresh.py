@@ -9,6 +9,7 @@ import pytest
 from pms.config import ControllerSettings, PMSSettings
 from pms.core.models import BookLevel, BookSnapshot
 from pms.runner import _controller_direct_book_reader
+from pms.core.enums import RunMode
 from pms.sensor.adapters.direct_book import (
     PolymarketPublicBookClient,
     RefreshingDirectBookSnapshotReader,
@@ -271,6 +272,7 @@ def test_venue_book_from_clob_payload_rejects_token_mismatch() -> None:
 def test_runner_direct_book_reader_wraps_store_when_refresh_enabled() -> None:
     store = cast(PostgresMarketDataStore, object())
     settings = PMSSettings(
+        mode=RunMode.PAPER,
         controller=ControllerSettings(
             max_book_age_ms=15_000.0,
             venue_book_refresh_enabled=True,
@@ -290,6 +292,6 @@ def test_runner_direct_book_reader_wraps_store_when_refresh_enabled() -> None:
 def test_runner_direct_book_reader_keeps_plain_store_by_default() -> None:
     store = cast(PostgresMarketDataStore, object())
 
-    reader = _controller_direct_book_reader(PMSSettings(), store)
+    reader = _controller_direct_book_reader(PMSSettings(mode=RunMode.PAPER), store)
 
     assert reader is store

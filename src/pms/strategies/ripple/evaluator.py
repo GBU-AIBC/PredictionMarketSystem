@@ -182,6 +182,14 @@ def _posterior_from_candidate(
         "metaculus_prior",
     )
     has_metaculus_prior = prior_probability is not None
+    missing_factors = _metadata_string_tuple(candidate.metadata, "missing_factors")
+    stale_factors = _metadata_string_tuple(candidate.metadata, "stale_factors")
+    source = candidate.metadata.get("source")
+    has_provenance = (
+        source != "live_factor_service"
+        or bool(candidate.metadata.get("factor_snapshot_hash"))
+        or any(ref.startswith("factor_snapshot:") for ref in candidate.evidence_refs)
+    )
     prior_strength = _optional_metadata_float(
         candidate.metadata,
         "prior_strength",
@@ -215,14 +223,43 @@ def _posterior_from_candidate(
         prior_strength=prior_strength,
         yes_count=yes_count,
         no_count=no_count,
-        degraded=not has_metaculus_prior,
+        degraded=(
+            not has_metaculus_prior
+            or bool(missing_factors)
+            or bool(stale_factors)
+            or not has_provenance
+        ),
     )
+    if (
+        has_metaculus_prior
+        and (
+            bool(missing_factors)
+            or bool(stale_factors)
+            or not has_provenance
+        )
+    ):
+        # A degraded posterior is never eligible for a trade.  Keep the
+        # diagnostic confidence value, but force the evaluator's existing
+        # confidence gate to reject it.
+        confidence = 0.0
     return RipplePosterior(
         posterior_probability=posterior_probability,
         expected_edge=posterior_probability - limit_price,
         confidence=confidence,
         entry_edge_threshold=threshold,
     )
+
+
+def _metadata_string_tuple(
+    metadata: Mapping[str, Any],
+    field_name: str,
+) -> tuple[str, ...]:
+    value = metadata.get(field_name, ())
+    if value is None:
+        return ()
+    if not isinstance(value, tuple) or any(not isinstance(item, str) for item in value):
+        raise TypeError(f"{field_name} must be a tuple of strings")
+    return cast(tuple[str, ...], value)
 
 
 def _optional_metadata_float(

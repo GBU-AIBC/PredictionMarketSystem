@@ -56,6 +56,15 @@ def test_router_gate_reason_returns_none_when_signal_passes_all_gates() -> None:
     assert Router().gate_reason(_signal()) is None
 
 
+def test_backtest_router_allows_resolved_price_extremes() -> None:
+    router = Router(allow_extreme_prices=True)
+    assert router.gate_reason(_signal(yes_price=0.0)) is None
+    assert router.gate_reason(_signal(yes_price=1.0)) is None
+    assert router.gate_reason(_signal(yes_price=0.999)) is None
+    assert router.gate_reason(_signal(yes_price=-0.001)) == "yes_price_out_of_band"
+    assert router.gate_reason(_signal(yes_price=1.001)) == "yes_price_out_of_band"
+
+
 def test_router_gate_reason_names_each_specific_gate_failure() -> None:
     now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
     router_default = Router()

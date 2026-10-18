@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class Router:
     controller: ControllerSettings = field(default_factory=ControllerSettings)
+    allow_extreme_prices: bool = False
 
     def gate(self, signal: MarketSignal) -> bool:
         reason = self.gate_reason(signal)
@@ -37,10 +38,12 @@ class Router:
             and signal.volume_24h < self.controller.min_volume
         ):
             return "min_volume_too_low"
-        if (
-            not isfinite(signal.yes_price)
-            or signal.yes_price < 0.02
-            or signal.yes_price > 0.98
+        if not isfinite(signal.yes_price):
+            return "yes_price_out_of_band"
+        if signal.yes_price < 0.0 or signal.yes_price > 1.0:
+            return "yes_price_out_of_band"
+        if not self.allow_extreme_prices and (
+            signal.yes_price < 0.02 or signal.yes_price > 0.98
         ):
             return "yes_price_out_of_band"
         if signal.resolves_at is not None and signal.resolves_at <= signal.timestamp:
@@ -59,9 +62,10 @@ class Router:
         return None
 
     def stop_conditions(self, signal: MarketSignal) -> list[str]:
+        price_band = "0.00-1.00" if self.allow_extreme_prices else "0.02-0.98"
         conditions = [
             f"min_volume:{self.controller.min_volume:.2f}",
-            "near_resolution_price_band:0.02-0.98",
+            f"near_resolution_price_band:{price_band}",
         ]
         if signal.resolves_at is not None:
             conditions.append(f"resolves_at:{signal.resolves_at.isoformat()}")

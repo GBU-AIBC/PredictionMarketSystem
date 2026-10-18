@@ -22,8 +22,10 @@ from pms.evaluation.resolution import (
 )
 from pms.evaluation.spool import EvalSpool
 from pms.runner import Runner
+from pms.research.replay import MarketUniverseReplayEngine, _MarketMetadata
 from pms.storage.eval_store import EvalStore
 from pms.storage.fill_store import FillStore
+from pms.storage.market_resolution_store import MarketResolutionStore
 from tests.support.fake_stores import InMemoryEvalStore
 
 
@@ -155,6 +157,14 @@ class FakeResolutionSource:
         return dict(self.resolutions)
 
 
+class FailingResolutionStore:
+    available = False
+
+    async def upsert(self, *_args: Any, **_kwargs: Any) -> None:
+        if not self.available:
+            raise RuntimeError("resolution persistence unavailable")
+
+
 class RecordingEvalSpool:
     def __init__(
         self,
@@ -270,6 +280,40 @@ async def test_sweep_routes_resolved_fill_through_eval_spool_and_hooks() -> None
     # The post-append hook fired: the Evaluator->Controller feedback edge
     # stays live for swept records.
     assert feedback_generator.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_resolution_persistence_failure_keeps_fill_retryable() -> None:
+    fill_store = FakeResolutionFillStore([_fill()])
+    spool = RecordingEvalSpool()
+    source = FakeResolutionSource({"0xmarket-1": 1.0})
+    sweeper = _sweeper(
+        fill_store=fill_store,
+        eval_spool=spool,
+        source=source,
+        decisions={
+            "d-res-1": _StoredDecision(
+                decision=_decision(),
+                decision_evidence={},
+            )
+        },
+    )
+    resolution_store = FailingResolutionStore()
+    sweeper.resolution_store = resolution_store
+    result = await sweeper.sweep_once()
+    assert result.persistence_failures == 1
+    assert result.fills_resolved == 0
+    assert result.eval_records_appended == 0
+    assert fill_store.fills["fill-res-1"].resolved_outcome is None
+    assert spool.processed == []
+
+    resolution_store.available = True
+    retried = await sweeper.sweep_once()
+    assert retried.persistence_failures == 0
+    assert retried.fills_resolved == 1
+    assert retried.eval_records_appended == 1
+    assert source.calls == [["0xmarket-1"], ["0xmarket-1"]]
+    assert fill_store.fills["fill-res-1"].resolved_outcome == 1.0
 
 
 class _CallLogEvalStore(InMemoryEvalStore):
@@ -660,6 +704,79 @@ async def test_gamma_resolution_source_parses_settled_closed_markets() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("timestamp_key", ["resolvedAt", "resolved_at", "resolutionDate"])
+async def test_gamma_resolution_source_retains_resolution_timestamp(
+    timestamp_key: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    **_gamma_market_row("0xresolved-at", closed=True),
+                    timestamp_key: "2099-03-01T00:00:00Z",
+                    "endDate": "2026-03-01T00:00:00Z",
+                }
+            ],
+        )
+
+    async with _gamma_client(handler) as client:
+        source = GammaResolutionSource(http_client=client)
+        assert await source.fetch_resolutions(["0xresolved-at"]) == {
+            "0xresolved-at": 1.0
+        }
+    assert source.resolved_at_by_market["0xresolved-at"] == datetime(
+        2099, 3, 1, tzinfo=UTC
+    )
+    engine = MarketUniverseReplayEngine()
+    engine._market_metadata_cache["0xresolved-at"] = _MarketMetadata(
+        title="explicit future resolution", venue="polymarket", resolves_at=None,
+        resolved_outcome=1.0,
+        resolved_at=source.resolved_at_by_market["0xresolved-at"],
+        observed_at=datetime(2026, 3, 1, tzinfo=UTC),
+    )
+    assert engine.resolution_for(
+        "0xresolved-at", as_of=datetime(2026, 3, 2, tzinfo=UTC),
+    ) is None
+
+
+@pytest.mark.parametrize("end_date", ["2026-03-01T00:00:00Z", "2099-03-01T00:00:00Z"])
+async def test_gamma_scheduled_end_date_does_not_backdate_resolution_availability(
+    end_date: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json=[{
+            **_gamma_market_row("0xobserved", closed=True),
+            "endDate": end_date,
+            "closedTime": "2026-03-01 00:00:00+00",
+        }])
+
+    before = datetime.now(tz=UTC)
+    async with _gamma_client(handler) as client:
+        source = GammaResolutionSource(http_client=client)
+        assert await source.fetch_resolutions(["0xobserved"]) == {"0xobserved": 1.0}
+    assert source.resolved_at_by_market["0xobserved"] is None
+    connection = _RecordingConnection()
+    await MarketResolutionStore(pool=cast(Any, connection)).upsert(
+        "0xobserved", resolved_outcome=1.0,
+        resolved_at=source.resolved_at_by_market["0xobserved"], source="gamma",
+    )
+    _, args = connection.execute_calls[0]
+    assert args[2] is None
+    observed_at = cast(datetime, args[4])
+    assert before <= observed_at <= datetime.now(tz=UTC)
+    engine = MarketUniverseReplayEngine()
+    engine._market_metadata_cache["0xobserved"] = _MarketMetadata(
+        title="first observed resolution", venue="polymarket", resolves_at=None,
+        resolved_outcome=1.0, resolved_at=None, observed_at=observed_at,
+    )
+    assert engine.resolution_for("0xobserved", as_of=before) is None
+    assert engine.resolution_for("0xobserved", as_of=observed_at) == 1.0
+
+
+@pytest.mark.asyncio
 async def test_gamma_resolution_source_query_pins_closed_true_and_explicit_limit() -> None:
     """Pins the outbound query-string contract, not a MockTransport echo.
 
@@ -987,6 +1104,7 @@ async def test_resolution_sweep_loop_survives_transient_errors(
             fills_resolved=1,
             eval_records_appended=1,
             fills_failed=1 if calls == 2 else 0,
+            persistence_failures=1 if calls == 2 else 0,
         )
 
     monkeypatch.setattr(runner, "_resolution_sweep_once", flaky_sweep_once)
@@ -1002,7 +1120,7 @@ async def test_resolution_sweep_loop_survives_transient_errors(
     # Failures must increment a counter so /status can distinguish "Gamma
     # down for a week" from healthy idle: whole-sweep exceptions count 1
     # each, and per-fill processing failures (fills_failed) add on top.
-    assert runner.resolution_sweep_failures_total == 2
+    assert runner.resolution_sweep_failures_total == 3
 
 
 def test_resolution_poll_interval_defaults_to_five_minutes() -> None:

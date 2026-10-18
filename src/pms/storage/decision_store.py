@@ -458,6 +458,7 @@ def _decision_payload(
         "intent_key": decision.intent_key,
         "risk_group_id": decision.risk_group_id,
         "spread_bps_at_decision": decision.spread_bps_at_decision,
+        "calibration_prob_estimate": decision.calibration_prob_estimate,
         "decision_evidence": (
             cast(dict[str, object], _json_safe(decision_evidence))
             if decision_evidence is not None
@@ -513,6 +514,9 @@ def _decision_from_payload(payload: Mapping[str, Any]) -> TradeDecision:
         intent_key=cast(str | None, payload.get("intent_key")),
         risk_group_id=cast(str | None, payload.get("risk_group_id")),
         spread_bps_at_decision=_optional_int(payload.get("spread_bps_at_decision")),
+        calibration_prob_estimate=_optional_float(
+            payload.get("calibration_prob_estimate")
+        ),
     )
 
 
@@ -589,3 +593,13 @@ def _optional_int(value: object) -> int | None:
     except (TypeError, ValueError):
         return None
     return int(round(numeric))
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(cast(int | float | str, value))
+    except (TypeError, ValueError):
+        return None
+    return numeric if isfinite(numeric) else None

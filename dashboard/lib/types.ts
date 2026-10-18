@@ -325,6 +325,7 @@ export type BacktestRunRow = {
 };
 
 export type BacktestStrategyRunRow = {
+  controller_rejection_counts?: Record<string, number>;
   strategy_run_id: string;
   run_id: string;
   strategy_id: string;

@@ -123,7 +123,11 @@ def _portfolio() -> Portfolio:
     )
 
 
-def _decision(*, spread_bps_at_decision: int | None = 123) -> TradeDecision:
+def _decision(
+    *,
+    spread_bps_at_decision: int | None = 123,
+    calibration_prob_estimate: float | None = None,
+) -> TradeDecision:
     return TradeDecision(
         decision_id="decision-meta-capture",
         market_id="market-meta-capture",
@@ -144,6 +148,7 @@ def _decision(*, spread_bps_at_decision: int | None = 123) -> TradeDecision:
         action=Side.BUY.value,
         model_id="unit",
         spread_bps_at_decision=spread_bps_at_decision,
+        calibration_prob_estimate=calibration_prob_estimate,
     )
 
 
@@ -285,6 +290,27 @@ async def test_decision_store_round_trips_spread_bps_in_payload() -> None:
     rows = await store.read_decisions(limit=1)
 
     assert rows[0].decision.spread_bps_at_decision == 789
+
+
+@pytest.mark.asyncio
+async def test_decision_store_round_trips_calibration_probability() -> None:
+    connection = _RecordingConnection()
+    store = DecisionStore(cast(asyncpg.Pool, _Pool(connection)))
+    created_at = datetime(2026, 5, 6, tzinfo=UTC)
+
+    await store.insert(
+        _decision(calibration_prob_estimate=0.31),
+        factor_snapshot_hash="snapshot",
+        created_at=created_at,
+        expires_at=created_at + timedelta(minutes=15),
+    )
+    payload_args = next(
+        args
+        for query, args, _ in connection.execute_calls
+        if "INSERT INTO decision_payloads" in query
+    )
+    payload = json.loads(cast(str, payload_args[1]))
+    assert payload["calibration_prob_estimate"] == pytest.approx(0.31)
 
 
 @pytest.mark.asyncio

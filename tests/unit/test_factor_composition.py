@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
 
-from pms.factors.composition import apply_composition, evaluate_branch_probabilities
+from pms.factors.composition import (
+    apply_composition,
+    evaluate_branch_probabilities,
+    validate_composition,
+)
 from pms.strategies.projections import FactorCompositionStep
 
 
@@ -52,6 +57,104 @@ def test_apply_composition_supports_weighted_legacy_shape() -> None:
     )
 
     assert result == pytest.approx(0.45)
+
+
+def test_apply_composition_rejects_non_finite_factor_values() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        apply_composition(
+            (_step("metaculus_prior", role="rule_delta", weight=1.0),),
+            {
+                ("metaculus_prior", ""): float("nan"),
+                ("yes_price", ""): 0.5,
+            },
+        )
+
+
+def test_rule_delta_piecewise_floor_and_threshold_boundaries() -> None:
+    composition = (
+        _step("favorite_longshot_bias", role="rule_delta", weight=2.0, threshold=0.01),
+    )
+
+    assert apply_composition(
+        composition,
+        {
+            ("favorite_longshot_bias", ""): -0.05,
+            ("yes_price", ""): 0.05,
+        },
+    ) == pytest.approx(1e-6)
+    # Exactly at the threshold the gate is inclusive; only values below it
+    # are neutralized.
+    assert apply_composition(
+        composition,
+        {
+            ("favorite_longshot_bias", ""): 0.01,
+            ("yes_price", ""): 0.50,
+        },
+    ) == pytest.approx(0.52)
+    assert apply_composition(
+        composition,
+        {
+            ("favorite_longshot_bias", ""): 0.009,
+            ("yes_price", ""): 0.50,
+        },
+    ) == pytest.approx(0.50)
+
+
+def test_composition_threshold_tolerates_binary_float_rounding() -> None:
+    result = apply_composition(
+        (
+            _step("metaculus_prior", role="rule_delta", weight=1.0, threshold=0.1),
+        ),
+        {
+            ("metaculus_prior", ""): 0.6,
+            ("yes_price", ""): 0.5,
+        },
+    )
+
+    # 0.6 - 0.5 is represented just below 0.1 in binary float, but the
+    # computed edge is at the configured gate boundary.
+    assert result == pytest.approx(0.6)
+
+
+def test_threshold_edge_output_is_bounded_to_probability_domain() -> None:
+    result = apply_composition(
+        (_step("fair_value_spread", role="threshold_edge", weight=1.0, threshold=0.0),),
+        {
+            ("fair_value_spread", ""): 2.0,
+            ("yes_price", ""): 0.5,
+        },
+    )
+
+    assert result == pytest.approx(1.0 - 1e-6)
+
+
+def test_validate_composition_rejects_unknown_role_and_factor() -> None:
+    with pytest.raises(ValueError, match="unknown composition role"):
+        validate_composition((_step("yes_price", role="typo", weight=1.0),))
+    with pytest.raises(ValueError, match="unknown composition factor id"):
+        validate_composition((_step("not_a_factor", role="weighted", weight=1.0),))
+
+
+def test_strategy_authoring_guide_example_matches_validator_and_semantics() -> None:
+    guide = Path("agent_docs/strategy-authoring-guide.md").read_text()
+    assert 'factor_id="orderbook_imbalance"' in guide
+    assert 'role="rule_delta"' in guide
+    assert 'factor_id="metaculus_prior"' in guide
+    composition = (
+        _step("orderbook_imbalance", role="rule_delta", weight=0.25, threshold=0.15),
+        _step("metaculus_prior", role="threshold_edge", weight=1.0, threshold=0.60),
+    )
+    validate_composition(composition)
+    # The guide describes precedence: each branch can provide a probability
+    # when the other branch is quiet.
+    assert apply_composition(
+        composition,
+        {("yes_price", ""): 0.5, ("metaculus_prior", ""): 0.7},
+    ) == pytest.approx(0.7)
+    assert apply_composition(
+        composition,
+        {("yes_price", ""): 0.5, ("orderbook_imbalance", ""): 0.5},
+    ) == pytest.approx(0.625)
 
 
 def test_apply_composition_renormalizes_present_weighted_inputs() -> None:

@@ -16,6 +16,8 @@ from hashlib import sha256
 import json
 from typing import Any
 
+from pms.factors.definitions import REGISTERED
+
 from .projections import (
     CalibrationSpec,
     EvalSpec,
@@ -51,6 +53,17 @@ def _payload_value(value: Any) -> Any:
             del payload["yes_price_min"]
         if payload.get("yes_price_max") is None:
             del payload["yes_price_max"]
+        return _payload_value(payload)
+    if isinstance(value, EvalSpec):
+        payload = asdict(value, dict_factory=_sorted_dict_factory)
+        for key, default in (
+            ("min_brier_samples", 20),
+            ("min_slippage_samples", 20),
+            ("min_win_rate_samples", 20),
+        ):
+            configured = getattr(value, key, default)
+            if configured != default:
+                payload[key] = configured
         return _payload_value(payload)
     if is_dataclass(value) and not isinstance(value, type):
         return _payload_value(asdict(value, dict_factory=_sorted_dict_factory))
@@ -120,6 +133,8 @@ def _strategy_payload(
     forecaster: ForecasterSpec,
     market_selection: MarketSelectionSpec,
     calibration: CalibrationSpec | None = None,
+    include_factor_definition_versions: bool = True,
+    llm_identity: tuple[str | None, str, str] | None = None,
 ) -> dict[str, Any]:
     payload = {
         "config": _payload_value(config),
@@ -128,9 +143,33 @@ def _strategy_payload(
         "forecaster": _payload_value(forecaster),
         "market_selection": _payload_value(market_selection),
     }
+    # Preserve the pre-W1B wire/hash contract for the omitted default. Existing
+    # strategy rows intentionally omit calibration, and changing that hash
+    # would make every installed default version fail rehydration. Explicit
+    # non-default calibration remains part of the immutable version payload.
     if calibration is not None and calibration != CalibrationSpec():
         payload["calibration"] = _payload_value(calibration)
+    if include_factor_definition_versions:
+        factor_versions = _factor_definition_versions(config)
+        if factor_versions:
+            payload["factor_definition_versions"] = factor_versions
+    if llm_identity is not None:
+        payload["llm_identity"] = list(llm_identity)
     return payload
+
+
+def _factor_definition_versions(config: StrategyConfig) -> dict[str, str]:
+    versions_by_id = {
+        factor_cls.factor_id: factor_cls.definition_version
+        for factor_cls in REGISTERED
+    }
+    versions = {
+        step.factor_id: versions_by_id[step.factor_id]
+        for step in config.factor_composition
+        if step.factor_id in versions_by_id
+        and versions_by_id[step.factor_id] != "1"
+    }
+    return dict(sorted(versions.items()))
 
 
 def serialize_strategy_config_json(
@@ -140,6 +179,7 @@ def serialize_strategy_config_json(
     forecaster: ForecasterSpec,
     market_selection: MarketSelectionSpec,
     calibration: CalibrationSpec | None = None,
+    llm_identity: tuple[str | None, str, str] | None = None,
 ) -> str:
     return json.dumps(
         _strategy_payload(
@@ -149,6 +189,7 @@ def serialize_strategy_config_json(
             forecaster=forecaster,
             market_selection=market_selection,
             calibration=calibration,
+            llm_identity=llm_identity,
         ),
         sort_keys=True,
         separators=(",", ":"),
@@ -163,6 +204,7 @@ def compute_strategy_version_id(
     forecaster: ForecasterSpec,
     market_selection: MarketSelectionSpec,
     calibration: CalibrationSpec | None = None,
+    llm_identity: tuple[str | None, str, str] | None = None,
 ) -> str:
     canonical_payload = _normalize_value(
         _strategy_payload(
@@ -172,6 +214,37 @@ def compute_strategy_version_id(
             forecaster=forecaster,
             market_selection=market_selection,
             calibration=calibration,
+            llm_identity=llm_identity,
+        )
+    )
+    canonical_json = json.dumps(
+        canonical_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
+def compute_legacy_strategy_version_id(
+    config: StrategyConfig,
+    risk: RiskParams,
+    eval_spec: EvalSpec,
+    forecaster: ForecasterSpec,
+    market_selection: MarketSelectionSpec,
+    calibration: CalibrationSpec | None = None,
+) -> str:
+    """Compute the pre-factor-definition-version hash for old registry rows."""
+
+    canonical_payload = _normalize_value(
+        _strategy_payload(
+            config=config,
+            risk=risk,
+            eval_spec=eval_spec,
+            forecaster=forecaster,
+            market_selection=market_selection,
+            calibration=calibration,
+            include_factor_definition_versions=False,
         )
     )
     canonical_json = json.dumps(

@@ -16,6 +16,7 @@ SENSOR_MARKET_SELECTION_CONTRACT = "Sensor: no market_selection import"
 ACTUATOR_MARKET_SELECTION_CONTRACT = "Actuator: no market_selection import"
 MARKET_SELECTION_AGGREGATE_CONTRACT = "Market selection: no aggregate import"
 KALSHI_STUB_BOUNDARY_CONTRACT = "Kalshi stub helper stays at runtime boundaries"
+MCP_PROXY_CONTRACT = "MCP proxy only calls the typed HTTP API"
 
 IMPORT_LINTER_CONFIG = """
 [project]
@@ -25,6 +26,7 @@ requires-python = ">=3.11"
 
 [tool.importlinter]
 root_packages = ["pms"]
+include_external_packages = true
 
 [[tool.importlinter.contracts]]
 name = "Sensor strategy-agnostic: no aggregate import"
@@ -76,6 +78,18 @@ allowed_importers = [
     "pms.research.execution",
 ]
 as_packages = false
+
+[[tool.importlinter.contracts]]
+name = "MCP proxy only calls the typed HTTP API"
+type = "forbidden"
+source_modules = ["pms.agent_mcp"]
+forbidden_modules = [
+    "pms.sensor",
+    "pms.controller",
+    "pms.actuator",
+    "pms.actuator.adapters",
+    "py_clob_client_v2",
+]
 """.strip()
 
 
@@ -122,6 +136,16 @@ def _lint_imports_command() -> list[str]:
             "from pms.core.venue_support import kalshi_stub_error\n",
             KALSHI_STUB_BOUNDARY_CONTRACT,
         ),
+        (
+            "pms/agent_mcp/bad.py",
+            "import py_clob_client_v2\n",
+            MCP_PROXY_CONTRACT,
+        ),
+        (
+            "pms/agent_mcp/bad.py",
+            "import pms.actuator.adapters\n",
+            MCP_PROXY_CONTRACT,
+        ),
     ],
 )
 def test_import_linter_rejects_forbidden_dependencies(
@@ -139,6 +163,7 @@ def test_import_linter_rejects_forbidden_dependencies(
         "pms/strategies",
         "pms/market_selection",
         "pms/core",
+        "pms/agent_mcp",
     ]:
         package_dir = tmp_path / package
         package_dir.mkdir(parents=True, exist_ok=True)
@@ -187,5 +212,6 @@ def test_current_tree_lints_clean() -> None:
         ACTUATOR_MARKET_SELECTION_CONTRACT,
         MARKET_SELECTION_AGGREGATE_CONTRACT,
         KALSHI_STUB_BOUNDARY_CONTRACT,
+        MCP_PROXY_CONTRACT,
     ]:
         assert contract in result.stdout

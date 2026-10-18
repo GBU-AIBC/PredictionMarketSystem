@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import re
 from typing import Any, cast
@@ -25,12 +25,14 @@ from pms.research.specs import (
 )
 from pms.strategies.projections import (
     ActiveStrategy,
+    CalibrationSpec,
     EvalSpec,
     ForecasterSpec,
     MarketSelectionSpec,
     RiskParams,
     StrategyConfig,
 )
+from pms.strategies.versioning import serialize_strategy_config_json
 
 
 def test_portfolio_target_round_trips_through_json() -> None:
@@ -425,6 +427,47 @@ class _InsertTrackingPool:
         del connection
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_default_strategy_loader_preserves_calibration_and_row_identity(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool,
+) -> None:
+    strategy = replace(
+        _active_strategy(),
+        calibration=CalibrationSpec(
+            enabled=enabled,
+            shrinkage_factor=0.73,
+            shrinkage_bias=-0.11,
+            extreme_clamp_low=0.06,
+            extreme_clamp_high=0.94,
+            min_resolved_for_extreme=37,
+        ),
+    )
+    pool = _InsertTrackingPool([])
+
+    async def fetchrow(query: str, *args: object) -> dict[str, object]:
+        assert "FROM strategy_versions" in query
+        assert args == ("alpha", "stored-v1")
+        return {
+            "strategy_id": "alpha",
+            "strategy_version_id": "stored-v1",
+            "config_json": serialize_strategy_config_json(
+                strategy.config, strategy.risk, strategy.eval_spec,
+                strategy.forecaster, strategy.market_selection, strategy.calibration,
+            ),
+        }
+
+    monkeypatch.setattr(pool._connection, "fetchrow", fetchrow, raising=False)
+    runner = BacktestRunner(
+        writable_pool=cast(Any, pool), readonly_pool=cast(Any, pool),
+    )
+
+    loaded = await runner._load_strategies((("alpha", "stored-v1"),))
+
+    assert loaded == [replace(
+        strategy, strategy_version_id="stored-v1",
+    )]
+
+
 @pytest.mark.asyncio
 async def test_insert_strategy_runs_atomically_rolls_back_on_mid_batch_failure(
     monkeypatch: pytest.MonkeyPatch,
@@ -774,6 +817,32 @@ async def test_backtest_runner_execution_model_staleness_budget_can_prevent_fill
 
     assert accumulator.decision_count == 1
     assert accumulator.fill_count == 0
+
+
+@pytest.mark.asyncio
+async def test_backtest_runner_records_resolution_cancellation_for_gtc_order() -> None:
+    start = datetime(2026, 4, 20, tzinfo=UTC)
+    cutoff = start + timedelta(seconds=1)
+    runner = BacktestRunner(
+        writable_pool=cast(Any, object()),
+        readonly_pool=cast(Any, object()),
+        replay_engine=_ReplayEngine([
+            replace(_signal(start), resolves_at=cutoff),
+            replace(_signal(cutoff), resolves_at=cutoff),
+        ]),
+        controller_factory=_PipelineFactory(_GtcUnfilledPipeline()),
+    )
+    spec = _spec()
+    spec = replace(spec, execution_model=replace(
+        spec.execution_model, fill_policy="good_til_cancelled",
+    ))
+    accumulator = await runner._run_strategy(
+        strategy=_active_strategy(), spec=spec,
+        exec_config=BacktestExecutionConfig(),
+    )
+    assert accumulator.fill_count == 0
+    first = next(row for row in accumulator.execution_rows if row.decision_id == "decision-1")
+    assert first.rejection_reason == "market_resolved_before_execution"
 
 
 @pytest.mark.asyncio

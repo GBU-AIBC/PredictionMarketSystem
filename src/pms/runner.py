@@ -7,7 +7,7 @@ import logging
 from copy import deepcopy
 from math import isfinite
 from hashlib import sha256
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -30,6 +30,7 @@ from pms.actuator.adapters.polymarket import (
     PolymarketRoutingQuoteProvider,
     PolymarketSDKClient,
     PolymarketSubmissionUnknownError,
+    PolymarketVenueRejectionError,
     PolymarketVenueAccountReconciler,
 )
 from pms.actuator.executor import (
@@ -44,7 +45,7 @@ from pms.actuator.exit_monitor import (
     mark_position_from_signal,
 )
 from pms.actuator.feedback import ActuatorFeedback
-from pms.actuator.risk import RiskManager
+from pms.actuator.risk import HaltState, RiskManager, RiskTradeResult
 from pms.config import PMSSettings, validate_live_mode_ready
 from pms.controller._price_utils import best_ask
 from pms.controller.baselines import (
@@ -54,10 +55,15 @@ from pms.controller.baselines import (
 )
 from pms.controller.diagnostics import ControllerDiagnostic
 from pms.controller.factory import ControllerPipelineFactory
-from pms.controller.factor_snapshot import PostgresFactorSnapshotReader
+from pms.controller.factor_snapshot import (
+    RAW_FACTOR_ROLES,
+    PostgresFactorSnapshotReader,
+)
 from pms.controller.outcome_tokens import MarketDataOutcomeTokenResolver
+from pms.controller.pipeline import _decision_cost_edges
 from pms.controller.sizers.kelly import KellySizer
 from pms.core.enums import OrderStatus, RunMode, Side, TimeInForce
+from pms.core.exceptions import SensorDataQualityError
 from pms.core.interfaces import (
     DiscoveryPollCompleteSensor,
     IController,
@@ -81,6 +87,7 @@ from pms.core.models import (
     VenueAccountSnapshot as VenueAccountSnapshot,
     VenueCredentials,
 )
+from pms.core.validation import normalize_resolved_outcome
 from pms.artifact_path_safety import (
     require_path_outside_working_tree,
     require_private_parent,
@@ -101,7 +108,7 @@ from pms.evaluation.resolution import (
 from pms.evaluation.spool import EvalSpool
 from pms.event_stream import RuntimeEventBus
 from pms.execution.fees import market_fee_rate_from_metadata
-from pms.factors.catalog import ensure_factor_catalog
+from pms.factors.catalog import AGENT_FACTOR_IDS, ensure_factor_catalog
 from pms.factors.definitions import REGISTERED
 from pms.factors.service import FactorService
 from pms.live_preflight import (
@@ -124,21 +131,31 @@ from pms.sensor.adapters.direct_book import (
 from pms.sensor.adapters.historical import HistoricalSensor
 from pms.sensor.adapters.market_data import MarketDataSensor
 from pms.sensor.adapters.market_discovery import MarketDiscoverySensor
-from pms.sensor.stream import SensorStream, SignalSubscription
+from pms.sensor.stream import DEFAULT_SIGNAL_BUFFER_CAPACITY, SensorStream, SignalSubscription
 from pms.storage.dedup_store import InMemoryDedupStore, PgDedupStore
 from pms.storage.decision_store import DecisionStore
 from pms.storage.eval_store import EvalStore
 from pms.storage.feedback_store import FeedbackStore
 from pms.storage.fill_store import FillStore
+from pms.storage.live_emergency_audit import (
+    LiveEmergencyAuditWriter,
+    read_active_halt,
+    read_last_halt_clear,
+)
 from pms.storage.first_order_audit import JsonlFirstOrderAuditWriter
-from pms.storage.live_emergency_audit import LiveEmergencyAuditWriter
 from pms.storage.market_data_store import PostgresMarketDataStore
+from pms.storage.agent_evidence_store import AgentEvidenceStore
+from pms.storage.llm_replay_store import PostgresLLMReplayStore
+from pms.storage.market_resolution_store import MarketResolutionStore
 from pms.storage.market_subscription_store import PostgresMarketSubscriptionStore
 from pms.storage.opportunity_store import OpportunityStore
 from pms.storage.order_store import OrderStore
 from pms.storage.quote_eval_store import QuoteEvalStore
 from pms.storage.runtime_heartbeat_store import RuntimeHeartbeatStore
-from pms.storage.strategy_registry import PostgresStrategyRegistry
+from pms.storage.strategy_registry import (
+    PostgresStrategyRegistry,
+    llm_identity_for_settings,
+)
 from pms.strategies.aggregate import Strategy
 from pms.strategies.defaults import DEFAULT_STRATEGY_COMPOSITION
 from pms.strategies.anchoring import (
@@ -147,7 +164,11 @@ from pms.strategies.anchoring import (
     AnchoringLagStrategyModule,
     LiveAnchoringSource,
 )
-from pms.strategies.anchoring.source import AnchoringMarketSnapshotReader
+from pms.strategies.anchoring.source import (
+    ANCHORING_LEGACY_VERSION_IDS,
+    AnchoringMarketSnapshotReader,
+    build_anchoring_strategy,
+)
 from pms.strategies.flb import FlbAgent, FlbController, FlbStrategyModule
 from pms.strategies.flb.artifacts import (
     flb_calibration_provenance_path,
@@ -161,14 +182,18 @@ from pms.strategies.flb.source import (
     load_flb_calibration_csv,
 )
 from pms.strategies.flb.projection import (
+    H1_FLB_LEGACY_VERSION_IDS,
     H1_FLB_STRATEGY_ID,
     build_h1_flb_strategy,
 )
 from pms.strategies.intents import StrategyContext
 from pms.strategies.paper_multifactor import (
+    PAPER_AGENT_PROBABILITY_STRATEGY_ID,
     PAPER_MULTI_FACTOR_STRATEGY_ID,
+    build_paper_agent_probability_strategy,
     build_paper_multi_factor_strategy,
 )
+from pms.strategies.agent_evidence import AgentEvidenceObservationSource
 from pms.strategies.projections import (
     ActiveStrategy,
     CalibrationSpec,
@@ -187,10 +212,13 @@ from pms.strategies.ripple import (
     RippleStrategyModule,
 )
 from pms.strategies.ripple.source import (
+    RIPPLE_LEGACY_VERSION_IDS,
     RippleFactorSnapshotReader,
     RippleMarketSnapshotReader,
+    build_ripple_strategy,
 )
 from pms.strategies.runtime_bridge import StrategyRunResult
+from pms.strategies.economics import strategy_economic_float
 from pms.strategies.versioning import compute_strategy_version_id
 from pms.supervision import (
     ALIVE_WORKER_STATES,
@@ -206,6 +234,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_BACKTEST_FIXTURE = Path("tests/fixtures/polymarket_7day_synthetic.jsonl")
 RUNNER_STATE_LIMIT = 1000
 CONTROLLER_SIGNAL_COOLESCE_LIMIT = 1_000
+CONTROLLER_SIGNAL_QUEUE_FALLBACK_LIMIT = 100  # Default sensor subscription cap.
 RESELECTION_INTERVAL_S = 300.0
 DECISION_PENDING_TTL = timedelta(minutes=15)
 DECISION_SWEEP_INTERVAL_S = 5.0
@@ -220,6 +249,7 @@ WORKER_TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
     asyncpg.PostgresError,
     OSError,
     TimeoutError,
+    SensorDataQualityError,
 )
 WORKER_MAX_RESTARTS = 5
 WORKER_RESTART_WINDOW_S = 600.0
@@ -243,17 +273,6 @@ TRADING_REQUIRED_WORKERS: tuple[str, ...] = (
 READINESS_REQUIRED_WORKERS: tuple[str, ...] = (
     *TRADING_REQUIRED_WORKERS,
     WORKER_RUNTIME_HEARTBEAT,
-)
-RAW_FACTOR_COMPOSITION_ROLES = frozenset(
-    {
-        "weighted",
-        "precedence_rank",
-        "threshold_edge",
-        "posterior_prior",
-        "posterior_success",
-        "posterior_failure",
-        "rule_delta",
-    }
 )
 REGISTERED_FACTOR_IDS = frozenset(factor_cls.factor_id for factor_cls in REGISTERED)
 DEFAULT_V2_FACTOR_COMPOSITION = DEFAULT_STRATEGY_COMPOSITION
@@ -293,6 +312,42 @@ class StrategyControllerRuntime:
     strategy_version_id: str
     controller: IController
     asset_ids: frozenset[str] | None
+
+
+class _LatestControllerSignalQueue(asyncio.Queue[MarketSignal]):
+    _is_shutdown: bool
+
+    def __init__(self, maxsize: int) -> None:
+        super().__init__(maxsize=maxsize)
+        self._pending: dict[tuple[str, str], MarketSignal] = {}
+
+    def _replace_pending(self, signal: MarketSignal) -> bool:
+        if self._is_shutdown:
+            raise asyncio.QueueShutDown
+        key = _controller_signal_coalesce_key(signal)
+        current = self._pending.get(key)
+        if current is None:
+            return False
+        if _is_newer_controller_signal(signal, current):
+            self._pending[key] = signal
+        return True
+
+    async def put(self, item: MarketSignal) -> None:
+        if not self._replace_pending(item):
+            await super().put(item)
+
+    def put_nowait(self, item: MarketSignal) -> None:
+        if not self._replace_pending(item):
+            super().put_nowait(item)
+
+    def _put(self, item: MarketSignal) -> None:
+        # Replacements keep the token's original FIFO position for fairness.
+        self._pending[_controller_signal_coalesce_key(item)] = item
+        super()._put(item)
+
+    def _get(self) -> MarketSignal:
+        item = super()._get()
+        return self._pending.pop(_controller_signal_coalesce_key(item))
 
 
 @dataclass
@@ -416,6 +471,10 @@ class Runner:
         init=False,
         default_factory=dict,
     )
+    _active_strategies_by_version: dict[tuple[str, str], ActiveStrategy] = field(
+        init=False,
+        default_factory=dict,
+    )
     _controller_signal_queues: dict[str, asyncio.Queue[MarketSignal]] = field(
         init=False,
         default_factory=dict,
@@ -435,6 +494,8 @@ class Runner:
     )
     _reselection_task: asyncio.Task[None] | None = field(init=False, default=None)
     _reselection_lock: asyncio.Lock = field(init=False)
+    _market_selection_lock: asyncio.Lock = field(init=False)
+    _reselection_generation: int = field(init=False, default=0)
     _reselection_requested: asyncio.Event = field(init=False)
     _strategy_change_callbacks_registered: bool = field(init=False, default=False)
     _active_sensors: tuple[ISensor, ...] = field(init=False, default=())
@@ -468,6 +529,8 @@ class Runner:
         default=None,
     )
     _live_trading_suspended_reason: str | None = field(init=False, default=None)
+    _risk_peak_equity: float = field(init=False, default=0.0)
+    _persisted_halt_triggered_at: datetime | None = field(init=False, default=None)
     _live_preflight_artifact_validated: bool = field(init=False, default=False)
     _live_preflight_active_strategies_fingerprint: str | None = field(
         init=False,
@@ -475,12 +538,17 @@ class Runner:
     )
 
     def __post_init__(self) -> None:
+        self.sensor_stream.configure_capacity(
+            self.config.sensor.max_subscription_asset_ids or DEFAULT_SIGNAL_BUFFER_CAPACITY
+        )
         if self.config.mode == RunMode.LIVE:
             self.portfolio = _portfolio_with_configured_budget(
                 self.portfolio,
                 total_budget_usdc=self.config.risk.max_total_exposure,
             )
         self.state = RunnerState(mode=self.config.mode)
+        self._risk_peak_equity = self.portfolio.total_usdc
+        self._persisted_halt_triggered_at = None
         self._controller_factory = ControllerPipelineFactory(settings=self.config)
         self._evaluator_spool = EvalSpool(
             store=self.eval_store,
@@ -494,6 +562,7 @@ class Runner:
         self._stop_event = asyncio.Event()
         self._controller_lifecycle_lock = asyncio.Lock()
         self._reselection_lock = asyncio.Lock()
+        self._market_selection_lock = asyncio.Lock()
         self._reselection_requested = asyncio.Event()
         self._position_exit_monitor = PositionExitMonitor(self.config.position_exit)
         self._category_prior_estimator = _category_prior_estimator_from_settings(
@@ -664,7 +733,11 @@ class Runner:
                 if self._pg_pool is None:
                     msg = "Runner PostgreSQL pool is not initialized"
                     raise RuntimeError(msg)
+                llm_identity = llm_identity_for_settings(self.config)
+                # Keep construction compatible with registry test doubles;
+                # the concrete registry reads this identity during versioning.
                 self._strategy_registry = PostgresStrategyRegistry(self._pg_pool)
+                setattr(self._strategy_registry, "_llm_identity", llm_identity)
                 if self.config.mode == RunMode.LIVE:
                     self._live_preflight_active_strategies_fingerprint = (
                         await require_live_preflight_active_strategies_artifact(
@@ -696,22 +769,16 @@ class Runner:
                 # default while the venue actually holds real exposure. See
                 # also `_reconcile_portfolio_from_db`.
                 await self._reconcile_portfolio_from_db()
+                await self._reconcile_risk_from_db()
                 if self.config.mode == RunMode.LIVE:
                     await self._reconcile_venue_account()
             self._active_sensors = self._build_sensors()
             self._wire_active_perception(self._active_sensors)
             await self._configure_controllers()
-            await self.sensor_stream.start(self._active_sensors)
-            for index, (sensor, sensor_task) in enumerate(
-                zip(self._active_sensors, self.sensor_stream.tasks, strict=True)
-            ):
-                # Watch-only: sensor _consume tasks carry their own reconnect
-                # loops, and restarting them would fight SensorStream's
-                # _active_consumers bookkeeping.
-                self._supervisor.observe(
-                    sensor_task,
-                    name=f"sensor:{index}:{type(sensor).__name__}",
-                )
+            await self.sensor_stream.start(
+                self._active_sensors,
+                task_factory=self._supervised_sensor_task,
+            )
             await self._evaluator_spool.start()
             self._controller_task = self._supervisor.spawn(
                 self._worker_spec(
@@ -739,7 +806,7 @@ class Runner:
                 self._resolution_sweep_task = asyncio.create_task(
                     self._resolution_sweep_loop()
                 )
-        except Exception:
+        except BaseException:
             self._live_preflight_artifact_validated = False
             self._live_preflight_active_strategies_fingerprint = None
             await self._cleanup_after_start_failure()
@@ -802,6 +869,12 @@ class Runner:
                 error = exc
 
         try:
+            await self._discard_pending_actuator_work()
+        except BaseException as exc:
+            if error is None:
+                error = exc
+
+        try:
             await self._evaluator_spool.stop()
         except BaseException as exc:  # pragma: no cover - defensive
             if error is None:
@@ -830,6 +903,9 @@ class Runner:
         self._subscription_controller = None
         self._strategy_registry = None
         self._controller_runtimes = {}
+        self._active_strategies_by_version = {}
+        for queue in self._controller_signal_queues.values():
+            queue.shutdown(immediate=True)
         self._controller_signal_queues = {}
         self._controller_pipeline_tasks = {}
         self._controller_release_cancel_point = None
@@ -868,6 +944,7 @@ class Runner:
                 self.portfolio,
                 total_budget_usdc=self.config.risk.max_total_exposure,
             )
+        self._risk_peak_equity = _portfolio_equity(self.portfolio)
         self.actuator_executor = self._build_executor(new_mode)
 
     async def wait_until_idle(self) -> None:
@@ -900,6 +977,18 @@ class Runner:
         while len(self.state.signals) < count:
             await asyncio.sleep(0.1)
 
+    def build_agent_evidence_source(
+        self,
+        market_ids: Sequence[str],
+    ) -> AgentEvidenceObservationSource:
+        """Build the production point-in-time evidence source for a strategy."""
+        if self._pg_pool is None:
+            raise RuntimeError("Runner PostgreSQL pool is required for agent evidence")
+        return AgentEvidenceObservationSource(
+            store=AgentEvidenceStore(self._pg_pool),
+            market_ids=tuple(market_ids),
+        )
+
     def build_flb_strategy_module(
         self,
         *,
@@ -922,25 +1011,97 @@ class Runner:
             reader = _PostgresFlbMarketSnapshotReader(
                 PostgresMarketDataStore(self._pg_pool)
             )
+        h1_strategy: Strategy | None = None
+        if strategy_id == H1_FLB_STRATEGY_ID:
+            calibration_model = self._flb_calibration_model
+            h1_strategy = (
+                _h1_flb_strategy_from_settings(
+                    self.config,
+                    calibration_model=calibration_model,
+                )
+                if calibration_model is not None
+                else build_h1_flb_strategy(
+                    time_in_force=self.config.controller.time_in_force,
+                )
+            )
+        if h1_strategy is not None:
+            _verify_runtime_strategy_version(
+                h1_strategy,
+                strategy_version_id,
+                legacy_ids=H1_FLB_LEGACY_VERSION_IDS,
+            )
+        position_sizing_risk = self.config.risk
+        if h1_strategy is not None:
+            position_sizing_risk = self.config.risk.model_copy(
+                update={
+                    "max_position_per_market": (
+                        h1_strategy.risk.max_position_notional_usdc
+                    )
+                }
+            )
+        h1_metadata = dict(h1_strategy.config.metadata) if h1_strategy else {}
 
         return FlbStrategyModule(
             source=LiveFlbSource(
                 market_ids=tuple(market_ids),
                 market_reader=reader,
-                position_sizer=KellySizer(self.config.risk),
+                position_sizer=KellySizer(risk=position_sizing_risk),
                 portfolio=self.portfolio,
-                max_slippage_bps=self.config.controller.max_slippage_bps,
-                entry_execution_cost_bps=(
-                    self.config.strategies.flb_entry_execution_cost_bps
+                max_slippage_bps=(
+                    int(h1_metadata["max_slippage_bps"])
+                    if h1_strategy is not None
+                    else self.config.controller.max_slippage_bps
                 ),
-                fee_rate=self.config.strategies.flb_fee_rate,
-                time_in_force=TimeInForce(
-                    self.config.controller.time_in_force.upper()
+                entry_execution_cost_bps=(
+                    float(h1_metadata["entry_execution_cost_bps"])
+                    if h1_strategy is not None
+                    else self.config.strategies.flb_entry_execution_cost_bps
+                ),
+                fee_rate=(
+                    float(h1_metadata["fee_rate"])
+                    if h1_strategy is not None
+                    else self.config.strategies.flb_fee_rate
+                ),
+                longshot_yes_threshold=(
+                    float(h1_metadata["longshot_yes_threshold"])
+                    if h1_strategy is not None
+                    else 0.10
+                ),
+                favorite_yes_threshold=(
+                    float(h1_metadata["favorite_yes_threshold"])
+                    if h1_strategy is not None
+                    else 0.90
+                ),
+                min_expected_edge=(
+                    float(h1_metadata["min_expected_edge"])
+                    if h1_strategy is not None
+                    else 0.02
+                ),
+                confidence=(
+                    float(h1_metadata["source_confidence"])
+                    if h1_strategy is not None
+                    else 0.65
+                ),
+                time_in_force=(
+                    TimeInForce(h1_metadata["time_in_force"])
+                    if h1_strategy is not None
+                    else TimeInForce(self.config.controller.time_in_force.upper())
                 ),
                 calibration_model=self._flb_calibration_model,
             ),
             controller=FlbController(),
-            agent=FlbAgent(),
+            agent=FlbAgent(
+                min_confidence=(
+                    float(h1_metadata["min_confidence"])
+                    if h1_strategy is not None
+                    else 0.6
+                ),
+                min_expected_edge=(
+                    float(h1_metadata["min_expected_edge"])
+                    if h1_strategy is not None
+                    else 0.02
+                ),
+            ),
             strategy_id=strategy_id,
             strategy_version_id=strategy_version_id,
         )
@@ -1010,23 +1171,40 @@ class Runner:
         else:
             resolved_market_reader = market_reader
 
+        ripple_strategy = build_ripple_strategy(
+            strategy_id,
+            time_in_force=self.config.controller.time_in_force,
+        )
+        _verify_runtime_strategy_version(
+            ripple_strategy,
+            strategy_version_id,
+            legacy_ids=RIPPLE_LEGACY_VERSION_IDS,
+        )
+        ripple_metadata = dict(ripple_strategy.config.metadata)
+
         return RippleStrategyModule(
             source=LiveRippleSource(
                 market_ids=tuple(market_ids),
                 factor_reader=resolved_factor_reader,
                 market_reader=resolved_market_reader,
                 position_sizer=KellySizer(
-                    risk=self.config.risk,
+                    risk=self.config.risk.model_copy(
+                        update={
+                            "max_position_per_market": (
+                                ripple_strategy.risk.max_position_notional_usdc
+                            )
+                        }
+                    ),
                     fraction=Decimal("0.25"),
                 ),
                 portfolio=self.portfolio,
-                max_slippage_bps=self.config.controller.max_slippage_bps,
-                time_in_force=TimeInForce(
-                    self.config.controller.time_in_force.upper()
-                ),
+                prior_strength=float(ripple_metadata["prior_strength"]),
+                min_expected_edge=float(ripple_metadata["min_expected_edge"]),
+                max_slippage_bps=int(ripple_metadata["max_slippage_bps"]),
+                time_in_force=TimeInForce(ripple_metadata["time_in_force"]),
             ),
             controller=RippleController(),
-            agent=RippleAgent(),
+            agent=RippleAgent(min_confidence=float(ripple_metadata["min_confidence"])),
             strategy_id=strategy_id,
             strategy_version_id=strategy_version_id,
         )
@@ -1076,19 +1254,43 @@ class Runner:
             )
             raise RuntimeError(msg)
 
+        anchoring_strategy = build_anchoring_strategy(
+            strategy_id,
+            time_in_force=self.config.controller.time_in_force,
+        )
+        _verify_runtime_strategy_version(
+            anchoring_strategy,
+            strategy_version_id,
+            legacy_ids=ANCHORING_LEGACY_VERSION_IDS,
+        )
+        anchoring_metadata = dict(anchoring_strategy.config.metadata)
+
         return AnchoringLagStrategyModule(
             source=LiveAnchoringSource(
                 market_ids=tuple(market_ids),
                 market_reader=market_reader,
-                position_sizer=KellySizer(self.config.risk),
-                portfolio=self.portfolio,
-                max_slippage_bps=self.config.controller.max_slippage_bps,
-                time_in_force=TimeInForce(
-                    self.config.controller.time_in_force.upper()
+                position_sizer=KellySizer(
+                    self.config.risk.model_copy(
+                        update={
+                            "max_position_per_market": (
+                                anchoring_strategy.risk.max_position_notional_usdc
+                            )
+                        }
+                    )
                 ),
+                portfolio=self.portfolio,
+                min_divergence=float(anchoring_metadata["min_divergence"]),
+                min_confidence=float(anchoring_metadata["min_confidence"]),
+                min_expected_edge=float(anchoring_metadata["min_expected_edge"]),
+                max_slippage_bps=int(anchoring_metadata["max_slippage_bps"]),
+                time_in_force=TimeInForce(anchoring_metadata["time_in_force"]),
             ),
             controller=AnchoringController(),
-            agent=AnchoringAgent(),
+            agent=AnchoringAgent(
+                min_confidence=float(anchoring_metadata["min_confidence"]),
+                min_expected_edge=float(anchoring_metadata["min_expected_edge"]),
+                min_divergence=float(anchoring_metadata["min_divergence"]),
+            ),
             strategy_id=strategy_id,
             strategy_version_id=strategy_version_id,
         )
@@ -1160,6 +1362,7 @@ class Runner:
         self._subscription_controller = None
         self._reselection_task = None
         self._reselection_requested.clear()
+        self._reselection_generation = 0
         if self.config.mode == RunMode.BACKTEST:
             return
         if self._pg_pool is None:
@@ -1177,8 +1380,20 @@ class Runner:
         if self._strategy_registry is None:
             msg = "Runner strategy registry is not initialized"
             raise RuntimeError(msg)
+        discovery_cycle_budget_s = self.config.sensor.discovery_max_pages * (
+            self.config.sensor.discovery_http_timeout_s
+            + self.config.sensor.discovery_http_pool_timeout_s
+            + 30.0
+        )
         self._market_selector = MarketSelector(
-            PostgresMarketDataStore(self._pg_pool),
+            PostgresMarketDataStore(
+                self._pg_pool,
+                market_freshness_s=max(
+                    3.0 * self.config.sensor.poll_interval_s,
+                    300.0,
+                    discovery_cycle_budget_s,
+                ),
+            ),
             self._strategy_registry,
             UnionMergePolicy(),
             PostgresMarketSubscriptionStore(self._pg_pool),
@@ -1187,6 +1402,23 @@ class Runner:
         self._register_strategy_change_callbacks()
         discovery_sensor.on_poll_complete = self._handle_discovery_poll_complete
         self._reselection_task = asyncio.create_task(self._periodic_reselection_loop())
+
+    def _supervised_sensor_task(
+        self,
+        index: int,
+        sensor: ISensor,
+    ) -> asyncio.Task[None]:
+        name = f"sensor:{index}:{type(sensor).__name__}"
+
+        async def consume_sensor() -> None:
+            await self.sensor_stream.consume(sensor)
+
+        return self._supervisor.spawn(
+            self._worker_spec(
+                name,
+                consume_sensor,
+            )
+        )
 
     def _register_strategy_change_callbacks(self) -> None:
         if self._strategy_change_callbacks_registered:
@@ -1226,6 +1458,20 @@ class Runner:
     def worker_health_snapshot(self) -> dict[str, WorkerHealth]:
         return self._supervisor.snapshot()
 
+    def required_worker_names(self) -> tuple[str, ...]:
+        snapshot = self.worker_health_snapshot()
+        required = {
+            name for name in snapshot
+            if name in READINESS_REQUIRED_WORKERS or name.startswith("sensor:")
+        }
+        expected_strategies = {
+            strategy_id for strategy_id, _ in self._active_strategies_by_version
+        } | self._controller_runtimes.keys()
+        required.update(f"controller-pipeline:{strategy_id}" for strategy_id in expected_strategies)
+        if self.controller is not None:
+            required.update(name for name in snapshot if name.startswith("controller-pipeline:"))
+        return tuple(sorted(required))
+
     def worker_component_payload(self) -> dict[str, object]:
         return self._supervisor.component_payload()
 
@@ -1246,9 +1492,8 @@ class Runner:
     def _trading_workers_ok(self) -> bool:
         snapshot = self._supervisor.snapshot()
         return all(
-            health.state in ALIVE_WORKER_STATES
-            for name, health in snapshot.items()
-            if name in TRADING_REQUIRED_WORKERS
+            name in snapshot and snapshot[name].state in ALIVE_WORKER_STATES
+            for name in self.required_worker_names()
         )
 
     def _build_factor_service(self) -> FactorService:
@@ -1350,6 +1595,8 @@ class Runner:
             raise RuntimeError(msg)
         if self.config.paper_soak_strategy_id == PAPER_MULTI_FACTOR_STRATEGY_ID:
             strategy = build_paper_multi_factor_strategy()
+        elif self.config.paper_soak_strategy_id == PAPER_AGENT_PROBABILITY_STRATEGY_ID:
+            strategy = build_paper_agent_probability_strategy()
         elif self.config.paper_soak_strategy_id == H1_FLB_STRATEGY_ID:
             if self._flb_calibration_model is None:
                 msg = "h1_flb paper soak requires strategies.flb_calibration_path"
@@ -1397,6 +1644,14 @@ class Runner:
                 factor_reader=PostgresFactorSnapshotReader(self._pg_pool),
                 outcome_token_resolver=MarketDataOutcomeTokenResolver(market_data_store),
                 direct_book_reader=direct_book_reader,
+                historical_book_reader=(
+                    HistoricalSensor(self.historical_data_path)
+                    if self.config.mode == RunMode.BACKTEST else None
+                ),
+                evidence_reader=AgentEvidenceObservationSource(
+                    AgentEvidenceStore(self._pg_pool)
+                ),
+                replay_store=PostgresLLMReplayStore(self._pg_pool),
             )
         if isinstance(self.eval_store, EvalStore):
             self.eval_store.bind_pool(self._pg_pool)
@@ -1439,9 +1694,16 @@ class Runner:
         self.actuator_executor = self._build_executor(self.config.mode)
 
     def _build_executor(self, mode: RunMode) -> ActuatorExecutor:
+        risk = RiskManager(self.config.risk)
+        if mode == RunMode.LIVE:
+            persisted_halt = read_active_halt(
+                Path(self.config.live_emergency_audit_path)
+            )
+            if persisted_halt is not None:
+                risk.restore_halt(persisted_halt)
         return ActuatorExecutor(
             adapter=self._build_adapter(mode),
-            risk=RiskManager(self.config.risk),
+            risk=risk,
             feedback=ActuatorFeedback(self.feedback_store),
             dedup_store=self._build_dedup_store(),
             event_bus=self.event_bus,
@@ -1506,6 +1768,10 @@ class Runner:
         *,
         queue: asyncio.Queue[MarketSignal],
     ) -> MarketSignal:
+        if self.config.mode == RunMode.BACKTEST or isinstance(
+            queue, _LatestControllerSignalQueue,
+        ):
+            return signal
         selected_key = _controller_signal_coalesce_key(signal)
         selected_signal = signal
         deferred_signals: list[MarketSignal] = []
@@ -1545,6 +1811,8 @@ class Runner:
                 return
             try:
                 signal = await asyncio.wait_for(self.sensor_stream.queue.get(), 0.05)
+            except asyncio.QueueShutDown:
+                return
             except TimeoutError:
                 continue
 
@@ -1581,7 +1849,11 @@ class Runner:
                     queue = self._controller_signal_queues.get(strategy_id)
                     if queue is None:
                         continue
-                    await queue.put(signal)
+                    try:
+                        await queue.put(signal)
+                    except asyncio.QueueShutDown:
+                        # A strategy can detach while bounded fanout is waiting.
+                        continue
             finally:
                 self.sensor_stream.queue.task_done()
 
@@ -1624,6 +1896,8 @@ class Runner:
                     signal = await asyncio.wait_for(queue.get(), 0.05)
                 except TimeoutError:
                     continue
+                except asyncio.QueueShutDown:
+                    return
 
                 try:
                     signal = self._coalesce_controller_signal_batch(
@@ -1698,6 +1972,8 @@ class Runner:
                         )
                         decision_evidence = _decision_evidence_from_signal(
                             decision_signal,
+                            settings=self.config,
+                            fee_rate=self._paper_fill_fee_rate(decision),
                             decision=decision,
                             factor_snapshot_hash=factor_snapshot_hash,
                             quote_source=self.config.controller.quote_source,
@@ -1709,6 +1985,80 @@ class Runner:
                                 )
                             ),
                         )
+                        risk_manager = getattr(self.actuator_executor, "risk", None)
+                        risk_preview = None
+                        halt_preview = None
+                        if risk_manager is not None:
+                            # Trace a copy so persistence never changes the
+                            # live breaker or portfolio while recording the
+                            # decision's historical risk outcome.
+                            trace_risk = deepcopy(risk_manager)
+                            trace_portfolio = deepcopy(self.portfolio)
+                            check_auto_halt = getattr(trace_risk, "check_auto_halt", None)
+                            if callable(check_auto_halt):
+                                halt_preview = check_auto_halt(
+                                    trace_portfolio,
+                                    decision=deepcopy(decision),
+                                )
+                            risk_check = getattr(trace_risk, "check", None)
+                            if callable(risk_check) and not (
+                                halt_preview is not None and halt_preview.halted
+                            ):
+                                risk_preview = risk_check(
+                                    deepcopy(decision),
+                                    trace_portfolio,
+                                )
+                        if halt_preview is not None and halt_preview.halted:
+                            risk_reason = halt_preview.reason
+                        elif risk_preview is None:
+                            risk_reason = "unavailable"
+                        else:
+                            risk_reason = risk_preview.reason
+                        risk_approved = (
+                            False
+                            if halt_preview is not None and halt_preview.halted
+                            else None
+                            if risk_preview is None
+                            else risk_preview.approved
+                        )
+                        decision_evidence["decision_trace"] = {
+                            "strategy_id": decision.strategy_id,
+                            "strategy_version_id": decision.strategy_version_id,
+                            "forecasts": {
+                                "results": list(
+                                    getattr(runtime.controller, "last_forecaster_results", ())
+                                ),
+                                "model_id": decision.model_id,
+                                "prob_estimate": decision.prob_estimate,
+                                "expected_edge": decision.expected_edge,
+                            },
+                            "gates": {
+                                "status": "passed",
+                                "outcomes": list(
+                                    getattr(runtime.controller, "last_gate_outcomes", ())
+                                )
+                                + [{"name": "pre_actuator", "passed": True, "reason": None}],
+                                "strict_factor_gates": self.config.controller.strict_factor_gates,
+                                "factor_snapshot_hash": factor_snapshot_hash,
+                            },
+                            "sizing": {
+                                "notional_usdc": decision.notional_usdc,
+                                "limit_price": decision.limit_price,
+                                "max_slippage_bps": decision.max_slippage_bps,
+                            },
+                            "risk": {
+                                "approved": risk_approved,
+                                "reason": risk_reason,
+                                "halted": bool(
+                                    halt_preview is not None and halt_preview.halted
+                                ),
+                                "halt_reason": (
+                                    None
+                                    if halt_preview is None or not halt_preview.halted
+                                    else halt_preview.reason
+                                ),
+                            },
+                        }
                         await self.decision_store.insert(
                             decision,
                             factor_snapshot_hash=factor_snapshot_hash,
@@ -1821,6 +2171,7 @@ class Runner:
                     dedup_acquired=work_item.dedup_acquired,
                     paper_orderbook=work_item.paper_orderbook,
                 )
+                await self._persist_active_halt_if_needed()
                 _append_bounded(self.state.orders, order_state)
                 try:
                     await self.order_store.insert(order_state)
@@ -1834,18 +2185,39 @@ class Runner:
                         )
                     logger.warning("order persistence failed: %s", error)
                 self._record_live_order_risk_reservation(order_state)
-                # LIVE fills get their real fee from venue reconciliation; for
-                # paper/backtest, model it from the configured rate so net-edge
-                # metrics are not inflated.
+                live_fill = self.config.mode == RunMode.LIVE
+                # Every LIVE adapter path must carry venue fee evidence; fee
+                # estimation is reserved for PAPER/BACKTEST and cannot be
+                # selected by adapter duck typing.
                 fill_fee_rate = (
                     None
-                    if self.config.mode == RunMode.LIVE
-                    else self.config.strategies.flb_fee_rate
+                    if live_fill
+                    else self._paper_fill_fee_rate(decision)
                 )
                 fill = _fill_from_order(
                     order_state, decision, signal, fee_rate=fill_fee_rate
                 )
                 if fill is not None:
+                    run_mode_flag = f"run_mode={self.config.mode.value}"
+                    if run_mode_flag not in fill.anomaly_flags:
+                        fill = replace(
+                            fill,
+                            anomaly_flags=[*fill.anomaly_flags, run_mode_flag],
+                        )
+                fee_unreconciled = bool(
+                    live_fill and fill is not None and fill.fees is None
+                )
+                if fill is not None:
+                    realized_result = _risk_trade_result_from_fill(
+                        self.portfolio,
+                        fill,
+                        decision=decision,
+                    )
+                    risk_manager = getattr(self.actuator_executor, "risk", None)
+                    if realized_result is not None and risk_manager is not None:
+                        risk_manager.record_trade_result(
+                            realized_result
+                        )
                     _append_bounded(self.state.fills, fill)
                     if _is_selection_funnel_entry_fill(fill):
                         increment_metric(SELECTION_FUNNEL_TRADED_TOTAL_METRIC)
@@ -1861,6 +2233,14 @@ class Runner:
                             )
                         logger.warning("fill persistence failed: %s", error)
                     self.portfolio = _portfolio_with_fill(self.portfolio, fill)
+                    self.portfolio = _portfolio_with_risk_drawdown(
+                        self.portfolio,
+                        peak_equity=self._risk_peak_equity,
+                    )
+                    self._risk_peak_equity = max(
+                        self._risk_peak_equity,
+                        _portfolio_equity(self.portfolio),
+                    )
                     self._record_position_exit_reentry_quarantine(fill, decision)
                     decision_evidence = work_item.decision_evidence
                     if not decision_evidence and signal is not None:
@@ -1871,6 +2251,8 @@ class Runner:
                         )
                         decision_evidence = _decision_evidence_from_signal(
                             evidence_signal,
+                            settings=self.config,
+                            fee_rate=self._paper_fill_fee_rate(decision),
                             decision=decision,
                             factor_snapshot_hash=None,
                             quote_source=self.config.controller.quote_source,
@@ -1900,6 +2282,16 @@ class Runner:
                     current_status="submitted",
                     next_status=_decision_status_from_order(order_state),
                 )
+                if fee_unreconciled:
+                    await self._hard_halt_live_persistence_failure(
+                        phase="live_fill_fee",
+                        decision=decision,
+                        order_state=order_state,
+                        error=RuntimeError(
+                            "LIVE venue fill fee is unavailable; fill persisted "
+                            "with fee_unreconciled and new risk is suspended"
+                        ),
+                    )
             except PolymarketSubmissionUnknownError as error:
                 detail = _runtime_error_detail(error, self.config)
                 self._live_trading_suspended_reason = "submission_unknown"
@@ -1938,6 +2330,32 @@ class Runner:
                 )
             except LivePersistenceFailureError:
                 raise
+            except LiveTradingDisabledError as error:
+                reason = (
+                    "operator_gate_denied"
+                    if type(error).__name__ == "OperatorApprovalRequiredError"
+                    else (
+                        "venue_rejection"
+                        if isinstance(error, PolymarketVenueRejectionError)
+                        else "live_disabled"
+                    )
+                )
+                await self._update_decision_status_if_supported(
+                    decision.decision_id,
+                    current_status="submitted",
+                    next_status=(
+                        "venue_rejected"
+                        if isinstance(error, PolymarketVenueRejectionError)
+                        else "rejected"
+                    ),
+                )
+                await self.event_bus.publish(
+                    "error",
+                    f"live decision rejected ({reason}): "
+                    f"{_runtime_error_detail(error, self.config)}",
+                    market_id=decision.market_id,
+                    decision_id=decision.decision_id,
+                )
             except Exception as error:
                 detail = _runtime_error_detail(error, self.config)
                 await self.event_bus.publish(
@@ -1952,6 +2370,18 @@ class Runner:
                     self._release_position_exit_key(decision.decision_id)
                     self._release_position_capacity_reservation(decision.decision_id)
                 self._decision_queue.task_done()
+
+    def _paper_fill_fee_rate(self, decision: TradeDecision) -> float:
+        strategy = self._active_strategies_by_version.get(
+            (decision.strategy_id, decision.strategy_version_id)
+        )
+        if strategy is None:
+            return self.config.strategies.flb_fee_rate
+        return strategy_economic_float(
+            strategy,
+            "fee_rate",
+            self.config.strategies.flb_fee_rate,
+        )
 
     async def _decision_expiry_loop(self) -> None:
         while True:
@@ -2019,7 +2449,9 @@ class Runner:
                 # Per-fill processing failures (eval append or scoring) leave
                 # the fill unresolved for retry; they count as sweep failures
                 # so /status can distinguish them from healthy idle.
-                self._resolution_sweep_failures_total += result.fills_failed
+                self._resolution_sweep_failures_total += (
+                    result.fills_failed + result.persistence_failures
+                )
                 if result.fills_resolved > 0:
                     logger.info(
                         "resolution sweep resolved %d fill(s), appended %d "
@@ -2050,6 +2482,11 @@ class Runner:
                 decision_reader=self.decision_store,
                 eval_spool=self._evaluator_spool,
                 resolution_source=GammaResolutionSource(http_client=http_client),
+                resolution_store=(
+                    MarketResolutionStore(self._pg_pool)
+                    if self._pg_pool is not None
+                    else None
+                ),
             )
             return await sweeper.sweep_once()
 
@@ -2651,6 +3088,55 @@ class Runner:
             )
             return False
 
+    async def _persist_active_halt_if_needed(self) -> None:
+        if self.config.mode != RunMode.LIVE:
+            return
+        risk_manager = getattr(self.actuator_executor, "risk", None)
+        if risk_manager is None or not callable(
+            getattr(risk_manager, "active_halt", None)
+        ):
+            return
+        state = risk_manager.active_halt()
+        if state is None or state.triggered_at == self._persisted_halt_triggered_at:
+            return
+        try:
+            await LiveEmergencyAuditWriter(
+                Path(self.config.live_emergency_audit_path)
+            ).append_halt(state)
+        except Exception as error:  # noqa: BLE001
+            # A halt audit failure must not clear or bypass the in-memory
+            # breaker; surface the failure and keep LIVE suspended.
+            logger.error("live halt persistence failed: %s", error)
+            self._live_trading_suspended_reason = "halt_persistence_failure"
+            return
+        self._persisted_halt_triggered_at = state.triggered_at
+
+    async def clear_live_halt(
+        self,
+        *,
+        cleared_by: str,
+        token_id: str | None = None,
+    ) -> HaltState | None:
+        if self.config.mode != RunMode.LIVE:
+            raise RuntimeError("halt clear is only available in LIVE mode")
+        audit_writer = LiveEmergencyAuditWriter(
+            Path(self.config.live_emergency_audit_path)
+        )
+        await audit_writer.append_halt_clear(
+            cleared_by=cleared_by,
+            token_id=token_id,
+        )
+        self.actuator_executor.risk.clear_halt(preserve_open_orders=True)
+        self.portfolio = replace(self.portfolio, max_drawdown_pct=None)
+        self._risk_peak_equity = _portfolio_equity(self.portfolio)
+        self._persisted_halt_triggered_at = None
+        remaining = self.actuator_executor.risk.check_auto_halt(self.portfolio)
+        if not remaining.halted:
+            return None
+        await audit_writer.append_halt(remaining)
+        self._persisted_halt_triggered_at = remaining.triggered_at
+        return remaining
+
     async def _hard_halt_live_persistence_failure(
         self,
         *,
@@ -2835,6 +3321,33 @@ class Runner:
     async def _close_pg_pool(self) -> None:
         await self.close_pg_pool()
 
+    async def _discard_pending_actuator_work(self) -> None:
+        error: Exception | None = None
+        while not self._decision_queue.empty():
+            raw_work_item = self._decision_queue.get_nowait()
+            try:
+                work_item = _coerce_actuator_work_item(raw_work_item)
+                decision_id = work_item.decision.decision_id
+                # Only items still in the queue are known not to be submitted.
+                try:
+                    await self._update_decision_status_if_supported(
+                        decision_id, current_status="queued", next_status="cancelled",
+                    )
+                    if work_item.dedup_acquired:
+                        await self.actuator_executor.dedup_store.release(
+                            decision_id, "rejected",
+                        )
+                finally:
+                    self._release_position_exit_key(decision_id)
+                    self._release_position_capacity_reservation(decision_id)
+            except Exception as exc:
+                if error is None:
+                    error = exc
+            finally:
+                self._decision_queue.task_done()
+        if error is not None:
+            raise error
+
     async def _cleanup_after_start_failure(self) -> None:
         self._supervisor.stop()
         stop_error: BaseException | None = None
@@ -2849,8 +3362,8 @@ class Runner:
         resolution_sweep_task = self._resolution_sweep_task
         if resolution_sweep_task is not None and not resolution_sweep_task.done():
             resolution_sweep_task.cancel()
-        for task in self._controller_pipeline_tasks.values():
-            if not task.done():
+        for task in (self._controller_task, *self._controller_pipeline_tasks.values(), self._actuator_task):
+            if task is not None and not task.done():
                 task.cancel()
         reselection_task = self._reselection_task
         self._reselection_requested.set()
@@ -2864,7 +3377,9 @@ class Runner:
                     task
                     for task in (
                         self._factor_service_task,
+                        self._controller_task,
                         *self._controller_pipeline_tasks.values(),
+                        self._actuator_task,
                         decision_expiry_task,
                         runtime_heartbeat_task,
                         resolution_sweep_task,
@@ -2883,6 +3398,12 @@ class Runner:
         try:
             await self.sensor_stream.stop()
         except BaseException as exc:  # pragma: no cover - defensive
+            if stop_error is None:
+                stop_error = exc
+
+        try:
+            await self._discard_pending_actuator_work()
+        except BaseException as exc:
             if stop_error is None:
                 stop_error = exc
 
@@ -2909,6 +3430,9 @@ class Runner:
         self._subscription_controller = None
         self._strategy_registry = None
         self._controller_runtimes = {}
+        self._active_strategies_by_version = {}
+        for queue in self._controller_signal_queues.values():
+            queue.shutdown(immediate=True)
         self._controller_signal_queues = {}
         self._controller_pipeline_tasks = {}
         self._controller_release_cancel_point = None
@@ -2940,7 +3464,56 @@ class Runner:
         if pool is None:
             return
         try:
-            persisted_positions = await self.fill_store.read_positions()
+            fee_reader = getattr(self.fill_store, "read_fee_total_for_mode", None)
+            if callable(fee_reader) and isinstance(
+                getattr(self.fill_store, "pool", None), asyncpg.Pool
+            ):
+                reconciled_fee_total = await fee_reader(self.config.mode.value)
+            else:
+                reconciled_fee_total = 0.0
+            mode_reader = getattr(self.fill_store, "read_positions_for_mode", None)
+            if callable(mode_reader) and isinstance(
+                getattr(self.fill_store, "pool", None), asyncpg.Pool
+            ):
+                legacy_fill_ids = await self.fill_store.untagged_fill_ids()
+                if legacy_fill_ids and self.config.mode == RunMode.LIVE:
+                    raise RuntimeError(
+                        "LIVE portfolio reconciliation found untagged legacy fills: "
+                        + ", ".join(legacy_fill_ids)
+                        + "; run pms-live tag-fill-provenance --mode live "
+                        "--operator <operator> --evidence <evidence>"
+                    )
+                if legacy_fill_ids:
+                    logger.warning(
+                        "treating %d untagged legacy fills as PAPER provenance: %s",
+                        len(legacy_fill_ids),
+                        ", ".join(legacy_fill_ids),
+                    )
+                incomplete_fill_ids, incomplete_total = await self.fill_store.incomplete_fill_summary(
+                    run_mode=self.config.mode.value
+                )
+                if incomplete_fill_ids and self.config.mode == RunMode.LIVE:
+                    raise RuntimeError(
+                        "LIVE portfolio reconciliation found economically incomplete "
+                        "fills: "
+                        + ", ".join(incomplete_fill_ids)
+                        + (f" (+{incomplete_total - len(incomplete_fill_ids)} more)" if incomplete_total > len(incomplete_fill_ids) else "")
+                        + "; run pms-live reconcile-fill-economics --fill-id <fill-id> "
+                        "with verified ledger fields"
+                    )
+                if incomplete_fill_ids:
+                    logger.warning(
+                        "excluding %d economically incomplete fills from %s portfolio: %s",
+                        len(incomplete_fill_ids),
+                        self.config.mode.value,
+                        ", ".join(incomplete_fill_ids),
+                    )
+            if callable(mode_reader) and isinstance(
+                getattr(self.fill_store, "pool", None), asyncpg.Pool
+            ):
+                persisted_positions = await mode_reader(self.config.mode.value)
+            else:
+                persisted_positions = await self.fill_store.read_positions()
         except Exception as error:  # noqa: BLE001
             if self.config.mode == RunMode.LIVE:
                 # Fail closed in LIVE: silent degradation here recreates
@@ -2971,9 +3544,10 @@ class Runner:
             self.portfolio = replace(
                 self.portfolio,
                 locked_usdc=0.0,
-                free_usdc=total_budget,
+                free_usdc=max(0.0, total_budget - reconciled_fee_total),
                 open_positions=[],
             )
+            self._risk_peak_equity = _portfolio_equity(self.portfolio)
             logger.info(
                 "Reconciled portfolio from DB: 0 positions, $0.00 locked of $%.2f total",
                 total_budget,
@@ -2990,19 +3564,217 @@ class Runner:
             )
             free_usdc = 0.0
         else:
-            free_usdc = total_budget - total_locked
+            free_usdc = max(0.0, total_budget - total_locked - reconciled_fee_total)
         self.portfolio = replace(
             self.portfolio,
             locked_usdc=total_locked,
             free_usdc=free_usdc,
             open_positions=open_positions,
         )
+        self._risk_peak_equity = _portfolio_equity(self.portfolio)
         logger.info(
             "Reconciled portfolio from DB: %d positions, $%.2f locked of $%.2f total",
             len(open_positions),
             total_locked,
             total_budget,
         )
+
+    async def _reconcile_risk_from_db(self) -> None:
+        """Rebuild realized-loss telemetry before allowing LIVE orders."""
+        if self._pg_pool is None:
+            return
+        fill_pool = getattr(self.fill_store, "pool", None)
+        if not isinstance(fill_pool, asyncpg.Pool):
+            # Test doubles and explicitly in-memory runners can carry a
+            # sentinel _pg_pool for lifecycle tests without durable fills.
+            return
+        try:
+            replay_reader = getattr(self.fill_store, "read_trades_for_replay", None)
+            if callable(replay_reader):
+                trades = await replay_reader(page_size=10_000)
+            else:
+                # Compatibility for narrow test doubles; FillStore uses the
+                # repeatable-snapshot reader above in production.
+                expected_count = await self.fill_store.count_trades()
+                trades = []
+                offset = 0
+                while offset < expected_count:
+                    page = await self.fill_store.read_trades(
+                        limit=10_000, offset=offset
+                    )
+                    if not page:
+                        raise RuntimeError(
+                            "durable fill replay truncated before expected row count "
+                            f"({len(trades)} of {expected_count})"
+                        )
+                    trades.extend(page)
+                    offset += len(page)
+        except Exception as error:  # noqa: BLE001
+            if self.config.mode == RunMode.LIVE:
+                detail = _runtime_error_detail(error, self.config)
+                raise RuntimeError(
+                    "LIVE risk telemetry reconciliation failed "
+                    f"({type(error).__name__}: {detail}); refusing to start "
+                    "without verified trade results"
+                ) from error
+            logger.warning("risk telemetry reconciliation failed: %s", error)
+            return
+        risk_manager = getattr(self.actuator_executor, "risk", None)
+        if risk_manager is None or not callable(getattr(risk_manager, "active_halt", None)):
+            return
+        positions: dict[tuple[str, str | None, str, str, str], tuple[float, float, str]] = {}
+        cumulative_pnl = Decimal("0")
+        peak_equity = Decimal(str(self.portfolio.total_usdc))
+        max_drawdown_pct = Decimal(str(self.portfolio.max_drawdown_pct or 0.0))
+        clear_cutoff = read_last_halt_clear(
+            Path(self.config.live_emergency_audit_path)
+        )
+        if self.config.mode == RunMode.LIVE:
+            unknown_provenance = [
+                trade.fill_id
+                for trade in trades
+                if trade.run_mode is None and isinstance(self.fill_store, FillStore)
+            ]
+            if unknown_provenance:
+                shown = unknown_provenance[:20]
+                omitted = len(unknown_provenance) - len(shown)
+                suffix = f"; {omitted} more" if omitted > 0 else ""
+                raise RuntimeError(
+                    "LIVE risk telemetry has fills with unknown run mode: "
+                    + ", ".join(shown)
+                    + suffix
+                    + "; backfill durable run_mode provenance before restarting"
+                )
+        if isinstance(self.fill_store, FillStore):
+            legacy_count = sum(trade.run_mode is None for trade in trades)
+            if legacy_count and self.config.mode in {RunMode.PAPER, RunMode.BACKTEST}:
+                logger.warning(
+                    "treating %d untagged legacy fills as PAPER provenance during risk replay",
+                    legacy_count,
+                )
+            trades = [
+                trade
+                for trade in trades
+                if trade.run_mode == self.config.mode.value
+                or (
+                    trade.run_mode is None
+                    and self.config.mode in {RunMode.PAPER, RunMode.BACKTEST}
+                )
+            ]
+        if self.config.mode == RunMode.LIVE:
+            unresolved_telemetry: list[str] = []
+            for trade in trades:
+                missing: list[str] = []
+                if trade.fees is None:
+                    missing.append("fee")
+                if trade.slippage_bps is None:
+                    missing.append("execution_slippage")
+                if trade.fee_reconcile_audit_pending:
+                    missing.append("fee_audit")
+                if missing:
+                    unresolved_telemetry.append(
+                        f"{trade.fill_id} ({', '.join(missing)})"
+                    )
+            if unresolved_telemetry:
+                shown = unresolved_telemetry[:20]
+                omitted = len(unresolved_telemetry) - len(shown)
+                suffix = f"; {omitted} more" if omitted > 0 else ""
+                raise RuntimeError(
+                    "LIVE risk telemetry has unresolved fills: "
+                    + ", ".join(shown)
+                    + suffix
+                    + "; reconcile telemetry with: pms-live "
+                    "reconcile-live-fee --fill-id <fill-id> "
+                    "[--fees <venue-fee>] "
+                    "[--slippage-bps <execution-slippage-bps>] "
+                    "--reconciled-by <operator> --evidence <venue-evidence> "
+                    "[--override]"
+                )
+        clear_day_start = (
+            clear_cutoff.astimezone(UTC).replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            if clear_cutoff is not None
+            else None
+        )
+        for trade in sorted(
+            trades,
+            key=lambda item: (
+                item.filled_at,
+                item.executed_at,
+                item.order_id,
+                item.fill_id,
+            ),
+        ):
+            include_risk_telemetry = (
+                clear_day_start is None or trade.filled_at >= clear_day_start
+            )
+            key = (
+                trade.market_id,
+                trade.token_id,
+                trade.venue,
+                trade.strategy_id,
+                trade.strategy_version_id,
+            )
+            shares, avg_price, side = positions.get(key, (0.0, 0.0, trade.side))
+            if shares > 1e-9 and side != trade.side:
+                closing = min(shares, trade.fill_quantity)
+                direction = Decimal("1") if side.upper() == "BUY" else Decimal("-1")
+                pnl = (
+                    direction
+                    * (Decimal(str(trade.fill_price)) - Decimal(str(avg_price)))
+                    * Decimal(str(closing))
+                    - Decimal(str(trade.fees or 0.0))
+                )
+                if include_risk_telemetry:
+                    risk_manager.record_trade_result(
+                        RiskTradeResult(
+                            pnl=float(pnl),
+                            slippage_bps=trade.slippage_bps or 0.0,
+                            filled_at=trade.filled_at,
+                            trace_id=trade.trade_id,
+                        )
+                    )
+                    cumulative_pnl += pnl
+                    equity = Decimal(str(self.portfolio.total_usdc)) + cumulative_pnl
+                    peak_equity = max(peak_equity, equity)
+                    if peak_equity > 0:
+                        max_drawdown_pct = max(
+                            max_drawdown_pct,
+                            (peak_equity - equity) / peak_equity * Decimal("100"),
+                        )
+                shares -= closing
+                if shares <= 1e-9:
+                    positions.pop(key, None)
+                else:
+                    positions[key] = (shares, avg_price, side)
+                if trade.fill_quantity <= closing + 1e-9:
+                    continue
+                trade_quantity = trade.fill_quantity - closing
+                positions[key] = (trade_quantity, trade.fill_price, trade.side)
+                continue
+            if shares <= 1e-9:
+                positions[key] = (trade.fill_quantity, trade.fill_price, trade.side)
+            else:
+                total_shares = shares + trade.fill_quantity
+                avg_price = float(
+                    (
+                        Decimal(str(avg_price)) * Decimal(str(shares))
+                        + Decimal(str(trade.fill_price))
+                        * Decimal(str(trade.fill_quantity))
+                    )
+                    / Decimal(str(total_shares))
+                )
+                positions[key] = (total_shares, avg_price, side)
+        if max_drawdown_pct > 0:
+            self.portfolio = replace(
+                self.portfolio,
+                max_drawdown_pct=float(max_drawdown_pct),
+            )
+        self._risk_peak_equity = _portfolio_equity(self.portfolio)
 
     async def _reconcile_venue_account(self) -> None:
         if self.config.mode != RunMode.LIVE:
@@ -3037,12 +3809,26 @@ class Runner:
         if selector is None or subscription_controller is None:
             return
         async with self._reselection_lock:
+            self._reselection_generation += 1
+            generation = self._reselection_generation
+        # Serialize selector reads without holding the subscription lock; the
+        # DB pool may wait here, while the bounded websocket update below does
+        # not hold a pool-backed lock.
+        async with self._market_selection_lock:
             result = await selector.select()
+        protected_asset_ids = [
+            *_open_position_token_ids(self.portfolio),
+            *sorted(_selector_user_subscription_asset_ids(selector)),
+        ]
+        async with self._reselection_lock:
+            if generation != self._reselection_generation:
+                self._reselection_requested.set()
+                return
             await subscription_controller.update(
                 _cap_subscription_asset_ids(
                     list(result.asset_ids),
                     self.config,
-                    protected_asset_ids=_open_position_token_ids(self.portfolio),
+                    protected_asset_ids=protected_asset_ids,
                 )
             )
 
@@ -3145,7 +3931,17 @@ class Runner:
         )
 
     def _attach_controller_runtime(self, runtime: StrategyControllerRuntime) -> None:
-        signal_queue: asyncio.Queue[MarketSignal] = asyncio.Queue()
+        capacity = (
+            max(1, len(runtime.asset_ids))
+            if runtime.asset_ids is not None
+            else self.config.sensor.max_subscription_asset_ids
+            or CONTROLLER_SIGNAL_QUEUE_FALLBACK_LIMIT
+        )
+        signal_queue: asyncio.Queue[MarketSignal] = (
+            asyncio.Queue(maxsize=capacity)
+            if self.config.mode == RunMode.BACKTEST
+            else _LatestControllerSignalQueue(maxsize=capacity)
+        )
         self._controller_runtimes[runtime.strategy_id] = runtime
         self._controller_signal_queues[runtime.strategy_id] = signal_queue
         task = asyncio.create_task(
@@ -3265,6 +4061,8 @@ class Runner:
         task = self._controller_pipeline_tasks.pop(strategy_id, None)
         if runtime is None and queue is None and task is None:
             return None
+        if queue is not None:
+            queue.shutdown(immediate=True)
         current_task = asyncio.current_task()
         if task is not None and task is not current_task and not task.done():
             task.cancel()
@@ -3315,12 +4113,21 @@ class Runner:
                 for asset_id in asset_ids
             }
         )
+        selector = self._market_selector
         async with self._reselection_lock:
+            self._reselection_generation += 1
             await subscription_controller.update(
                 _cap_subscription_asset_ids(
                     merged_asset_ids,
                     self.config,
-                    protected_asset_ids=_open_position_token_ids(self.portfolio),
+                    protected_asset_ids=[
+                        *_open_position_token_ids(self.portfolio),
+                        *(
+                            sorted(_selector_user_subscription_asset_ids(selector))
+                            if selector is not None
+                            else []
+                        ),
+                    ],
                 )
             )
 
@@ -3341,7 +4148,7 @@ class Runner:
         while True:
             try:
                 queue.get_nowait()
-            except asyncio.QueueEmpty:
+            except (asyncio.QueueEmpty, asyncio.QueueShutDown):
                 return
             queue.task_done()
 
@@ -3355,7 +4162,13 @@ class Runner:
             self._attach_controller_runtime(runtime)
 
     async def _build_controller_runtimes(self) -> list[StrategyControllerRuntime]:
+        self._active_strategies_by_version = {}
         if self.controller is not None:
+            strategy = getattr(self.controller, "strategy", None)
+            if isinstance(strategy, ActiveStrategy):
+                self._active_strategies_by_version = {
+                    (strategy.strategy_id, strategy.strategy_version_id): strategy
+                }
             return [
                 StrategyControllerRuntime(
                     strategy_id="default",
@@ -3373,6 +4186,10 @@ class Runner:
             active_strategies = await registry.list_active_strategies()
             if not active_strategies:
                 return []
+            self._active_strategies_by_version = {
+                (strategy.strategy_id, strategy.strategy_version_id): strategy
+                for strategy in active_strategies
+            }
             self._require_live_active_strategies_match_preflight(active_strategies)
             scopes: dict[str, frozenset[str]] = {}
             if (
@@ -3396,6 +4213,11 @@ class Runner:
             ]
 
         default_strategy = _default_active_strategy(self.config)
+        self._active_strategies_by_version = {
+            (default_strategy.strategy_id, default_strategy.strategy_version_id): (
+                default_strategy
+            )
+        }
         pipeline = self._controller_factory.build(default_strategy)
         return [
             StrategyControllerRuntime(
@@ -3725,6 +4547,19 @@ def _find_subscription_sink(
     return None
 
 
+def _selector_user_subscription_asset_ids(
+    selector: MarketSelectorLike,
+) -> frozenset[str]:
+    value: object = getattr(
+        selector,
+        "last_user_subscription_asset_ids",
+        frozenset(),
+    )
+    if isinstance(value, frozenset):
+        return cast(frozenset[str], value)
+    return frozenset(cast(Sequence[str], value))
+
+
 def _matches_strategy_scope(
     asset_ids: frozenset[str] | None,
     signal: MarketSignal,
@@ -3777,6 +4612,11 @@ def _default_active_strategy(settings: PMSSettings) -> ActiveStrategy:
         eval_spec,
         forecaster,
         market_selection,
+        llm_identity=(
+            settings.llm.provider,
+            settings.llm.model,
+            settings.llm.prompt_version,
+        ) if settings.llm.enabled else None,
     )
     return ActiveStrategy(
         strategy_id="default",
@@ -3820,12 +4660,14 @@ def _cap_subscription_asset_ids(
     limit = settings.sensor.max_subscription_asset_ids
     if limit is None or len(merged_asset_ids) <= limit:
         return merged_asset_ids
+    dropped_asset_ids = merged_asset_ids[limit:]
     logger.warning(
         "subscription asset set capped at %d of %d selected assets; "
-        "%d open-position assets protected",
+        "%d protected assets; dropped=%s",
         limit,
         len(merged_asset_ids),
         len(protected),
+        dropped_asset_ids,
     )
     return merged_asset_ids[:limit]
 
@@ -3980,7 +4822,22 @@ def _fill_from_order(
     # synthesize over it. Formula matches ExecutionModel.compute_fee.
     fees: float | None = None
     fee_bps: int | None = None
-    if fee_rate is not None:
+    anomaly_flags: list[str] = []
+    venue_fee = order_state.pre_submit_quote.get("fees")
+    if venue_fee is not None:
+        try:
+            fees = float(venue_fee)
+        except (TypeError, ValueError):
+            fees = None
+        if fees is not None and not isfinite(fees):
+            fees = None
+        raw_fee_bps = order_state.pre_submit_quote.get("fee_bps")
+        if raw_fee_bps is not None:
+            try:
+                fee_bps = int(raw_fee_bps)
+            except (TypeError, ValueError):
+                fee_bps = None
+    if fees is None and fee_rate is not None:
         effective_fee_rate = (
             market_fee_rate_from_metadata(
                 signal.external_signal,
@@ -3995,6 +4852,25 @@ def _fill_from_order(
             * (1.0 - order_state.fill_price)
         )
         fee_bps = int(effective_fee_rate * 10_000)
+        anomaly_flags.append("fee_estimated")
+    elif fees is None:
+        anomaly_flags.append("fee_unreconciled")
+    if decision.limit_price > 0.0:
+        if (decision.action or decision.side).upper() == "BUY":
+            execution_slippage_bps = (
+                (order_state.fill_price - decision.limit_price)
+                / decision.limit_price
+                * 10_000.0
+            )
+        else:
+            execution_slippage_bps = (
+                (decision.limit_price - order_state.fill_price)
+                / decision.limit_price
+                * 10_000.0
+            )
+        anomaly_flags.append(
+            f"execution_slippage_bps={execution_slippage_bps:.9f}"
+        )
 
     return FillRecord(
         trade_id=order_state.order_id,
@@ -4010,7 +4886,7 @@ def _fill_from_order(
         executed_at=order_state.submitted_at,
         filled_at=order_state.last_updated_at,
         status=order_state.status,
-        anomaly_flags=[],
+        anomaly_flags=anomaly_flags,
         strategy_id=decision.strategy_id,
         strategy_version_id=decision.strategy_version_id,
         resolved_outcome=_resolved_outcome(signal),
@@ -4071,20 +4947,32 @@ def _is_open_order_state(order_state: OrderState) -> bool:
 
 def _portfolio_with_fill(portfolio: Portfolio, fill: FillRecord) -> Portfolio:
     positions = list(portfolio.open_positions)
-    fill_size = fill.fill_notional_usdc
+    fill_size_dec = Decimal(str(fill.fill_notional_usdc))
+    fill_fees_dec = Decimal(str(fill.fees or 0.0))
+    fill_size = float(fill_size_dec)
+    fill_fees = float(fill_fees_dec)
     contracts = _filled_contracts(fill)
     for index, position in enumerate(positions):
         if _same_position(position, fill):
-            new_shares = position.shares_held + contracts
-            avg_entry_price = (
-                position.avg_entry_price * position.shares_held
-                + fill.fill_price * contracts
-            ) / new_shares
+            new_shares_dec = Decimal(str(position.shares_held)) + Decimal(
+                str(contracts)
+            )
+            avg_entry_price = float(
+                (
+                    Decimal(str(position.avg_entry_price))
+                    * Decimal(str(position.shares_held))
+                    + Decimal(str(fill.fill_price)) * Decimal(str(contracts))
+                )
+                / new_shares_dec
+            )
+            new_shares = float(new_shares_dec)
             positions[index] = replace(
                 position,
                 shares_held=new_shares,
                 avg_entry_price=avg_entry_price,
-                locked_usdc=position.locked_usdc + fill_size,
+                locked_usdc=float(
+                    Decimal(str(position.locked_usdc)) + fill_size_dec
+                ),
                 current_price=fill.fill_price,
                 risk_group_id=position.risk_group_id or fill.risk_group_id,
             )
@@ -4106,7 +4994,7 @@ def _portfolio_with_fill(portfolio: Portfolio, fill: FillRecord) -> Portfolio:
                     )
                 return replace(
                     portfolio,
-                    free_usdc=portfolio.free_usdc + fill_size,
+                    free_usdc=portfolio.free_usdc + fill_size - fill_fees,
                     locked_usdc=max(0.0, portfolio.locked_usdc - released_locked),
                     open_positions=positions,
                 )
@@ -4129,9 +5017,82 @@ def _portfolio_with_fill(portfolio: Portfolio, fill: FillRecord) -> Portfolio:
         )
     return replace(
         portfolio,
-        free_usdc=portfolio.free_usdc - fill_size,
+        free_usdc=portfolio.free_usdc - fill_size - fill_fees,
         locked_usdc=portfolio.locked_usdc + fill_size,
         open_positions=positions,
+    )
+
+
+def _portfolio_equity(portfolio: Portfolio) -> float:
+    return portfolio.free_usdc + portfolio.locked_usdc + sum(
+        position.unrealized_pnl for position in portfolio.open_positions
+    )
+
+
+def _portfolio_with_risk_drawdown(
+    portfolio: Portfolio,
+    *,
+    peak_equity: float,
+) -> Portfolio:
+    equity = Decimal(str(_portfolio_equity(portfolio)))
+    peak = Decimal(str(peak_equity))
+    if peak <= 0:
+        return portfolio
+    drawdown_pct = max(Decimal("0"), (peak - equity) / peak * Decimal("100"))
+    prior = Decimal(str(portfolio.max_drawdown_pct or 0.0))
+    return replace(
+        portfolio,
+        max_drawdown_pct=float(max(prior, drawdown_pct)),
+    )
+
+
+def _risk_trade_result_from_fill(
+    portfolio: Portfolio,
+    fill: FillRecord,
+    *,
+    decision: TradeDecision | None = None,
+) -> RiskTradeResult | None:
+    """Return realized PnL for the closing portion of a fill, if any."""
+    closing = next(
+        (
+            position
+            for position in portfolio.open_positions
+            if _opposes_position(position, fill)
+        ),
+        None,
+    )
+    if closing is None:
+        return None
+    contracts = min(closing.shares_held, fill.fill_quantity)
+    if contracts <= 1e-9:
+        return None
+    direction = Decimal("1") if closing.side.upper() == "BUY" else Decimal("-1")
+    contracts_decimal = Decimal(str(contracts))
+    pnl_decimal = (
+        direction
+        * (Decimal(str(fill.fill_price)) - Decimal(str(closing.avg_entry_price)))
+        * contracts_decimal
+        - Decimal(str(fill.fees or 0.0))
+    )
+    slippage_decimal = Decimal("0")
+    if decision is not None and decision.limit_price > 0.0:
+        if fill.side.upper() == "BUY":
+            slippage_decimal = (
+                (Decimal(str(fill.fill_price)) - Decimal(str(decision.limit_price)))
+                / Decimal(str(decision.limit_price))
+                * Decimal("10000")
+            )
+        else:
+            slippage_decimal = (
+                (Decimal(str(decision.limit_price)) - Decimal(str(fill.fill_price)))
+                / Decimal(str(decision.limit_price))
+                * Decimal("10000")
+            )
+    return RiskTradeResult(
+        pnl=float(pnl_decimal),
+        slippage_bps=float(slippage_decimal),
+        filled_at=fill.filled_at,
+        trace_id=fill.trade_id,
     )
 
 
@@ -4176,10 +5137,7 @@ def _opposes_position(position: Position, fill: FillRecord) -> bool:
 def _resolved_outcome(signal: MarketSignal | None) -> float | None:
     if signal is None:
         return None
-    raw_outcome = signal.external_signal.get("resolved_outcome")
-    if raw_outcome is not None:
-        return min(max(float(raw_outcome), 0.0), 1.0)
-    return None
+    return normalize_resolved_outcome(signal.external_signal.get("resolved_outcome"))
 
 
 def _coerce_actuator_work_item(
@@ -4312,9 +5270,9 @@ def _raw_factor_steps(
     for step in steps:
         role = getattr(step, "role", None)
         factor_id = getattr(step, "factor_id", None)
-        if role not in RAW_FACTOR_COMPOSITION_ROLES:
+        if role not in RAW_FACTOR_ROLES:
             continue
-        if factor_id not in REGISTERED_FACTOR_IDS:
+        if factor_id not in REGISTERED_FACTOR_IDS and factor_id not in AGENT_FACTOR_IDS:
             continue
         raw_steps.append(step)
     return tuple(raw_steps)
@@ -4323,11 +5281,13 @@ def _raw_factor_steps(
 def _decision_evidence_from_signal(
     signal: MarketSignal,
     *,
+    settings: PMSSettings,
     decision: TradeDecision,
     factor_snapshot_hash: str | None,
     quote_source: str,
     decision_created_at: datetime,
     spread_already_in_price: bool = False,
+    fee_rate: float | None = None,
 ) -> dict[str, object]:
     book_top_levels = _top_orderbook_levels(signal.orderbook)
     book_token_outcome = _book_token_outcome(signal, decision)
@@ -4345,6 +5305,9 @@ def _decision_evidence_from_signal(
         "decision_side": decision.side,
         "venue": signal.venue,
         "market_status": signal.market_status,
+        "category": _optional_text(
+            signal.external_signal.get("category")
+        ) or _optional_text(signal.external_signal.get("market_category")),
         "signal_fetched_at": signal.fetched_at.isoformat(),
         "yes_price": canonical_yes_price,
         "direct_token_price": signal.yes_price,
@@ -4392,6 +5355,8 @@ def _decision_evidence_from_signal(
         **_decision_cost_evidence(
             signal,
             decision,
+            settings=settings,
+            fee_rate=fee_rate,
             spread_already_in_price=spread_already_in_price,
         ),
         "external_signal_keys": sorted(str(key) for key in signal.external_signal),
@@ -4402,56 +5367,44 @@ def _decision_cost_evidence(
     signal: MarketSignal,
     decision: TradeDecision,
     *,
+    settings: PMSSettings,
+    fee_rate: float | None = None,
     spread_already_in_price: bool = False,
 ) -> dict[str, float | bool]:
     price = Decimal(str(decision.limit_price))
     if not price.is_finite() or price < 0:
         return {}
-
-    evidence: dict[str, float | bool] = {}
-    total_cost_edge = Decimal("0")
-    has_cost_evidence = False
-
+    costs = _decision_cost_edges(
+        decision_price=decision.limit_price,
+        spread_bps=(
+            max(0, decision.spread_bps_at_decision)
+            if decision.spread_bps_at_decision is not None
+            else None
+        ),
+        settings=settings,
+        fee_rate=market_fee_rate_from_metadata(
+            signal.external_signal,
+            fallback_rate=(
+                settings.strategies.flb_fee_rate if fee_rate is None else fee_rate
+            ),
+        ),
+        max_slippage_bps=max(0, decision.max_slippage_bps),
+        spread_already_in_price=spread_already_in_price,
+    )
+    evidence: dict[str, float | bool] = {
+        "fee_rate": costs.fee_rate,
+        "fee_edge_at_decision": costs.fee_edge,
+        "spread_edge_at_decision": costs.spread_edge,
+        "slippage_edge_at_decision": costs.slippage_edge,
+        "total_cost_edge_at_decision": costs.total_edge,
+    }
     fee_rate_bps = _optional_float(signal.external_signal.get("fee_rate_bps"))
     if fee_rate_bps is not None and 0.0 <= fee_rate_bps <= 10_000.0:
-        fee_rate = Decimal(str(fee_rate_bps)) / Decimal("10000")
-        fee_edge = fee_rate * (Decimal("1.0") - price)
         evidence["fee_rate_bps"] = fee_rate_bps
-        evidence["fee_rate"] = float(fee_rate)
-        evidence["fee_edge_at_decision"] = float(fee_edge)
-        total_cost_edge += fee_edge
-        has_cost_evidence = True
-
-    spread_bps = _optional_float(decision.spread_bps_at_decision)
     if spread_already_in_price:
-        # Ask-frame decisions already paid the spread inside expected_edge;
-        # keep the key present (the h1_flb smoke check requires it) but
-        # charge zero so net_edge_after_costs matches the gate arithmetic.
-        spread_edge = Decimal("0")
-        evidence["spread_edge_at_decision"] = float(spread_edge)
         evidence["spread_already_in_price"] = True
-        total_cost_edge += spread_edge
-        has_cost_evidence = True
-    elif spread_bps is not None and spread_bps >= 0.0:
-        spread_edge = (Decimal(str(spread_bps)) / Decimal("10000")) * price
-        evidence["spread_edge_at_decision"] = float(spread_edge)
-        total_cost_edge += spread_edge
-        has_cost_evidence = True
-
-    slippage_bps = _optional_float(decision.max_slippage_bps)
-    if slippage_bps is not None and slippage_bps >= 0.0:
-        slippage_edge = (Decimal(str(slippage_bps)) / Decimal("10000")) * price
-        evidence["slippage_edge_at_decision"] = float(slippage_edge)
-        total_cost_edge += slippage_edge
-        has_cost_evidence = True
-
-    if not has_cost_evidence:
-        return evidence
-
-    evidence["total_cost_edge_at_decision"] = float(total_cost_edge)
-    expected_edge = Decimal(str(decision.expected_edge))
-    if expected_edge.is_finite():
-        evidence["net_edge_after_costs"] = float(expected_edge - total_cost_edge)
+    if isfinite(decision.expected_edge):
+        evidence["net_edge_after_costs"] = decision.expected_edge - costs.total_edge
     return evidence
 
 
@@ -4559,7 +5512,9 @@ def _controller_can_refresh_queued_book(controller: object) -> bool:
 def _controller_direct_book_reader(
     settings: PMSSettings,
     market_data_store: PostgresMarketDataStore,
-) -> PostgresMarketDataStore | RefreshingDirectBookSnapshotReader:
+) -> PostgresMarketDataStore | RefreshingDirectBookSnapshotReader | None:
+    if settings.mode == RunMode.BACKTEST:
+        return None
     if not settings.controller.venue_book_refresh_enabled:
         return market_data_store
     return RefreshingDirectBookSnapshotReader(
@@ -4675,7 +5630,35 @@ def _h1_flb_strategy_from_settings(
     return build_h1_flb_strategy(
         calibration_csv_sha256=provenance.calibration_csv_sha256,
         calibration_source_label=provenance.calibration_source_label,
+        time_in_force=settings.controller.time_in_force,
     )
+
+
+def _verify_runtime_strategy_version(
+    strategy: Strategy,
+    strategy_version_id: str,
+    *,
+    legacy_ids: Collection[str],
+) -> str:
+    expected_version_id = compute_strategy_version_id(*strategy.snapshot())
+    if strategy_version_id == expected_version_id:
+        return expected_version_id
+    if strategy_version_id in legacy_ids:
+        logger.warning(
+            "legacy runtime strategy version accepted with economics drift",
+            extra={
+                "event": "strategy_economics_version_drift",
+                "strategy_id": strategy.config.strategy_id,
+                "strategy_version_id": strategy_version_id,
+                "expected_version_id": expected_version_id,
+            },
+        )
+        return strategy_version_id
+    msg = (
+        "strategy_version_id does not match runtime strategy projection: "
+        f"row={strategy_version_id!r}, expected={expected_version_id!r}"
+    )
+    raise ValueError(msg)
 
 
 def _market_implied_baseline_prob_estimate(decision: TradeDecision) -> float:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pms.core.models import MarketSignal
+from pms.core.validation import validate_quantity
 from pms.factors.base import FactorDefinition, FactorValueRow, OuterRingReader
 
 
@@ -24,5 +25,5 @@ class YesCount(FactorDefinition):
             param="",
             market_id=signal.market_id,
             ts=signal.timestamp,
-            value=float(raw_yes_count),
+            value=validate_quantity(raw_yes_count, field_name="external_signal.yes_count"),
         )

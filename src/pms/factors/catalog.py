@@ -81,7 +81,7 @@ FACTOR_CATALOG_ROWS: tuple[FactorCatalogEntry, ...] = (
         input_schema_hash="27ec38b9caa18da4ad771cdfac2bb3c1727dd44da8d50c7d9a9e2bbd84f552a4",
         output_type="scalar",
         direction="neutral",
-        owner="system",
+        owner="deferred",
     ),
     FactorCatalogEntry(
         factor_id="contradiction_relation",
@@ -90,7 +90,7 @@ FACTOR_CATALOG_ROWS: tuple[FactorCatalogEntry, ...] = (
         input_schema_hash="f471eaed6525a85335173285f4fa692193678d027106d8d60458751c839acabc",
         output_type="scalar",
         direction="neutral",
-        owner="system",
+        owner="deferred",
     ),
     FactorCatalogEntry(
         factor_id="semantic_similarity",
@@ -99,7 +99,7 @@ FACTOR_CATALOG_ROWS: tuple[FactorCatalogEntry, ...] = (
         input_schema_hash="078ca015846d22223ad7cdce31e1cae9a75bc8b44919e0ee2fdb6d8733d7852d",
         output_type="scalar",
         direction="neutral",
-        owner="system",
+        owner="deferred",
     ),
     FactorCatalogEntry(
         factor_id="cross_market_mispricing",
@@ -108,7 +108,7 @@ FACTOR_CATALOG_ROWS: tuple[FactorCatalogEntry, ...] = (
         input_schema_hash="dafee0e995dadb1c8dc140a3d2b7a1186690ae33f4d9c21361b837a44c504385",
         output_type="scalar",
         direction="neutral",
-        owner="system",
+        owner="deferred",
     ),
     FactorCatalogEntry(
         factor_id="metaculus_prior",
@@ -118,6 +118,15 @@ FACTOR_CATALOG_ROWS: tuple[FactorCatalogEntry, ...] = (
         output_type="probability",
         direction="neutral",
         owner="system",
+    ),
+    FactorCatalogEntry(
+        factor_id="agent_probability",
+        name="Agent Probability",
+        description="Externally submitted point-in-time probability from an agent.",
+        input_schema_hash="3e8b3b26e3d6a9f3f7db8eb5d651c7adf3a2d3cf9f6f21f4b5b11f4aa2a2c5ef",
+        output_type="probability",
+        direction="neutral",
+        owner="agent:llm",
     ),
     FactorCatalogEntry(
         factor_id="yes_count",
@@ -139,6 +148,21 @@ FACTOR_CATALOG_ROWS: tuple[FactorCatalogEntry, ...] = (
     ),
 )
 
+AGENT_FACTOR_IDS = frozenset(
+    entry.factor_id for entry in FACTOR_CATALOG_ROWS if entry.owner.startswith("agent:")
+)
+
+
+def catalog_entry(factor_id: str) -> FactorCatalogEntry | None:
+    return next(
+        (entry for entry in FACTOR_CATALOG_ROWS if entry.factor_id == factor_id),
+        None,
+    )
+
+
+def is_agent_factor(factor_id: str) -> bool:
+    return factor_id in AGENT_FACTOR_IDS
+
 
 class _AsyncAcquireContext(Protocol):
     async def __aenter__(self) -> object: ...
@@ -154,13 +178,47 @@ class _AsyncAcquireContext(Protocol):
 def _select_entries(
     factor_ids: Sequence[str] | None,
 ) -> tuple[FactorCatalogEntry, ...]:
-    available = {entry.factor_id: entry for entry in FACTOR_CATALOG_ROWS}
+    # Relation factors are intentionally not advertised until a production
+    # writer/lifecycle is wired (F-13).  Keeping their definitions here makes
+    # the storage format forwards-compatible while preventing catalog users
+    # from depending on values that can never be populated.
+    available = {
+        entry.factor_id: entry
+        for entry in FACTOR_CATALOG_ROWS
+        if entry.owner != "deferred"
+    }
     selected_ids = tuple(factor_ids) if factor_ids is not None else tuple(available)
     missing_ids = sorted(set(selected_ids) - set(available))
     if missing_ids:
         msg = f"unknown factor catalog ids: {', '.join(missing_ids)}"
         raise ValueError(msg)
     return tuple(available[factor_id] for factor_id in selected_ids)
+
+
+def validate_registered_factor_catalog() -> None:
+    """Fail loudly if a compute-capable factor is absent from the catalog."""
+
+    from pms.factors.definitions import REGISTERED
+
+    registered_ids = {factor.factor_id for factor in REGISTERED}
+    catalog_ids = {entry.factor_id for entry in FACTOR_CATALOG_ROWS}
+    missing_ids = sorted(registered_ids - catalog_ids)
+    if missing_ids:
+        msg = "registered factors missing from catalog: " + ", ".join(missing_ids)
+        raise ValueError(msg)
+    # Agent-owned rows are external observations.  They intentionally have no
+    # FactorDefinition: adding one would make FactorService overwrite them.
+    unregistered_ids = sorted(
+        entry.factor_id
+        for entry in FACTOR_CATALOG_ROWS
+        if (
+            entry.owner != "deferred" and not entry.owner.startswith("agent:")
+            and entry.factor_id not in registered_ids
+        )
+    )
+    if unregistered_ids:
+        msg = "catalog factors missing from REGISTERED: " + ", ".join(unregistered_ids)
+        raise ValueError(msg)
 
 
 async def seed_factor_catalog(

@@ -5,13 +5,14 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any, Final, Literal, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from pms.actuator.risk import RiskDecision
 from pms.core.models import Opportunity, Portfolio, TradeDecision
 
 
 class AcceptDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     factor_snapshot_hash: str
 
 

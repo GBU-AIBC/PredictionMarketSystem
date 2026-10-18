@@ -133,6 +133,7 @@ def _open_order_state(decision: TradeDecision) -> OrderState:
         time_in_force=decision.time_in_force.value,
         intent_key=decision.intent_key,
         risk_group_id=decision.risk_group_id,
+        pre_submit_quote={"fees": 0.0, "fee_bps": 0},
     )
 
 

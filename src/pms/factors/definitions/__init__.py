@@ -22,8 +22,16 @@ REGISTERED: tuple[type[FactorDefinition], ...] = (
     YesCount,
 )
 
+
+def current_definition_version(factor_id: str) -> str:
+    for factor_cls in REGISTERED:
+        if factor_cls.factor_id == factor_id:
+            return factor_cls.definition_version
+    return "1"
+
 __all__ = (
     "REGISTERED",
+    "current_definition_version",
     "AnchoringLagDivergence",
     "FavoriteLongshotBias",
     "FairValueSpread",

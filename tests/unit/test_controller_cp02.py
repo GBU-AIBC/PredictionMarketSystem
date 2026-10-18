@@ -54,6 +54,19 @@ class CountingForecaster(StaticForecaster):
         return super().predict(signal)
 
 
+class StaticSizer:
+    def size(
+        self,
+        *,
+        prob: float,
+        market_price: float,
+        portfolio: Portfolio,
+        cost_edge: float = 0.0,
+    ) -> float:
+        del prob, market_price, portfolio, cost_edge
+        return 1.0
+
+
 def test_pipeline_funnel_log_updates_live_metrics() -> None:
     routed_before = get_metric(SELECTION_FUNNEL_ROUTED_TOTAL_METRIC) or 0.0
     forecasted_before = get_metric(SELECTION_FUNNEL_FORECASTED_TOTAL_METRIC) or 0.0
@@ -390,6 +403,51 @@ async def test_controller_pipeline_on_signal_emits_opportunity_and_linked_decisi
     assert decision.strategy_version_id == "alpha-v1"
     assert decision.limit_price == pytest.approx(0.4)
     assert decision.stop_conditions
+
+
+@pytest.mark.asyncio
+async def test_backtest_pipeline_drops_zero_execution_price_before_decision_entity() -> None:
+    pipeline = ControllerPipeline(
+        strategy_id="alpha",
+        strategy_version_id="alpha-v1",
+        forecasters=[StaticForecaster()],
+        calibrator=NetcalCalibrator(),
+        sizer=StaticSizer(),
+        router=Router(ControllerSettings(min_volume=100.0), allow_extreme_prices=True),
+        settings=PMSSettings(mode=RunMode.BACKTEST),
+    )
+
+    emission = await pipeline.on_signal(
+        replace(_signal(), yes_price=0.0),
+        portfolio=_portfolio(),
+    )
+
+    assert emission is None
+    assert pipeline.last_diagnostic is not None
+    assert pipeline.last_diagnostic.code == "decision_price_out_of_domain"
+
+
+@pytest.mark.asyncio
+async def test_backtest_pipeline_drops_one_execution_price_before_decision_entity() -> None:
+    pipeline = ControllerPipeline(
+        strategy_id="alpha",
+        strategy_version_id="alpha-v1",
+        forecasters=[StaticForecaster()],
+        calibrator=NetcalCalibrator(),
+        sizer=StaticSizer(),
+        router=Router(ControllerSettings(min_volume=100.0), allow_extreme_prices=True),
+        outcome_token_resolver=StaticOutcomeTokenResolver(),
+        settings=PMSSettings(mode=RunMode.BACKTEST),
+    )
+
+    emission = await pipeline.on_signal(
+        replace(_signal(), yes_price=1.0),
+        portfolio=_portfolio(),
+    )
+
+    assert emission is None
+    assert pipeline.last_diagnostic is not None
+    assert pipeline.last_diagnostic.code == "decision_price_out_of_domain"
 
 
 @pytest.mark.asyncio

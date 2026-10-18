@@ -41,6 +41,7 @@ def _candidate_from_observation(observation: StrategyObservation) -> StrategyCan
         "h2_metadata": payload_metadata,
     }
     for field_name in (
+        "economics_version",
         "decay_window_hours",
         "delta_effective",
         "h2_signal",
@@ -48,6 +49,7 @@ def _candidate_from_observation(observation: StrategyObservation) -> StrategyCan
         "llm_posterior",
         "min_divergence",
         "min_expected_edge",
+        "max_slippage_bps",
         "news_timestamp",
         "no_best_ask",
         "yes_best_ask",

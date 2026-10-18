@@ -40,7 +40,10 @@ from pms.live_preflight_artifact import (
 from pms.redaction import redact_database_error, redact_live_error_values
 from pms.research.spec_codec import deserialize_execution_model
 from pms.storage.schema_check import ensure_schema_current
-from pms.storage.strategy_registry import PostgresStrategyRegistry
+from pms.storage.strategy_registry import (
+    PostgresStrategyRegistry,
+    llm_identity_for_settings,
+)
 from pms.strategies.flb.artifacts import (
     file_sha256_no_follow,
     flb_calibration_provenance_path,
@@ -2785,7 +2788,10 @@ async def _active_strategies_check(
     settings: PMSSettings,
     pool: asyncpg.Pool,
 ) -> _ActiveStrategiesPreflight:
-    registry = PostgresStrategyRegistry(pool)
+    registry = PostgresStrategyRegistry(
+        pool,
+        llm_identity=llm_identity_for_settings(settings),
+    )
     try:
         strategies = await registry.list_active_strategies()
     except Exception as exc:  # noqa: BLE001

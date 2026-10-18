@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 import json
+from math import nan
 import os
 from pathlib import Path
 import stat
@@ -24,6 +25,7 @@ from pms.core.models import (
     Trade,
     Venue,
 )
+from pms.core.validation import normalize_resolved_outcome
 from pms.research.specs import BacktestExecutionConfig, BacktestSpec
 
 
@@ -51,6 +53,11 @@ class _MarketMetadata:
     title: str
     venue: Venue
     resolves_at: datetime | None
+    resolved_outcome: float | None = None
+    resolved_at: datetime | None = None
+    observed_at: datetime | None = None
+    yes_token_id: str | None = None
+    no_token_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -61,6 +68,7 @@ class _LastBookState:
     asks: dict[float, float] = field(default_factory=dict)
     last_trade_price: float | None = None
     last_hash: str | None = None
+    book_ts: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,8 +98,10 @@ class MarketUniverseReplayEngine:
     jsonl_path: Path | None = None
     write_probe: WriteProbe | None = None
     chunk_observer: ChunkObserver | None = None
-    _materialized_signature: tuple[str, int] | None = field(init=False, default=None)
-    _signal_cache: tuple[MarketSignal, ...] = field(init=False, default_factory=tuple)
+    _spec: BacktestSpec | None = field(init=False, default=None)
+    _exec_config: BacktestExecutionConfig | None = field(init=False, default=None)
+    _lookup_chunks: AsyncGenerator[tuple[_ChunkWindow, list[MarketSignal]], None] | None = field(init=False, default=None)
+    _lookup_window: _ChunkWindow | None = field(init=False, default=None)
     _signal_history: dict[tuple[str, str], tuple[_SignalCheckpoint, ...]] = field(
         init=False,
         default_factory=dict,
@@ -109,10 +119,32 @@ class MarketUniverseReplayEngine:
         self,
         spec: BacktestSpec,
         exec_config: BacktestExecutionConfig,
-    ) -> AsyncIterator[MarketSignal]:
-        await self._ensure_materialized(spec=spec, exec_config=exec_config)
-        for signal in self._signal_cache:
-            yield _clone_signal(signal)
+    ) -> AsyncGenerator[MarketSignal, None]:
+        if exec_config.chunk_days <= 0:
+            raise ValueError("BacktestExecutionConfig.chunk_days must be positive")
+        await self.aclose()
+        self._spec, self._exec_config = spec, exec_config
+        if self.jsonl_path is not None:
+            metadata: dict[str, _MarketMetadata] = {}
+            for _event in _iter_jsonl_events(self.jsonl_path, metadata):
+                pass
+            self._market_metadata_cache = _filter_market_metadata(
+                metadata, market_universe_filter=spec.dataset.market_universe_filter,
+            )
+        else:
+            self._market_metadata_cache = await self._load_market_metadata(
+                spec.dataset.market_universe_filter
+            )
+        if not self._market_metadata_cache:
+            raise ValueError("BacktestSpec.dataset.market_universe_filter matched zero markets")
+        chunks = self._signal_chunks(spec, exec_config)
+        try:
+            async for _window, signals in chunks:
+                for signal in signals:
+                    yield _clone_signal(signal)
+        finally:
+            await chunks.aclose()
+            await self.aclose()
 
     async def book_state_at(
         self,
@@ -131,15 +163,33 @@ class MarketUniverseReplayEngine:
         market_id: str,
         token_id: str | None,
     ) -> MarketSignal:
-        key = (market_id, token_id or "")
-        checkpoints = self._signal_history.get(key)
-        if not checkpoints:
-            msg = f"no replay history for market_id={market_id!r} token_id={token_id!r}"
-            raise LookupError(msg)
+        if self._spec is None or self._exec_config is None:
+            raise LookupError("replay stream has not been initialized")
+        if self._lookup_window is not None and ts < self._lookup_window.start:
+            await self.aclose()
+        if self._lookup_chunks is None:
+            self._lookup_chunks = self._signal_chunks(self._spec, self._exec_config)
+        while self._lookup_window is None or (
+            not self._lookup_window.is_final and ts >= self._lookup_window.end
+        ):
+            try:
+                window, signals = await anext(self._lookup_chunks)
+            except StopAsyncIteration:
+                break
+            # Keep one prior book per token, including tokens absent in this chunk.
+            history = {key: [items[-1]] for key, items in self._signal_history.items()}
+            for sequence, signal in enumerate(signals):
+                key = (signal.market_id, signal.token_id or "")
+                history.setdefault(key, []).append(
+                    _SignalCheckpoint(signal.fetched_at, sequence, signal)
+                )
+            self._signal_history = {key: tuple(items) for key, items in history.items()}
+            self._lookup_window = window
+        checkpoints = self._signal_history.get((market_id, token_id or ""), ())
         for checkpoint in reversed(checkpoints):
             if checkpoint.ts <= ts:
                 return _clone_signal(checkpoint.signal)
-        return _clone_signal(checkpoints[0].signal)
+        raise LookupError(f"no replay history as of {ts} for {market_id!r}/{token_id!r}")
 
     async def latest_signal(
         self,
@@ -147,92 +197,74 @@ class MarketUniverseReplayEngine:
         market_id: str,
         token_id: str | None,
     ) -> MarketSignal:
-        key = (market_id, token_id or "")
-        checkpoints = self._signal_history.get(key)
-        if not checkpoints:
-            msg = f"no replay history for market_id={market_id!r} token_id={token_id!r}"
-            raise LookupError(msg)
-        return _clone_signal(checkpoints[-1].signal)
-
-    async def _ensure_materialized(
-        self,
-        *,
-        spec: BacktestSpec,
-        exec_config: BacktestExecutionConfig,
-    ) -> None:
-        signature = (spec.config_hash, exec_config.chunk_days)
-        if self._materialized_signature == signature:
-            return
-
-        if exec_config.chunk_days <= 0:
-            msg = "BacktestExecutionConfig.chunk_days must be positive"
-            raise ValueError(msg)
-
-        if self.jsonl_path is not None:
-            market_metadata, events = _load_jsonl_source(
-                self.jsonl_path,
-                spec=spec,
-                chunk_observer=self.chunk_observer,
-                chunk_days=exec_config.chunk_days,
-            )
-        else:
-            market_metadata, events = await self._load_pg_source(
-                spec=spec,
-                exec_config=exec_config,
-            )
-
-        if not market_metadata:
-            msg = "BacktestSpec.dataset.market_universe_filter matched zero markets"
-            raise ValueError(msg)
-
-        states: dict[tuple[str, str], _LastBookState] = {}
-        signal_cache: list[MarketSignal] = []
-        signal_history: dict[tuple[str, str], list[_SignalCheckpoint]] = {}
-        for event in events:
-            signal = _event_to_signal(
-                event=event,
-                states=states,
-                market_metadata=market_metadata,
-            )
-            signal_cache.append(_clone_signal(signal))
-            key = (signal.market_id, signal.token_id or "")
-            signal_history.setdefault(key, []).append(
-                _SignalCheckpoint(
-                    ts=signal.fetched_at,
-                    sequence=event.sequence,
-                    signal=_clone_signal(signal),
-                )
-            )
-
-        self._market_metadata_cache = dict(market_metadata)
-        self._signal_cache = tuple(signal_cache)
-        self._signal_history = {
-            key: tuple(checkpoints) for key, checkpoints in signal_history.items()
-        }
-        self._materialized_signature = signature
-
-    async def _load_pg_source(
-        self,
-        *,
-        spec: BacktestSpec,
-        exec_config: BacktestExecutionConfig,
-    ) -> tuple[dict[str, _MarketMetadata], list[_ReplayEvent]]:
-        market_metadata = await self._load_market_metadata(
-            spec.dataset.market_universe_filter
+        if self._spec is None:
+            raise LookupError("replay stream has not been initialized")
+        return await self.signal_at(
+            self._spec.date_range_end, market_id=market_id, token_id=token_id,
         )
-        market_ids = tuple(sorted(market_metadata))
-        events: list[_ReplayEvent] = []
-        for window in _chunk_windows(
-            start=spec.date_range_start,
-            end=spec.date_range_end,
-            chunk_days=exec_config.chunk_days,
-        ):
-            if self.chunk_observer is not None:
-                self.chunk_observer(window.start, window.end)
-            events.extend(
-                await self._load_chunk_events(window=window, market_ids=market_ids)
-            )
-        return market_metadata, events
+
+    async def aclose(self) -> None:
+        """Release the lookup cursor, including after queries outside stream()."""
+        if self._lookup_chunks is not None:
+            await self._lookup_chunks.aclose()
+        self._lookup_chunks = None
+        self._lookup_window = None
+        self._signal_history.clear()
+
+    def resolution_for(
+        self,
+        market_id: str,
+        *,
+        as_of: datetime | None = None,
+    ) -> float | None:
+        metadata = self._market_metadata_cache.get(market_id)
+        if metadata is None:
+            return None
+        if as_of is not None:
+            known_at = metadata.resolved_at or metadata.observed_at
+            if known_at is None or known_at > as_of:
+                return None
+        return metadata.resolved_outcome
+
+    async def _signal_chunks(
+        self,
+        spec: BacktestSpec,
+        exec_config: BacktestExecutionConfig,
+    ) -> AsyncGenerator[tuple[_ChunkWindow, list[MarketSignal]], None]:
+        states: dict[tuple[str, str], _LastBookState] = {}
+        market_ids = tuple(sorted(self._market_metadata_cache))
+        source = (
+            _iter_jsonl_events(self.jsonl_path, {})
+            if self.jsonl_path is not None else None
+        )
+        pending = next(source, None) if source is not None else None
+        try:
+            for window in _chunk_windows(
+                start=spec.date_range_start, end=spec.date_range_end,
+                chunk_days=exec_config.chunk_days,
+            ):
+                if self.chunk_observer is not None:
+                    self.chunk_observer(window.start, window.end)
+                if source is None:
+                    events = await self._load_chunk_events(window=window, market_ids=market_ids)
+                else:
+                    events = []
+                    while pending is not None and (
+                        pending.ts < window.end or (window.is_final and pending.ts == window.end)
+                    ):
+                        if pending.ts >= window.start and _event_market_id(pending) in self._market_metadata_cache:
+                            events.append(pending)
+                        pending = next(source, None)
+                signals = [
+                    _event_to_signal(event=event, states=states, market_metadata=self._market_metadata_cache)
+                    for event in events
+                ]
+                del events
+                yield window, signals
+                del signals
+        finally:
+            if source is not None:
+                source.close()
 
     async def _load_market_metadata(
         self,
@@ -251,11 +283,23 @@ class MarketUniverseReplayEngine:
             if explicit_market_ids:
                 rows = await connection.fetch(
                     """
-                    SELECT condition_id, question, venue, resolves_at
+                    SELECT markets.condition_id, markets.question, markets.venue,
+                           markets.resolves_at, markets.closed,
+                           markets.yes_price, markets.no_price,
+                           resolutions.resolved_outcome,
+                           resolutions.resolved_at,
+                           resolutions.observed_at,
+                           markets.last_seen_at,
+                           (SELECT MAX(token_id) FROM tokens WHERE condition_id = markets.condition_id
+                            AND outcome = 'YES') AS yes_token_id,
+                           (SELECT MAX(token_id) FROM tokens WHERE condition_id = markets.condition_id
+                            AND outcome = 'NO') AS no_token_id
                     FROM markets
-                    WHERE condition_id = ANY($1::text[])
-                      AND ($2::text IS NULL OR venue = $2)
-                    ORDER BY condition_id ASC
+                    LEFT JOIN market_resolutions AS resolutions
+                      ON resolutions.market_id = markets.condition_id
+                    WHERE markets.condition_id = ANY($1::text[])
+                      AND ($2::text IS NULL OR markets.venue = $2)
+                    ORDER BY markets.condition_id ASC
                     """,
                     list(explicit_market_ids),
                     venue,
@@ -263,10 +307,22 @@ class MarketUniverseReplayEngine:
             else:
                 rows = await connection.fetch(
                     """
-                    SELECT condition_id, question, venue, resolves_at
+                    SELECT markets.condition_id, markets.question, markets.venue,
+                           markets.resolves_at, markets.closed,
+                           markets.yes_price, markets.no_price,
+                           resolutions.resolved_outcome,
+                           resolutions.resolved_at,
+                           resolutions.observed_at,
+                           markets.last_seen_at,
+                           (SELECT MAX(token_id) FROM tokens WHERE condition_id = markets.condition_id
+                            AND outcome = 'YES') AS yes_token_id,
+                           (SELECT MAX(token_id) FROM tokens WHERE condition_id = markets.condition_id
+                            AND outcome = 'NO') AS no_token_id
                     FROM markets
-                    WHERE ($1::text IS NULL OR venue = $1)
-                    ORDER BY condition_id ASC
+                    LEFT JOIN market_resolutions AS resolutions
+                      ON resolutions.market_id = markets.condition_id
+                    WHERE ($1::text IS NULL OR markets.venue = $1)
+                    ORDER BY markets.condition_id ASC
                     """,
                     venue,
                 )
@@ -278,6 +334,14 @@ class MarketUniverseReplayEngine:
                 title=cast(str, row["question"]),
                 venue=cast(Venue, row["venue"]),
                 resolves_at=cast(datetime | None, row["resolves_at"]),
+                resolved_outcome=_market_resolution_label(row),
+                resolved_at=cast(datetime | None, row.get("resolved_at")),
+                observed_at=cast(
+                    datetime | None,
+                    row.get("observed_at") or row.get("last_seen_at"),
+                ),
+                yes_token_id=cast(str | None, row.get("yes_token_id")),
+                no_token_id=cast(str | None, row.get("no_token_id")),
             )
             for row in rows
         }
@@ -365,43 +429,34 @@ class MarketUniverseReplayEngine:
             raise
 
 
-def _load_jsonl_source(
-    path: Path,
-    *,
-    spec: BacktestSpec,
-    chunk_observer: ChunkObserver | None,
-    chunk_days: int,
-) -> tuple[dict[str, _MarketMetadata], list[_ReplayEvent]]:
-    raw_metadata, raw_events = _parse_jsonl_events(path)
-    filtered_metadata = _filter_market_metadata(
-        raw_metadata,
-        market_universe_filter=spec.dataset.market_universe_filter,
-    )
-    filtered_market_ids = set(filtered_metadata)
-    events = [
-        event
-        for event in raw_events
-        if _event_market_id(event) in filtered_market_ids
-        and spec.date_range_start <= event.ts <= spec.date_range_end
-    ]
-    if chunk_observer is not None:
-        for window in _chunk_windows(
-            start=spec.date_range_start,
-            end=spec.date_range_end,
-            chunk_days=chunk_days,
-        ):
-            chunk_observer(window.start, window.end)
-    return filtered_metadata, events
+def _market_resolution_label(row: Any) -> float | None:
+    raw_label = row.get("resolved_outcome") if hasattr(row, "get") else None
+    label = normalize_resolved_outcome(raw_label)
+    if label is not None:
+        return label
+    closed = row.get("closed") if hasattr(row, "get") else None
+    if closed is not True:
+        return None
+    try:
+        yes_price = float(row.get("yes_price"))
+        no_price = float(row.get("no_price"))
+    except (TypeError, ValueError):
+        return None
+    if yes_price >= 0.999 and no_price <= 0.001:
+        return 1.0
+    if no_price >= 0.999 and yes_price <= 0.001:
+        return 0.0
+    return None
 
 
-def _parse_jsonl_events(path: Path) -> tuple[dict[str, _MarketMetadata], list[_ReplayEvent]]:
-    market_metadata: dict[str, _MarketMetadata] = {}
-    events: list[_ReplayEvent] = []
+def _iter_jsonl_events(
+    path: Path, market_metadata: dict[str, _MarketMetadata],
+) -> Generator[_ReplayEvent, None, None]:
     last_ts: datetime | None = None
     last_sequence_by_market: dict[str, int] = {}
 
     for line_number, line in enumerate(
-        _read_jsonl_text_no_follow(path).splitlines(),
+        _read_jsonl_lines_no_follow(path),
         start=1,
     ):
         if not line.strip():
@@ -431,7 +486,20 @@ def _parse_jsonl_events(path: Path) -> tuple[dict[str, _MarketMetadata], list[_R
                 title=str(row.get("title") or market_id),
                 venue=cast(Venue, str(row.get("venue") or "polymarket")),
                 resolves_at=_optional_datetime(row.get("resolves_at")),
+                resolved_outcome=normalize_resolved_outcome(row.get("resolved_outcome")),
+                resolved_at=_optional_datetime(row.get("resolved_at")),
+                observed_at=_optional_datetime(row.get("observed_at")) or ts,
+                yes_token_id=_optional_str(row.get("yes_token_id")),
+                no_token_id=_optional_str(row.get("no_token_id")),
             ),
+        )
+
+        # Token identity is immutable metadata, even when supplied on a later row.
+        metadata = market_metadata[market_id]
+        market_metadata[market_id] = replace(
+            metadata,
+            yes_token_id=metadata.yes_token_id or _optional_str(row.get("yes_token_id")),
+            no_token_id=metadata.no_token_id or _optional_str(row.get("no_token_id")),
         )
 
         event_type = _required_str(row, "event_type", path=path, line_number=line_number)
@@ -482,19 +550,10 @@ def _parse_jsonl_events(path: Path) -> tuple[dict[str, _MarketMetadata], list[_R
             msg = f"{path}:{line_number} unsupported event_type={event_type!r}"
             raise ValueError(msg)
 
-        events.append(
-            _ReplayEvent(
-                ts=ts,
-                priority=priority,
-                sequence=sequence,
-                payload=payload,
-            )
-        )
-
-    return market_metadata, events
+        yield _ReplayEvent(ts=ts, priority=priority, sequence=sequence, payload=payload)
 
 
-def _read_jsonl_text_no_follow(path: Path) -> str:
+def _read_jsonl_lines_no_follow(path: Path) -> Iterator[str]:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     fd = -1
     try:
@@ -506,7 +565,7 @@ def _read_jsonl_text_no_follow(path: Path) -> str:
             raise OSError("multiple hardlinks")
         with os.fdopen(fd, "r", encoding="utf-8") as file:
             fd = -1
-            return file.read()
+            yield from file
     except OSError as exc:
         msg = f"replay JSONL cannot be read safely: {path}"
         raise ValueError(msg) from exc
@@ -605,11 +664,16 @@ def _event_to_signal(
             if level.side == "SELL"
         }
         state.last_hash = snapshot.hash
+        state.book_ts = snapshot.ts
         return _market_signal(
             state=state,
             metadata=market_metadata[snapshot.market_id],
             timestamp=snapshot.ts,
-            price=state.last_trade_price,
+            price=_signal_price(
+                price=state.last_trade_price if state.last_trade_price is not None else nan,
+                best_bid=max(state.bids, default=None),
+                best_ask=min(state.asks, default=None),
+            ),
             event_type="book",
         )
     if isinstance(payload, PriceChange):
@@ -664,6 +728,7 @@ def _apply_price_change(state: _LastBookState, *, change: PriceChange) -> None:
     else:
         levels[change.price] = change.size
     state.last_hash = change.hash
+    state.book_ts = change.ts
 
 
 def _market_signal(
@@ -675,7 +740,13 @@ def _market_signal(
     event_type: str,
     extra: dict[str, Any] | None = None,
 ) -> MarketSignal:
-    external_signal = {"raw_event_type": event_type}
+    external_signal: dict[str, Any] = {"raw_event_type": event_type}
+    if state.book_ts is not None:
+        external_signal["book_received_at"] = state.book_ts.isoformat()
+    if metadata.yes_token_id is not None:
+        external_signal["yes_token_id"] = metadata.yes_token_id
+    if metadata.no_token_id is not None:
+        external_signal["no_token_id"] = metadata.no_token_id
     if extra is not None:
         external_signal.update(extra)
     return MarketSignal(
@@ -683,7 +754,7 @@ def _market_signal(
         token_id=state.token_id,
         venue=metadata.venue,
         title=metadata.title,
-        yes_price=price if price is not None else 0.0,
+        yes_price=price if price is not None else nan,
         volume_24h=None,
         resolves_at=metadata.resolves_at,
         orderbook=_orderbook_from_state(state),
@@ -749,27 +820,22 @@ def _chunk_windows(
     start: datetime,
     end: datetime,
     chunk_days: int,
-) -> list[_ChunkWindow]:
+) -> Iterator[_ChunkWindow]:
     if start > end:
         msg = "BacktestSpec.date_range_start must not exceed date_range_end"
         raise ValueError(msg)
 
     if start == end:
-        return [_ChunkWindow(start=start, end=end, is_final=True)]
+        yield _ChunkWindow(start=start, end=end, is_final=True)
+        return
 
-    windows: list[_ChunkWindow] = []
     cursor = start
     while cursor < end:
         next_cursor = min(cursor + timedelta(days=chunk_days), end)
-        windows.append(
-            _ChunkWindow(
-                start=cursor,
-                end=next_cursor,
-                is_final=next_cursor == end,
-            )
+        yield _ChunkWindow(
+            start=cursor, end=next_cursor, is_final=next_cursor == end,
         )
         cursor = next_cursor
-    return windows
 
 
 async def _fetch_snapshots(

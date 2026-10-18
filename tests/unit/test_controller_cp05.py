@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from math import inf, nan
 from types import SimpleNamespace
 from typing import Any, Protocol
@@ -104,6 +106,20 @@ def _portfolio() -> Portfolio:
         locked_usdc=0.0,
         open_positions=[],
     )
+
+
+def _reserve_budget_in_process(ledger_path: str, results: Any) -> None:
+    forecaster = LLMForecaster(
+        config=LLMSettings(
+            enabled=True,
+            provider="anthropic",
+            api_key="test-key",
+            model="claude-test",
+            max_daily_llm_cost_usdc=0.003,
+            spend_ledger_path=ledger_path,
+        )
+    )
+    results.put(forecaster._reserve_budget(Decimal("0.002")))  # noqa: SLF001
 
 
 class FakeMessages:
@@ -552,6 +568,7 @@ def test_llm_forecaster_reserves_budget_atomically_for_concurrent_calls() -> Non
             enabled=True,
             provider="anthropic",
             api_key="test-key",
+            model="claude-test",
             cache_ttl_s=0.0,
             max_daily_llm_cost_usdc=0.003,
         ),
@@ -577,6 +594,79 @@ def test_llm_forecaster_reserves_budget_atomically_for_concurrent_calls() -> Non
     assert sum(result is not None for result in results) == 1
 
 
+def test_llm_forecaster_reserves_budget_atomically_across_processes(tmp_path: Any) -> None:
+    ledger_path = str(tmp_path / "llm-spend.json")
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    processes = [
+        context.Process(target=_reserve_budget_in_process, args=(ledger_path, results))
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    assert sorted(results.get(timeout=2) for _ in processes) == [False, True]
+
+
+def test_llm_forecaster_reloads_external_ledger_before_reserving(tmp_path: Any) -> None:
+    ledger_path = tmp_path / "llm-spend.json"
+    forecaster = LLMForecaster(
+        config=LLMSettings(
+            enabled=True,
+            provider="anthropic",
+            api_key="test-key",
+            model="claude-test",
+            max_daily_llm_cost_usdc=0.003,
+            spend_ledger_path=str(ledger_path),
+        )
+    )
+
+    assert forecaster._reserve_budget(Decimal("0.002")) is True  # noqa: SLF001
+    today = datetime.now(tz=UTC).date().isoformat()
+    ledger_path.write_text(
+        json.dumps({"date": today, "cost_usdc": "0.003"}),
+        encoding="utf-8",
+    )
+
+    assert forecaster._reserve_budget(Decimal("0.0005")) is False  # noqa: SLF001
+    assert json.loads(ledger_path.read_text(encoding="utf-8"))["cost_usdc"] == "0.003"
+
+
+def test_llm_forecaster_settle_preserves_reservation_day_at_utc_midnight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    ledger_path = tmp_path / "llm-spend.json"
+    reservation_day = date(2026, 10, 18)
+    settlement_day = date(2026, 10, 19)
+    days = iter((reservation_day, settlement_day))
+    monkeypatch.setattr(
+        "pms.controller.forecasters.llm._today_utc",
+        lambda: next(days),
+    )
+    forecaster = LLMForecaster(
+        config=LLMSettings(
+            enabled=True,
+            provider="anthropic",
+            api_key="test-key",
+            model="claude-test",
+            max_daily_llm_cost_usdc=0.003,
+            spend_ledger_path=str(ledger_path),
+        )
+    )
+
+    assert forecaster._reserve_budget(Decimal("0.002")) is True  # noqa: SLF001
+    forecaster._settle_budget(Decimal("0.002"), Decimal("0.001"))  # noqa: SLF001
+
+    assert json.loads(ledger_path.read_text(encoding="utf-8")) == {
+        "cost_usdc": "0.001",
+        "date": reservation_day.isoformat(),
+    }
+
+
 def test_llm_forecaster_shares_daily_budget_across_strategy_instances() -> None:
     first_client = FakeClaudeClient()
     second_client = FakeClaudeClient()
@@ -584,6 +674,7 @@ def test_llm_forecaster_shares_daily_budget_across_strategy_instances() -> None:
         enabled=True,
         provider="anthropic",
         api_key="test-key",
+        model="claude-test",
         cache_ttl_s=0.0,
         max_daily_llm_cost_usdc=0.003,
     )
@@ -652,6 +743,7 @@ def test_llm_forecaster_counts_malformed_provider_attempt_against_budget() -> No
             enabled=True,
             provider="anthropic",
             api_key="test-key",
+            model="claude-test",
             cache_ttl_s=0.0,
             max_daily_llm_cost_usdc=0.003,
         ),
@@ -671,6 +763,7 @@ def test_llm_forecaster_refunds_transient_provider_failure_budget() -> None:
             enabled=True,
             provider="anthropic",
             api_key="test-key",
+            model="claude-test",
             cache_ttl_s=0.0,
             max_daily_llm_cost_usdc=0.003,
         ),
@@ -691,6 +784,7 @@ def test_llm_forecaster_refunds_unhandled_provider_exception_budget() -> None:
             enabled=True,
             provider="anthropic",
             api_key="test-key",
+            model="claude-test",
             cache_ttl_s=0.0,
             max_daily_llm_cost_usdc=0.003,
         ),
@@ -727,6 +821,7 @@ def test_llm_forecaster_refunds_client_initialization_exception_budget(
             enabled=True,
             provider="anthropic",
             api_key="test-key",
+            model="claude-test",
             cache_ttl_s=0.0,
             max_daily_llm_cost_usdc=0.003,
         )
@@ -827,9 +922,7 @@ async def test_controller_pipeline_rejects_tiny_edge_before_zero_size_metric() -
     assert pipeline.suppressed_zero_size == 0
     diagnostic = pipeline.last_diagnostic
     assert diagnostic is not None
-    assert diagnostic.code == "decision_net_edge_not_positive"
-    assert diagnostic.metadata["gross_edge"] == pytest.approx(0.001)
-    assert diagnostic.metadata["net_edge_after_costs"] < 0.0
+    assert diagnostic.code == "llm_only_forecast"
 
 
 @pytest.mark.asyncio

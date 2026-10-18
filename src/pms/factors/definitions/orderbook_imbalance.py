@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from pms.core.models import MarketSignal
-from pms.factors.base import FactorDefinition, FactorValueRow, OuterRingReader
+from pms.factors.base import FactorDefinition, FactorValueRow, OuterRingReader, is_no_token_signal
 
 
 def _depth(levels: object) -> Decimal:
@@ -23,6 +23,7 @@ def _depth(levels: object) -> Decimal:
 
 class OrderbookImbalance(FactorDefinition):
     factor_id = "orderbook_imbalance"
+    definition_version = "2"
     required_inputs = ("orderbook",)
 
     def compute(
@@ -45,5 +46,5 @@ class OrderbookImbalance(FactorDefinition):
             param="",
             market_id=signal.market_id,
             ts=signal.timestamp,
-            value=float((bid_depth - ask_depth) / total_depth),
+            value=float((bid_depth - ask_depth) / total_depth) * (-1 if is_no_token_signal(signal) else 1),
         )

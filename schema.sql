@@ -43,6 +43,15 @@ CREATE INDEX IF NOT EXISTS idx_markets_price_updated_at
     ON markets (price_updated_at DESC)
     WHERE price_updated_at IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS market_resolutions (
+    market_id TEXT PRIMARY KEY REFERENCES markets(condition_id) ON DELETE CASCADE,
+    resolved_outcome DOUBLE PRECISION NOT NULL
+        CHECK (resolved_outcome >= 0.0 AND resolved_outcome <= 1.0),
+    resolved_at TIMESTAMPTZ,
+    source TEXT NOT NULL CHECK (source <> ''),
+    observed_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS market_price_snapshots (
     condition_id TEXT NOT NULL,
     snapshot_at TIMESTAMPTZ NOT NULL,
@@ -130,6 +139,25 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE INDEX IF NOT EXISTS idx_trades_market_token_ts
     ON trades(market_id, token_id, ts DESC);
 
+CREATE TABLE IF NOT EXISTS agent_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    market_id TEXT NOT NULL REFERENCES markets(condition_id) ON DELETE CASCADE,
+    source TEXT NOT NULL CHECK (length(source) BETWEEN 1 AND 512),
+    model TEXT NOT NULL CHECK (length(model) BETWEEN 1 AND 256),
+    url TEXT NOT NULL CHECK (length(url) BETWEEN 1 AND 2048),
+    summary TEXT NOT NULL CHECK (length(summary) BETWEEN 1 AND 8192),
+    payload JSONB NOT NULL,
+    content_hash TEXT NOT NULL UNIQUE CHECK (content_hash ~ '^[0-9a-f]{64}$'),
+    captured_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ,
+    submitted_by_token_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (expires_at IS NULL OR expires_at > captured_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_evidence_market_captured
+    ON agent_evidence (market_id, captured_at DESC);
+
 -- END OUTER RING
 
 -- BEGIN MIDDLE RING
@@ -151,11 +179,46 @@ CREATE TABLE IF NOT EXISTS factor_values (
     param TEXT NOT NULL DEFAULT '',
     market_id TEXT NOT NULL REFERENCES markets(condition_id) ON DELETE CASCADE,
     ts TIMESTAMPTZ NOT NULL,
-    value DOUBLE PRECISION NOT NULL
+    value DOUBLE PRECISION NOT NULL,
+    definition_version TEXT NOT NULL DEFAULT '1'
 );
 
+ALTER TABLE factor_values
+    ADD COLUMN IF NOT EXISTS definition_version TEXT NOT NULL DEFAULT '1';
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_factor_values_factor_param_market_ts
-    ON factor_values(factor_id, param, market_id, ts DESC);
+    ON factor_values(factor_id, param, market_id, ts DESC, definition_version);
+
+CREATE TABLE IF NOT EXISTS agent_factor_provenance (
+    factor_id TEXT NOT NULL,
+    param TEXT NOT NULL DEFAULT '',
+    market_id TEXT NOT NULL REFERENCES markets(condition_id) ON DELETE CASCADE,
+    ts TIMESTAMPTZ NOT NULL,
+    definition_version TEXT NOT NULL DEFAULT '1',
+    model TEXT NOT NULL CHECK (length(model) BETWEEN 1 AND 256),
+    prompt_hash TEXT NOT NULL CHECK (prompt_hash ~ '^[0-9a-f]{64}$'),
+    evidence_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    submitted_by_token_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (factor_id, param, market_id, ts, definition_version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_factor_provenance_market_ts
+    ON agent_factor_provenance (market_id, ts DESC);
+
+CREATE TABLE IF NOT EXISTS llm_replay_records (
+    replay_key TEXT PRIMARY KEY,
+    model TEXT NOT NULL,
+    prompt_hash TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    response JSONB NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL,
+    run_mode TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_replay_records_recorded_at
+    ON llm_replay_records (recorded_at);
 
 CREATE TABLE IF NOT EXISTS market_relations (
     id SERIAL PRIMARY KEY,
@@ -184,7 +247,7 @@ CREATE TABLE IF NOT EXISTS strategies (
     title TEXT,
     description TEXT,
     archived BOOLEAN NOT NULL DEFAULT FALSE,
-    share_enabled BOOLEAN NOT NULL DEFAULT TRUE
+    share_enabled BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 -- strategy_versions: immutable hash-keyed version rows (Invariant 3)
@@ -286,7 +349,8 @@ CREATE TABLE IF NOT EXISTS eval_records (
     strategy_id TEXT NOT NULL,
     strategy_version_id TEXT NOT NULL,
     edge_at_decision DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    spread_bps_at_decision INTEGER
+    spread_bps_at_decision INTEGER,
+    calibration_prob_estimate DOUBLE PRECISION
 );
 
 ALTER TABLE eval_records
@@ -295,7 +359,8 @@ ALTER TABLE eval_records
     ADD COLUMN IF NOT EXISTS baseline_prob_estimates JSONB NOT NULL DEFAULT '{}'::jsonb,
     ADD COLUMN IF NOT EXISTS baseline_brier_scores JSONB NOT NULL DEFAULT '{}'::jsonb,
     ADD COLUMN IF NOT EXISTS edge_at_decision DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    ADD COLUMN IF NOT EXISTS spread_bps_at_decision INTEGER;
+    ADD COLUMN IF NOT EXISTS spread_bps_at_decision INTEGER,
+    ADD COLUMN IF NOT EXISTS calibration_prob_estimate DOUBLE PRECISION;
 
 CREATE TABLE IF NOT EXISTS quote_eval_records (
     fill_id TEXT NOT NULL,
@@ -535,6 +600,7 @@ CREATE TABLE IF NOT EXISTS strategy_runs (
     portfolio_target_json JSONB,
     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at TIMESTAMPTZ,
+    controller_rejection_counts_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     CONSTRAINT strategy_runs_strategy_identity_check
         CHECK (strategy_id != '' AND strategy_version_id != '')
 );
@@ -677,6 +743,19 @@ CREATE TABLE IF NOT EXISTS runtime_heartbeats (
 
 CREATE INDEX IF NOT EXISTS idx_runtime_heartbeats_run_observed
     ON runtime_heartbeats (run_id, observed_at);
+
+CREATE TABLE IF NOT EXISTS "api_request_audit" (
+    audit_id BIGSERIAL PRIMARY KEY,
+    token_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    outcome INTEGER NOT NULL CHECK (outcome BETWEEN 100 AND 599),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_request_audit_created_at
+    ON api_request_audit (created_at DESC);
 
 -- default strategy seed (Invariant 3 NULLABLE→seed pattern).
 -- load-bearing legacy bootstrap row: changing `default-v1` requires a coordinated
@@ -988,6 +1067,23 @@ CREATE INDEX IF NOT EXISTS idx_strategy_run_slices_run_strategy_identity
 
 CREATE INDEX IF NOT EXISTS idx_backtest_live_comparisons_run_strategy_identity
     ON backtest_live_comparisons(run_id, strategy_id, strategy_version_id);
+
+INSERT INTO factors (
+    factor_id, name, description, input_schema_hash, output_type, direction, owner
+) VALUES (
+    'agent_probability',
+    'Agent Probability',
+    'Externally submitted point-in-time probability from an agent.',
+    '3e8b3b26e3d6a9f3f7db8eb5d651c7adf3a2d3cf9f6f21f4b5b11f4aa2a2c5ef',
+    'probability', 'neutral', 'agent:llm'
+)
+ON CONFLICT (factor_id) DO UPDATE SET
+    name = EXCLUDED.name,
+    description = EXCLUDED.description,
+    input_schema_hash = EXCLUDED.input_schema_hash,
+    output_type = EXCLUDED.output_type,
+    direction = EXCLUDED.direction,
+    owner = EXCLUDED.owner;
 
 INSERT INTO factors (
     factor_id,

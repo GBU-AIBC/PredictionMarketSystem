@@ -21,6 +21,7 @@ from pms.strategies.projections import EvalSpec
 
 
 logger = logging.getLogger(__name__)
+_TERMINAL_ORDER_TOMBSTONE_LIMIT = 10_000
 
 StrategyMetricsProvider = Callable[
     [],
@@ -58,6 +59,17 @@ class EvalSpool:
         default_factory=asyncio.Queue,
     )
     _task: asyncio.Task[None] | None = None
+    # Live venues may emit cumulative snapshots for one order.  Retain the
+    # highest observed totals so retries do not double count and later
+    # snapshots can replace the durable evaluation row.
+    _latest_order_totals: dict[str, tuple[float, float, str]] = field(
+        default_factory=dict
+    )
+    _terminal_order_totals: dict[str, tuple[float, float, str]] = field(
+        default_factory=dict
+    )
+    _scored_record_count: int = 0
+    _last_feedback_record_count: int = 0
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -108,12 +120,39 @@ class EvalSpool:
                 decision_evidence,
             )
             return False
+        terminal = self._terminal_order_totals.get(fill.order_id)
+        if terminal is not None:
+            if fill.status not in {"matched", "filled", "cancelled", "rejected"}:
+                return False
+            if (
+                fill.fill_notional_usdc < terminal[0]
+                or fill.fill_quantity < terminal[1]
+                or (
+                    fill.fill_notional_usdc == terminal[0]
+                    and fill.fill_quantity == terminal[1]
+                )
+            ):
+                return False
+        previous = self._latest_order_totals.get(fill.order_id) or terminal
+        if previous is not None:
+            previous_notional, previous_quantity, previous_status = previous
+            if (
+                fill.fill_notional_usdc < previous_notional
+                or fill.fill_quantity < previous_quantity
+                or (
+                    fill.fill_notional_usdc == previous_notional
+                    and fill.fill_quantity == previous_quantity
+                    and fill.status == previous_status
+                )
+            ):
+                return False
         scored_record = self.scorer.score(
             fill,
             decision,
             baseline_prob_estimates=_baseline_prob_estimates_from_evidence(
                 decision_evidence,
             ),
+            category=_category_from_evidence(decision_evidence),
         )
         # Persist before pushing: restart re-hydration reads the eval store,
         # so a record must never feed a calibrator unless it is also durable.
@@ -121,7 +160,43 @@ class EvalSpool:
         # Duplicate delivery for one decision_id (sweep retry, or an
         # ON CONFLICT-deduped store append) is safe: the sink's calibrator
         # dedups per (model_id, decision_id).
-        inserted = await self.store.append(scored_record)
+        if previous is None:
+            inserted = await self.store.append(scored_record)
+            if not inserted:
+                # A process restart loses the in-memory cumulative snapshot.
+                # The durable decision row may already contain an earlier
+                # partial; replace it so a terminal snapshot cannot freeze
+                # evaluation at the partial value.
+                replace_record = getattr(self.store, "replace", None)
+                if callable(replace_record):
+                    await replace_record(scored_record)
+        else:
+            replace_record = getattr(self.store, "replace", None)
+            if not callable(replace_record):
+                # A store without replacement support still gets retry-safe
+                # first-write semantics; production EvalStore implements it.
+                return False
+            inserted = bool(await replace_record(scored_record))
+        self._latest_order_totals[fill.order_id] = (
+            fill.fill_notional_usdc,
+            fill.fill_quantity,
+            fill.status,
+        )
+        if fill.status in {"matched", "filled", "cancelled", "rejected"}:
+            self._latest_order_totals.pop(fill.order_id, None)
+            if fill.order_id not in self._terminal_order_totals and len(
+                self._terminal_order_totals
+            ) >= _TERMINAL_ORDER_TOMBSTONE_LIMIT:
+                # shortcut: retain a bounded recent set; durable eval rows
+                # remain authoritative for older terminal orders.
+                self._terminal_order_totals.pop(next(iter(self._terminal_order_totals)))
+            self._terminal_order_totals[fill.order_id] = (
+                fill.fill_notional_usdc,
+                fill.fill_quantity,
+                fill.status,
+            )
+        if previous is None and inserted:
+            self._scored_record_count += 1
         if self.calibration_sink is not None:
             try:
                 self.calibration_sink(scored_record)
@@ -132,6 +207,10 @@ class EvalSpool:
         except Exception:  # noqa: BLE001
             logger.exception("feedback generation failed in evaluator spool")
         return inserted
+
+    async def flush_feedback(self) -> None:
+        """Run one final feedback batch at the end of a resolution sweep."""
+        await self._generate_feedback(force=True)
 
     async def _run(self) -> None:
         while True:
@@ -152,13 +231,22 @@ class EvalSpool:
             finally:
                 self._queue.task_done()
 
-    async def _generate_feedback(self) -> None:
+    async def _generate_feedback(self, *, force: bool = False) -> None:
         if self.feedback_generator is None or self.metrics_provider is None:
+            return
+        # Keep the first two updates responsive for operator feedback, then
+        # batch later updates so a resolution sweep does not reload every row
+        # once per fill (the previous O(N²) behavior).
+        if not force and (
+            self._scored_record_count > 2
+            and self._scored_record_count - self._last_feedback_record_count < 20
+        ):
             return
         metrics_by_strategy = await self.metrics_provider()
         if not metrics_by_strategy:
             return
         await self.feedback_generator.generate(metrics_by_strategy)
+        self._last_feedback_record_count = self._scored_record_count
 
     async def _record_quote_eval(
         self,
@@ -219,6 +307,18 @@ def _baseline_prob_estimates_from_evidence(
         if probability is not None:
             baselines[baseline_source] = probability
     return baselines
+
+
+def _category_from_evidence(
+    decision_evidence: Mapping[str, object] | None,
+) -> str | None:
+    if decision_evidence is None:
+        return None
+    for key in ("category", "market_category"):
+        value = decision_evidence.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def _probability_or_none(value: object) -> float | None:

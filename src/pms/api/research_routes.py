@@ -10,6 +10,7 @@ from uuid import UUID
 
 import asyncpg
 import yaml
+from yaml import YAMLError
 
 from pms.research.comparison import BacktestLiveComparisonTool
 from pms.research.policies import (
@@ -19,12 +20,14 @@ from pms.research.policies import (
 )
 from pms.research.spec_codec import deserialize_backtest_spec, deserialize_execution_config
 from pms.research.sweep import ParameterSweep, QueuedSweepRun
+from pms.core.validation import validate_finite
 
 
 _ORPHANED_FAILURE_REASON = "orphaned (worker process gone)"
 _JSON_COLUMN_NAMES = frozenset(
     {
         "benchmark_rows",
+        "controller_rejection_counts",
         "equity_delta_json",
         "exec_config_json",
         "portfolio_target_json",
@@ -141,6 +144,7 @@ async def list_backtest_strategy_runs(
                 decision_count,
                 fill_count,
                 portfolio_target_json,
+                controller_rejection_counts_json AS controller_rejection_counts,
                 started_at,
                 finished_at
             FROM strategy_runs
@@ -343,11 +347,14 @@ def _float_field(
     if not isinstance(raw_value, (int, float)) or isinstance(raw_value, bool):
         msg = f"{key} must be numeric"
         raise TypeError(msg)
-    return float(raw_value)
+    return validate_finite(raw_value, field_name=key)
 
 
 def _load_yaml_payload(sweep_yaml: str) -> dict[str, object]:
-    loaded = yaml.safe_load(sweep_yaml)
+    try:
+        loaded = yaml.safe_load(sweep_yaml)
+    except YAMLError as exc:
+        raise ValueError(f"sweep spec is malformed YAML: {exc}") from exc
     if not isinstance(loaded, dict):
         msg = "sweep spec must decode to a mapping"
         raise TypeError(msg)

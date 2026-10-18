@@ -17,6 +17,22 @@ def compute_decay_status(
     min_resolved_samples: int = 10,
     existing_peak: PerformancePeak | None = None,
 ) -> DecayStatus:
+    if not records and existing_peak is None:
+        return DecayStatus(
+            strategy_id=strategy_id,
+            strategy_version_id=strategy_version_id,
+            decay_status="producer_not_wired",
+            rolling_sharpe_7d=None,
+            peak_sharpe_7d=None,
+            sharpe_ratio_vs_peak=None,
+            rolling_sharpe_30d=None,
+            hit_rate_7d=None,
+            peak_hit_rate=None,
+            trading_days_in_window=0,
+            resolved_sample_count=0,
+            min_resolved_samples=min_resolved_samples,
+            last_updated=now,
+        )
     resolved_records = [record for record in records if record.filled]
     if len(resolved_records) < min_resolved_samples:
         return DecayStatus(

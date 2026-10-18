@@ -98,6 +98,17 @@ def test_decay_status_reports_insufficient_resolved_outcomes_before_sample_gate(
     assert status.min_resolved_samples == 10
 
 
+def test_decay_status_marks_unwired_producer_when_no_evidence_exists() -> None:
+    status = compute_decay_status(
+        [],
+        strategy_id="meta-strategy",
+        strategy_version_id="meta-v1",
+        now=datetime(2026, 5, 30, tzinfo=UTC),
+    )
+
+    assert status.decay_status == "producer_not_wired"
+
+
 def test_decay_status_flags_degraded_when_rolling_sharpe_halves_from_peak() -> None:
     now = datetime(2026, 5, 30, tzinfo=UTC)
     records = [

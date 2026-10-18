@@ -10,7 +10,10 @@ from pms.storage.strategy_registry import (
     _strategy_to_config_json,
 )
 from pms.strategies.aggregate import Strategy
-from pms.strategies.versioning import compute_strategy_version_id
+from pms.strategies.versioning import (
+    compute_legacy_strategy_version_id,
+    compute_strategy_version_id,
+)
 from pms.strategies.projections import (
     EvalSpec,
     FactorCompositionStep,
@@ -148,6 +151,34 @@ def test_versioned_reader_accepts_matching_content_hash_id() -> None:
     )
 
     assert loaded == strategy
+
+
+def test_versioned_reader_flags_legacy_hash_definition_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    strategy = _strategy()
+    config_json = json.loads(_strategy_to_config_json(strategy))
+    config_json.pop("factor_definition_versions", None)
+    legacy_id = compute_legacy_strategy_version_id(*strategy.snapshot())
+    monkeypatch.setattr(
+        "pms.storage.strategy_registry.compute_strategy_version_id",
+        lambda *args: "new-definition-hash",
+    )
+
+    with caplog.at_level("WARNING", logger="pms.storage.strategy_registry"):
+        loaded = _strategy_from_versioned_config_json(
+            config_json,
+            strategy_id="default",
+            strategy_version_id=legacy_id,
+        )
+
+    assert loaded == strategy
+    assert "factor definition drift" in caplog.text
+    assert any(
+        record.__dict__.get("event") == "factor_definition_version_drift"
+        for record in caplog.records
+    )
 
 
 def test_versioned_reader_rejects_non_legacy_id_that_mismatches_config_hash() -> None:

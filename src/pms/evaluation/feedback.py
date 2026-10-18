@@ -64,7 +64,7 @@ class EvaluatorFeedback:
 
         for category, brier_score in metrics.brier_by_category.items():
             if (
-                metrics.brier_samples.get(category, 0) >= 20
+                metrics.brier_samples.get(category, 0) >= eval_spec.min_brier_samples
                 and brier_score > eval_spec.max_brier_score
             ):
                 feedback.append(
@@ -87,7 +87,10 @@ class EvaluatorFeedback:
                     )
                 )
 
-        if metrics.slippage_bps > eval_spec.slippage_threshold_bps:
+        if (
+            metrics.record_count >= eval_spec.min_slippage_samples
+            and metrics.slippage_bps > eval_spec.slippage_threshold_bps
+        ):
             feedback.append(
                 self._build_feedback(
                     category="slippage",
@@ -107,7 +110,10 @@ class EvaluatorFeedback:
                 )
             )
 
-        if metrics.win_rate < eval_spec.min_win_rate:
+        if (
+            metrics.record_count >= eval_spec.min_win_rate_samples
+            and metrics.win_rate < eval_spec.min_win_rate
+        ):
             feedback.append(
                 self._build_feedback(
                     category="win_rate",

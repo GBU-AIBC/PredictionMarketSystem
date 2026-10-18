@@ -108,7 +108,7 @@ async def _seed_market(
     resolves_at: datetime | None,
     volume_24h: float,
 ) -> None:
-    created_at = datetime(2026, 4, 18, 9, 0, tzinfo=UTC)
+    created_at = datetime.now(tz=UTC)
     await store.write_market(
         Market(
             condition_id=market_id,
@@ -299,6 +299,35 @@ async def test_market_data_store_returns_latest_book_summary(
                 side="SELL",
                 price=0.51,
                 size=300.0,
+            ),
+        ],
+    )
+    # A newer NO-token snapshot must not replace the YES-token summary used by
+    # market selection; its inverted prices would otherwise change spread/depth
+    # filters on every reselection.
+    await store.write_book_snapshot(
+        BookSnapshot(
+            id=0,
+            market_id="pm-book-summary",
+            token_id="pm-book-summary-no",
+            ts=now + timedelta(seconds=20),
+            hash="book-no-newest",
+            source="subscribe",
+        ),
+        [
+            BookLevel(
+                snapshot_id=0,
+                market_id="pm-book-summary",
+                side="BUY",
+                price=0.01,
+                size=100.0,
+            ),
+            BookLevel(
+                snapshot_id=0,
+                market_id="pm-book-summary",
+                side="SELL",
+                price=0.99,
+                size=100.0,
             ),
         ],
     )

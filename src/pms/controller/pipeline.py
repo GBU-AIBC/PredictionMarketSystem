@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
+import inspect
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -24,7 +25,11 @@ from pms.controller.factor_snapshot import (
     NullFactorSnapshotReader,
     required_factor_keys,
 )
-from pms.controller.forecasters.llm import LLMForecaster
+from pms.controller.forecasters.llm import (
+    LLMForecaster,
+    LLMReplayCacheMissError,
+    durable_spend_ledger_path,
+)
 from pms.controller.forecasters.rules import RulesForecaster
 from pms.controller.forecasters.statistical import StatisticalForecaster
 from pms.controller.outcome_tokens import (
@@ -35,7 +40,7 @@ from pms.controller.outcome_tokens import (
 from pms.controller.router import Router
 from pms.controller.sizers.kelly import KellySizer
 from pms.core.enums import RunMode, TimeInForce
-from pms.core.interfaces import ICalibrator, IForecaster, IPreCalibrator, ISizer
+from pms.core.interfaces import ICalibrator, IForecaster, ISizer
 from pms.core.models import (
     BookLevel,
     BookSnapshot,
@@ -55,6 +60,13 @@ from pms.metrics import (
     increment_metric,
 )
 from pms.strategies.projections import ActiveStrategy, CalibrationContext, CalibrationSpec
+from pms.strategies.economics import (
+    strategy_economic_float,
+    strategy_economic_int,
+    strategy_economic_str,
+    strategy_metadata,
+    strategy_risk_settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +92,12 @@ class DirectBookSnapshotReader(Protocol):
     ) -> BookSnapshot | None: ...
 
     async def read_levels_for_snapshot(self, snapshot_id: int) -> list[BookLevel]: ...
+
+
+class HistoricalBookReader(Protocol):
+    async def signal_at(
+        self, ts: datetime, *, market_id: str, token_id: str | None,
+    ) -> MarketSignal: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +155,7 @@ class ControllerPipeline:
         default_factory=NullOutcomeTokenResolver
     )
     direct_book_reader: DirectBookSnapshotReader | None = None
+    historical_book_reader: HistoricalBookReader | None = None
     forecasters: Sequence[IForecaster] | None = None
     calibrator: ICalibrator | None = None
     sizer: ISizer | None = None
@@ -144,6 +163,14 @@ class ControllerPipeline:
     settings: PMSSettings = field(default_factory=PMSSettings)
     last_diagnostic: ControllerDiagnostic | None = field(init=False, default=None)
     last_execution_signal: MarketSignal | None = field(init=False, default=None)
+    last_forecaster_results: list[dict[str, object]] = field(
+        init=False,
+        default_factory=list,
+    )
+    last_gate_outcomes: list[dict[str, object]] = field(
+        init=False,
+        default_factory=list,
+    )
     suppressed_zero_size: int = field(init=False, default=0)
     _last_decision_emitted_at: dict[tuple[str, str, str, str, str], datetime] = field(
         init=False,
@@ -155,17 +182,36 @@ class ControllerPipeline:
             self.strategy_id = self.strategy.strategy_id
             self.strategy_version_id = self.strategy.strategy_version_id
         if self.forecasters is None:
+            llm_settings = self.settings.llm
+            if llm_settings.spend_ledger_path is None:
+                llm_settings = llm_settings.model_copy(
+                    update={
+                        "spend_ledger_path": durable_spend_ledger_path(
+                            database_dsn=self.settings.database.dsn,
+                            data_path=self.settings.live_emergency_audit_path,
+                            scope=self.settings.mode.value,
+                        )
+                    }
+                )
             self.forecasters = (
                 RulesForecaster(),
                 StatisticalForecaster(),
-                LLMForecaster(config=self.settings.llm),
+                LLMForecaster(config=llm_settings),
             )
         if self.calibrator is None:
             self.calibrator = NetcalCalibrator()
         if self.sizer is None:
-            self.sizer = KellySizer(risk=self.settings.risk)
+            self.sizer = KellySizer(
+                risk=strategy_risk_settings(
+                    self.strategy,
+                    fallback=self.settings.risk,
+                )
+            )
         if self.router is None:
-            self.router = Router(self.settings.controller)
+            self.router = Router(
+                self.settings.controller,
+                allow_extreme_prices=self.settings.mode == RunMode.BACKTEST,
+            )
 
     def _set_drop_diagnostic(
         self,
@@ -207,6 +253,8 @@ class ControllerPipeline:
     ) -> OpportunityEmission | None:
         self.last_diagnostic = None
         self.last_execution_signal = None
+        self.last_forecaster_results = []
+        self.last_gate_outcomes = []
         router = _required(self.router, "router")
         if signal.token_id is None:
             _log_pipeline_funnel(signal, forecasted_count=0, emitted_count=0)
@@ -244,6 +292,9 @@ class ControllerPipeline:
         # to the diagnostic.
         if not router.gate(signal):
             gate_reason = router.gate_reason(signal)
+            self.last_gate_outcomes = [
+                {"name": "router", "passed": False, "reason": gate_reason or "unknown"}
+            ]
             _log_pipeline_funnel(signal, forecasted_count=0, emitted_count=0)
             gate_metadata: dict[str, object] = {
                 "gate_reason": gate_reason or "unknown"
@@ -266,12 +317,18 @@ class ControllerPipeline:
             )
             return None
 
+        self.last_gate_outcomes = [{"name": "router", "passed": True, "reason": None}]
         active_portfolio = portfolio or _default_portfolio()
         sizer = _required(self.sizer, "sizer")
         min_order_usdc = _effective_min_order_usdc(
             strategy=self.strategy,
             sizer=sizer,
             settings=self.settings,
+        )
+        strategy_max_slippage_bps = strategy_economic_int(
+            self.strategy,
+            "max_slippage_bps",
+            self.settings.controller.max_slippage_bps,
         )
         risk_group_id = _risk_group_id(signal)
         group_capacity_diagnostic = _risk_group_capacity_diagnostic(
@@ -302,6 +359,8 @@ class ControllerPipeline:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         probabilities: list[float] = []
+        confidence_weights: list[float] = []
+        llm_weight_flags: list[bool] = []
         model_ids: list[str] = []
         rationales: list[str] = []
         runtime_probabilities: dict[str, float] = {}
@@ -310,18 +369,58 @@ class ControllerPipeline:
         for index, (forecaster, result) in enumerate(
             zip(forecasters, results, strict=True)
         ):
+            forecaster_name = (
+                forecaster_names[index]
+                if index < len(forecaster_names)
+                else type(forecaster).__name__
+            )
             if isinstance(result, BaseException):
+                self.last_forecaster_results.append(
+                    {
+                        "name": forecaster_name,
+                        "status": "error",
+                        "error_type": type(result).__name__,
+                    }
+                )
+                if isinstance(result, LLMReplayCacheMissError):
+                    raise result
                 logger.warning("forecaster failed: %s", result)
                 continue
             if result is None:
+                self.last_forecaster_results.append(
+                    {"name": forecaster_name, "status": "no_output"}
+                )
+                if isinstance(forecaster, LLMForecaster):
+                    failure_reason = forecaster.last_failure_reason or "no_output"
+                    self._set_drop_diagnostic(
+                        signal,
+                        code=f"llm_{failure_reason}",
+                        message=(
+                            "LLM forecaster produced no usable forecast: "
+                            f"{failure_reason}."
+                        ),
+                        severity="info",
+                    )
                 continue
             model_id = _model_id(result, forecaster)
-            calibrated_probability = calibrator.calibrate(
-                float(result[0]),
-                model_id=model_id,
+            self.last_forecaster_results.append(
+                {
+                    "name": forecaster_name,
+                    "model_id": model_id,
+                    "status": "accepted",
+                    "probability": float(result[0]),
+                    "confidence": float(result[1]),
+                    "rationale": result[2],
+                }
             )
             model_ids.append(model_id)
-            probabilities.append(calibrated_probability)
+            probabilities.append(float(result[0]))
+            confidence_weight = max(0.0, min(1.0, float(result[1])))
+            if isinstance(forecaster, LLMForecaster):
+                # Cap LLM influence at 25%; zero confidence means zero weight.
+                confidence_weight = min(confidence_weight, 0.25)
+            confidence_weights.append(confidence_weight)
+            llm_weight_flags.append(isinstance(forecaster, LLMForecaster))
             if result[2]:
                 rationales.append(f"{model_id}:{result[2]}")
             runtime_factor_id = _runtime_factor_id(
@@ -331,7 +430,7 @@ class ControllerPipeline:
                 result,
                 model_id=model_id,
             ):
-                runtime_probabilities[runtime_factor_id] = calibrated_probability
+                runtime_probabilities[runtime_factor_id] = float(result[0])
 
         has_factor_composition = bool(
             self.strategy is not None and self.strategy.config.factor_composition
@@ -353,8 +452,38 @@ class ControllerPipeline:
             )
             return None
 
+        non_llm_weight = sum(
+            weight
+            for weight, is_llm in zip(
+                confidence_weights,
+                llm_weight_flags,
+                strict=True,
+            )
+            if not is_llm
+        )
+        if any(llm_weight_flags) and non_llm_weight <= 0.0 and not has_factor_composition:
+            self._set_drop_diagnostic(
+                signal,
+                code="llm_only_forecast",
+                message=(
+                    "Skipping decision because no non-LLM forecaster has "
+                    "positive confidence to bound LLM influence."
+                ),
+                severity="info",
+            )
+            _log_pipeline_funnel(
+                signal,
+                forecasted_count=len(probabilities),
+                emitted_count=0,
+            )
+            return None
+
         prob_estimate = (
-            sum(probabilities) / len(probabilities)
+            _weighted_probability(
+                probabilities,
+                confidence_weights,
+                llm_mask=llm_weight_flags,
+            )
             if probabilities
             else signal.yes_price
         )
@@ -385,6 +514,9 @@ class ControllerPipeline:
                 key for key in reported_missing_factors if key not in factor_values
             )
             if _strict_factor_gates(self.settings) and unresolved_missing_factors:
+                self.last_gate_outcomes.append(
+                    {"name": "required_factors", "passed": False, "reason": "missing"}
+                )
                 self.last_diagnostic = _composition_diagnostic(
                     code="missing_required_factors",
                     message="Skipping decision because required raw factors are missing.",
@@ -404,6 +536,9 @@ class ControllerPipeline:
                 key for key in factor_snapshot.stale_factors if key not in signal_factor_values
             )
             if _strict_factor_gates(self.settings) and unresolved_stale_factors:
+                self.last_gate_outcomes.append(
+                    {"name": "factor_freshness", "passed": False, "reason": "stale"}
+                )
                 self.last_diagnostic = _composition_diagnostic(
                     code="stale_required_factors",
                     message="Skipping decision because required raw factors are stale.",
@@ -419,16 +554,23 @@ class ControllerPipeline:
                     extra={"controller_diagnostic": self.last_diagnostic},
                 )
                 return None
+            self.last_gate_outcomes.append(
+                {
+                    "name": "factor_gates",
+                    "passed": True,
+                    "reason": None,
+                    "strict": _strict_factor_gates(self.settings),
+                }
+            )
             try:
                 branch_probabilities = evaluate_branch_probabilities(
                     self.strategy.config.factor_composition,
                     factor_values,
                 )
                 if (
-                    self.settings.mode != RunMode.LIVE
+                    self.settings.mode == RunMode.BACKTEST
                     and not branch_probabilities
                     and unresolved_missing_factors
-                    and "resolved_outcome" in signal.external_signal
                 ):
                     prob_estimate = 0.5
                 else:
@@ -481,6 +623,7 @@ class ControllerPipeline:
         else:
             factor_values = dict(signal_factor_values)
             factor_values.update(runtime_factor_values)
+        calibration_prob_estimate = prob_estimate
         calibrated_estimate = _apply_pre_calibrators(
             prob_estimate,
             model_ids=model_ids,
@@ -604,7 +747,7 @@ class ControllerPipeline:
             decision_outcome = "NO"
             opportunity_side = "no"
             decision_probability = 1.0 - yes_probability
-            decision_price = max(1e-6, min(1.0 - 1e-6, 1.0 - yes_reference_price))
+            decision_price = 1.0 - yes_reference_price
             if signal_outcome.signal_outcome == "NO":
                 decision_price = _direct_signal_reference_price(
                     raw_signal,
@@ -612,9 +755,12 @@ class ControllerPipeline:
                 )
             decision_edge = decision_probability - decision_price
         if (
-            _strategy_metadata(self.strategy).get("price_reference") == "best_ask"
+            strategy_metadata(self.strategy).get("price_reference") == "best_ask"
         ):
-            direct_required = not _decision_uses_signal_orderbook(
+            direct_required = (
+                self.settings.mode == RunMode.BACKTEST
+                and self.historical_book_reader is not None
+            ) or not _decision_uses_signal_orderbook(
                 execution_signal,
                 token_id=decision_token_id,
                 outcome=decision_outcome,
@@ -677,6 +823,25 @@ class ControllerPipeline:
                     emitted_count=0,
                 )
                 return None
+        if not isfinite(decision_price) or not 0.0 < decision_price < 1.0:
+            self._set_drop_diagnostic(
+                signal,
+                code="decision_price_out_of_domain",
+                message=(
+                    "Skipping decision because the selected execution price "
+                    "is outside the open probability domain."
+                ),
+                metadata={
+                    "decision_price": decision_price,
+                    "decision_outcome": decision_outcome,
+                },
+            )
+            _log_pipeline_funnel(
+                signal,
+                forecasted_count=len(probabilities),
+                emitted_count=0,
+            )
+            return None
         if decision_edge <= 0.0:
             self._set_drop_diagnostic(
                 signal,
@@ -735,7 +900,7 @@ class ControllerPipeline:
         # covers the best_ask strategies whose pricing fell back to
         # yes_price because no ask existed — there the spread is a real cost.
         spread_already_in_price = (
-            _strategy_metadata(self.strategy).get("price_reference")
+            strategy_metadata(self.strategy).get("price_reference")
             == "best_ask"
             and decision_price == best_ask(execution_signal)
         )
@@ -743,10 +908,12 @@ class ControllerPipeline:
             decision_price=decision_price,
             spread_bps=decision_spread_bps,
             settings=self.settings,
-            fee_rate=market_fee_rate_from_metadata(
-                execution_signal.external_signal,
-                fallback_rate=self.settings.strategies.flb_fee_rate,
+            fee_rate=_strategy_fee_rate(
+                self.strategy,
+                execution_signal,
+                self.settings,
             ),
+            max_slippage_bps=strategy_max_slippage_bps,
             spread_already_in_price=spread_already_in_price,
         )
         net_edge_after_costs = decision_edge - decision_costs.total_edge
@@ -765,7 +932,7 @@ class ControllerPipeline:
                     "spread_already_in_price": spread_already_in_price,
                     "fee_rate": decision_costs.fee_rate,
                     "fee_edge": decision_costs.fee_edge,
-                    "max_slippage_bps": self.settings.controller.max_slippage_bps,
+                    "max_slippage_bps": strategy_max_slippage_bps,
                     "slippage_edge": decision_costs.slippage_edge,
                     "net_edge_after_costs": net_edge_after_costs,
                     "decision_outcome": decision_outcome,
@@ -779,10 +946,12 @@ class ControllerPipeline:
                 emitted_count=0,
             )
             return None
-        size = sizer.size(
+        size = _size_with_costs(
+            sizer,
             prob=decision_probability,
             market_price=decision_price,
             portfolio=active_portfolio,
+            cost_edge=decision_costs.total_edge if self.strategy is not None else 0.0,
         )
         market_exposure_usdc = _market_exposure_usdc(
             active_portfolio,
@@ -831,12 +1000,12 @@ class ControllerPipeline:
         executable_depth_usdc = _executable_buy_depth_usdc(
             execution_signal.orderbook,
             limit_price=decision_price,
-            max_slippage_bps=self.settings.controller.max_slippage_bps,
+            max_slippage_bps=strategy_max_slippage_bps,
         )
         if (
             executable_depth_usdc is not None
             and self.settings.mode != RunMode.BACKTEST
-            and _strategy_metadata(self.strategy).get("price_reference") == "best_ask"
+            and strategy_metadata(self.strategy).get("price_reference") == "best_ask"
             and _decision_uses_signal_orderbook(
                 execution_signal,
                 token_id=decision_token_id,
@@ -858,7 +1027,7 @@ class ControllerPipeline:
                         "decision_outcome": decision_outcome,
                         "decision_price": decision_price,
                         "max_slippage_bps": (
-                            self.settings.controller.max_slippage_bps
+                            strategy_max_slippage_bps
                         ),
                     },
                 )
@@ -996,7 +1165,7 @@ class ControllerPipeline:
                 "spread_already_in_price": spread_already_in_price,
                 "fee_rate": decision_costs.fee_rate,
                 "fee_edge": decision_costs.fee_edge,
-                "max_slippage_bps": self.settings.controller.max_slippage_bps,
+                "max_slippage_bps": strategy_max_slippage_bps,
                 "slippage_edge": decision_costs.slippage_edge,
                 "net_edge_after_costs": net_edge_after_costs,
             },
@@ -1024,11 +1193,17 @@ class ControllerPipeline:
             limit_price=decision_price,
             notional_usdc=size,
             order_type="limit",
-            max_slippage_bps=self.settings.controller.max_slippage_bps,
+            max_slippage_bps=strategy_max_slippage_bps,
             stop_conditions=router.stop_conditions(signal),
             prob_estimate=decision_probability,
             expected_edge=decision_edge,
-            time_in_force=TimeInForce(self.settings.controller.time_in_force.upper()),
+            time_in_force=TimeInForce(
+                strategy_economic_str(
+                    self.strategy,
+                    "time_in_force",
+                    self.settings.controller.time_in_force.upper(),
+                ).upper()
+            ),
             opportunity_id=opportunity.opportunity_id,
             strategy_id=self.strategy_id,
             strategy_version_id=self.strategy_version_id,
@@ -1038,6 +1213,7 @@ class ControllerPipeline:
             intent_key=intent_key,
             risk_group_id=_risk_group_id(signal),
             spread_bps_at_decision=decision_spread_bps,
+            calibration_prob_estimate=calibration_prob_estimate,
         )
 
     async def _refresh_signal_book_before_router_gate(
@@ -1049,7 +1225,7 @@ class ControllerPipeline:
         if (
             self.settings.mode == RunMode.BACKTEST
             or self.direct_book_reader is None
-            or _strategy_metadata(self.strategy).get("price_reference") != "best_ask"
+            or strategy_metadata(self.strategy).get("price_reference") != "best_ask"
         ):
             return signal
         direct_read = await self._read_direct_outcome_execution_signal(
@@ -1067,35 +1243,56 @@ class ControllerPipeline:
         outcome: Literal["YES", "NO"],
         price_coordinate: Literal["canonical_yes", "target_token"] = "canonical_yes",
     ) -> _DirectBookRead:
-        if token_id is None or self.direct_book_reader is None:
+        historical = self.settings.mode == RunMode.BACKTEST
+        reader = self.historical_book_reader if historical else self.direct_book_reader
+        if token_id is None or reader is None:
             failure = "missing_token_id" if token_id is None else "reader_unavailable"
             return _DirectBookRead(signal=None, failure=failure)
+        historical_signal: MarketSignal | None = None
+        orderbook: dict[str, Any] | None
         try:
-            snapshot = await self.direct_book_reader.read_latest_snapshot(
-                signal.market_id,
-                token_id,
-            )
-            if snapshot is None:
-                return _DirectBookRead(signal=None, failure="snapshot_missing")
-            snapshot_ts = _aware_utc(snapshot.ts)
-            age_ms = max(
-                0.0,
-                (datetime.now(tz=UTC) - snapshot_ts).total_seconds() * 1000.0,
-            )
+            if historical:
+                assert self.historical_book_reader is not None
+                try:
+                    historical_signal = await self.historical_book_reader.signal_at(
+                        signal.fetched_at, market_id=signal.market_id, token_id=token_id,
+                    )
+                except LookupError:
+                    return _DirectBookRead(signal=None, failure="snapshot_missing")
+                snapshot_ts = _aware_utc(
+                    _external_signal_datetime(historical_signal.external_signal.get("book_received_at"))
+                    or historical_signal.fetched_at
+                )
+                if historical_signal.fetched_at > signal.fetched_at or snapshot_ts > signal.fetched_at:
+                    return _DirectBookRead(signal=None, failure="future_snapshot")
+                orderbook = _orderbook_from_levels([
+                    BookLevel(0, signal.market_id, cast(Literal["BUY", "SELL"], side), level["price"], level["size"])
+                    for key, side in (("bids", "BUY"), ("asks", "SELL"))
+                    for level in historical_signal.orderbook.get(key, [])
+                ])
+                source = "replay"
+                now = _aware_utc(signal.fetched_at)
+            else:
+                assert self.direct_book_reader is not None
+                snapshot = await self.direct_book_reader.read_latest_snapshot(signal.market_id, token_id)
+                if snapshot is None:
+                    return _DirectBookRead(signal=None, failure="snapshot_missing")
+                snapshot_ts = _aware_utc(snapshot.ts)
+                levels = await self.direct_book_reader.read_levels_for_snapshot(snapshot.id)
+                orderbook = _orderbook_from_levels(levels)
+                source = snapshot.source
+                now = datetime.now(tz=UTC)
+            age_ms = max(0.0, (now - snapshot_ts).total_seconds() * 1000.0)
             if age_ms > self.settings.controller.max_book_age_ms:
                 return _DirectBookRead(signal=None, failure="stale", age_ms=age_ms)
-            levels = await self.direct_book_reader.read_levels_for_snapshot(snapshot.id)
         except Exception as error:  # noqa: BLE001
             logger.warning(
                 "direct outcome book read failed for %s/%s: %s",
-                signal.market_id,
-                token_id,
-                error,
+                signal.market_id, token_id, error,
             )
             return _DirectBookRead(signal=None, failure="read_failed")
 
-        orderbook = _orderbook_from_levels(levels)
-        if orderbook is None:
+        if orderbook is None or not orderbook.get("asks"):
             return _DirectBookRead(signal=None, failure="levels_missing", age_ms=age_ms)
         external_signal: dict[str, Any] = {
             key: value
@@ -1107,14 +1304,19 @@ class ControllerPipeline:
                 "signal_token_outcome": outcome,
                 "book_age_ms": age_ms,
                 "book_received_at": snapshot_ts.isoformat(),
-                "direct_outcome_book_source": snapshot.source,
+                "direct_outcome_book_source": source,
             }
         )
-        fee_rate_bps = await _read_direct_fee_rate_bps(
-            self.direct_book_reader,
-            market_id=signal.market_id,
-            token_id=token_id,
-        )
+        if historical_signal is not None:
+            raw_fee = historical_signal.external_signal.get("fee_rate_bps")
+            fee_rate_bps = (
+                float(raw_fee) if isinstance(raw_fee, (int, float))
+                and isfinite(raw_fee) and 0.0 <= raw_fee <= 10_000.0 else None
+            )
+        else:
+            fee_rate_bps = await _read_direct_fee_rate_bps(
+                self.direct_book_reader, market_id=signal.market_id, token_id=token_id,
+            )
         if fee_rate_bps is not None:
             external_signal["fee_rate_bps"] = fee_rate_bps
         best_bid = _best_level(orderbook, "bids")
@@ -1160,13 +1362,68 @@ class ControllerPipeline:
         forecaster: IForecaster,
         signal: MarketSignal,
     ) -> ForecastResult | None:
+        replay_mode = (
+            isinstance(forecaster, LLMForecaster)
+            and forecaster.record_replay_mode == "replay"
+        )
         async_predict = getattr(forecaster, "apredict", None)
         if callable(async_predict) and not _predict_method_overridden(forecaster):
-            return await cast(
-                Callable[[MarketSignal], Awaitable[ForecastResult | None]],
-                async_predict,
-            )(signal)
-        return await asyncio.to_thread(forecaster.predict, signal)
+            try:
+                if isinstance(forecaster, LLMForecaster):
+                    pending_result = await asyncio.wait_for(
+                        forecaster.apredict(signal, defer_record=True),
+                        timeout=self.settings.llm.timeout_s,
+                    )
+                    if forecaster.record_replay_mode == "record":
+                        await forecaster.record_outcome(signal, pending_result)
+                    return pending_result
+                return await asyncio.wait_for(
+                    cast(
+                        Callable[[MarketSignal], Awaitable[ForecastResult | None]],
+                        async_predict,
+                    )(signal),
+                    timeout=self.settings.llm.timeout_s,
+                )
+            except TimeoutError as exc:
+                if replay_mode:
+                    raise LLMReplayCacheMissError(
+                        "LLM replay timed out while reading the replay store"
+                    ) from exc
+                if isinstance(forecaster, LLMForecaster) and (
+                    forecaster.record_replay_mode == "record"
+                ):
+                    await forecaster.record_timeout(signal)
+                return None
+            except Exception:
+                if isinstance(forecaster, LLMForecaster) and (
+                    forecaster.record_replay_mode == "record"
+                ):
+                    await forecaster.record_outcome(
+                        signal,
+                        None,
+                        failure_reason=forecaster.last_failure_reason or "provider_error",
+                    )
+                raise
+        timeout_s = self.settings.llm.timeout_s
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(forecaster.predict, signal),
+                timeout=timeout_s,
+            )
+        except TimeoutError as exc:
+            if replay_mode:
+                raise LLMReplayCacheMissError(
+                    "LLM replay timed out while reading the replay store"
+                ) from exc
+            if isinstance(forecaster, LLMForecaster) and (
+                forecaster.record_replay_mode == "record"
+            ):
+                await forecaster.record_timeout(signal)
+            logger.info(
+                "forecaster timed out; skipping late forecast",
+                extra={"forecaster": type(forecaster).__name__, "market_id": signal.market_id},
+            )
+            return None
 
 
 def _apply_pre_calibrators(
@@ -1185,31 +1442,85 @@ def _apply_pre_calibrators(
         resolved_sample_count=_resolved_sample_count(calibrator, model_ids),
         model_id=_decision_model_id(model_ids) or "unknown",
     )
-    current: float | None = raw_prob
-    for pre_calibrator in _pre_calibrators(spec):
-        if current is None:
-            return None
-        next_prob = pre_calibrator.calibrate(current, context=context)
-        if next_prob is None:
-            logger.info(
-                "calibration clamp rejected forecast for %s",
-                signal.market_id,
-                extra={
-                    "event": "clamp_rejection",
-                    "market_id": signal.market_id,
-                    "raw_prob": raw_prob,
-                    "calibrated_prob": current,
-                    "clamp_action": "reject",
-                    "resolved_sample_count": context.resolved_sample_count,
-                },
-            )
-            return None
-        current = next_prob
+    # Netcal is trained from the raw decision coordinate persisted with each
+    # EvalRecord, so apply it to that same coordinate before presentation
+    # shrinkage and extreme clamping.
+    current: float | None = calibrator.calibrate(raw_prob, model_id=context.model_id)
+    if current is None:
+        return None
+    current = LogitShrinkageCalibrator(spec).calibrate(current, context=context)
+    if current is None:
+        return None
+    next_prob = ExtremeProbClamp(spec).calibrate(current, context=context)
+    if next_prob is None:
+        logger.info(
+            "calibration clamp rejected forecast for %s",
+            signal.market_id,
+            extra={
+                "event": "clamp_rejection",
+                "market_id": signal.market_id,
+                "raw_prob": raw_prob,
+                "calibrated_prob": current,
+                "clamp_action": "reject",
+                "resolved_sample_count": context.resolved_sample_count,
+            },
+        )
+        return None
+    current = next_prob
     return current
 
 
-def _pre_calibrators(spec: CalibrationSpec) -> tuple[IPreCalibrator, ...]:
-    return (LogitShrinkageCalibrator(spec), ExtremeProbClamp(spec))
+def _weighted_probability(
+    probabilities: Sequence[float],
+    weights: Sequence[float],
+    *,
+    llm_mask: Sequence[bool] | None = None,
+) -> float:
+    if not probabilities:
+        return 0.5
+    effective = [max(0.0, weight) for weight in weights]
+    if llm_mask is not None:
+        if len(llm_mask) != len(effective):
+            raise ValueError("llm_mask must match probabilities and weights")
+        non_llm_total = sum(
+            weight for weight, is_llm in zip(effective, llm_mask, strict=True) if not is_llm
+        )
+        llm_total = sum(
+            weight for weight, is_llm in zip(effective, llm_mask, strict=True) if is_llm
+        )
+        if non_llm_total <= 0.0 and llm_total > 0.0:
+            return 0.5
+        max_llm_total = non_llm_total / 3.0
+        if llm_total > max_llm_total > 0.0:
+            scale = max_llm_total / llm_total
+            effective = [
+                weight * scale if is_llm else weight
+                for weight, is_llm in zip(effective, llm_mask, strict=True)
+            ]
+    total = sum(effective)
+    if total <= 0.0:
+        return sum(probabilities) / len(probabilities)
+    return sum(probability * weight for probability, weight in zip(probabilities, effective, strict=True)) / total
+
+
+def _size_with_costs(
+    sizer: ISizer,
+    *,
+    prob: float,
+    market_price: float,
+    portfolio: Portfolio,
+    cost_edge: float,
+) -> float:
+    parameters = inspect.signature(sizer.size).parameters
+    kwargs: dict[str, object] = {
+        "prob": prob,
+        "market_price": market_price,
+        "portfolio": portfolio,
+    }
+    if "cost_edge" in parameters:
+        kwargs["cost_edge"] = cost_edge
+    size_fn = cast(Callable[..., float], sizer.size)
+    return size_fn(**kwargs)
 
 
 def _resolved_sample_count(calibrator: ICalibrator, model_ids: Sequence[str]) -> int:
@@ -1263,6 +1574,7 @@ def _decision_cost_edges(
     spread_bps: int | None,
     settings: PMSSettings,
     fee_rate: float | None = None,
+    max_slippage_bps: int | None = None,
     spread_already_in_price: bool = False,
 ) -> _DecisionCostEdges:
     price = Decimal(str(decision_price))
@@ -1272,7 +1584,12 @@ def _decision_cost_edges(
     fee_rate_decimal = Decimal(str(effective_fee_rate))
     fee_edge = fee_rate_decimal * (Decimal("1.0") - price)
     slippage_edge = (
-        Decimal(settings.controller.max_slippage_bps) / Decimal("10000")
+        Decimal(
+            settings.controller.max_slippage_bps
+            if max_slippage_bps is None
+            else max_slippage_bps
+        )
+        / Decimal("10000")
     ) * price
     spread_edge = (
         Decimal("0")
@@ -1284,6 +1601,22 @@ def _decision_cost_edges(
         fee_rate=effective_fee_rate,
         fee_edge=float(fee_edge),
         slippage_edge=float(slippage_edge),
+    )
+
+
+def _strategy_fee_rate(
+    strategy: ActiveStrategy | None,
+    signal: MarketSignal,
+    settings: PMSSettings,
+) -> float:
+    strategy_fallback = strategy_economic_float(
+        strategy,
+        "fee_rate",
+        settings.strategies.flb_fee_rate,
+    )
+    return market_fee_rate_from_metadata(
+        signal.external_signal,
+        fallback_rate=strategy_fallback,
     )
 
 
@@ -1357,7 +1690,7 @@ def _direct_signal_reference_price(
     *,
     strategy: ActiveStrategy | None,
 ) -> float:
-    if _strategy_metadata(strategy).get("price_reference") != "best_ask":
+    if strategy_metadata(strategy).get("price_reference") != "best_ask":
         return signal.yes_price
     executable_price = best_ask(signal)
     return signal.yes_price if executable_price is None else executable_price
@@ -1575,6 +1908,11 @@ def _effective_min_order_usdc(
 def _model_id(result: ForecastResult, forecaster: IForecaster) -> str:
     raw_model_id = getattr(result, "model_id", None)
     if isinstance(raw_model_id, str) and raw_model_id:
+        prompt_hash = getattr(result, "prompt_hash", None)
+        provider = getattr(result, "provider", None)
+        if isinstance(prompt_hash, str) and prompt_hash:
+            prefix = f"{provider}:" if isinstance(provider, str) else ""
+            return f"{prefix}{raw_model_id}:prompt-{prompt_hash[:12]}"
         return raw_model_id
     return forecaster.__class__.__name__
 
@@ -1638,10 +1976,7 @@ def _signal_factor_values(signal: MarketSignal) -> dict[tuple[str, str], float]:
     values: dict[tuple[str, str], float] = {("yes_price", ""): signal.yes_price}
     row = OrderbookImbalance().compute(signal, EMPTY_OUTER_RING)
     if row is not None:
-        value = row.value
-        if _signal_token_outcome(signal) == "NO":
-            value = -value
-        values[(row.factor_id, row.param)] = value
+        values[(row.factor_id, row.param)] = row.value
     return values
 
 
@@ -1675,6 +2010,8 @@ def _external_text(signal: MarketSignal, key: str) -> str | None:
 
 
 def _strict_factor_gates(settings: PMSSettings) -> bool:
+    # Strictness is a runtime safety policy owned by ControllerSettings (and
+    # forced on in LIVE). Strategy metadata does not carry a second gate flag.
     return settings.mode == RunMode.LIVE or settings.controller.strict_factor_gates
 
 
@@ -1723,16 +2060,10 @@ def _yes_reference_price(
     signal: MarketSignal,
     strategy: ActiveStrategy | None,
 ) -> float:
-    if _strategy_metadata(strategy).get("price_reference") != "best_ask":
+    if strategy_metadata(strategy).get("price_reference") != "best_ask":
         return signal.yes_price
     executable_price = best_ask(signal)
     return signal.yes_price if executable_price is None else executable_price
-
-
-def _strategy_metadata(strategy: ActiveStrategy | None) -> dict[str, str]:
-    if strategy is None:
-        return {}
-    return dict(strategy.config.metadata)
 
 
 def _market_exposure_usdc(portfolio: Portfolio, *, market_id: str) -> float:
