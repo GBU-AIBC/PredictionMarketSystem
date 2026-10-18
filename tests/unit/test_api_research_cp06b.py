@@ -333,6 +333,26 @@ async def test_research_run_routes_return_422_for_invalid_run_id(path: str) -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/research/backtest/11111111-1111-1111-1111-111111111111/strategies",
+        "/research/backtest/11111111-1111-1111-1111-111111111111/compare",
+    ],
+)
+async def test_research_run_routes_return_404_for_unknown_run_id(path: str) -> None:
+    runner = Runner()
+    runner.bind_pg_pool(cast(asyncpg.Pool, _FetchRowPool()))
+    app = create_app(runner, auto_start=False)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(path) if path.endswith("strategies") else await client.post(path, json={})
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_compare_backtest_run_returns_503_when_pg_pool_unset() -> None:
     runner = Runner()
     app = create_app(runner, auto_start=False)

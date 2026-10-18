@@ -1318,6 +1318,8 @@ def create_app(
         if active_runner.pg_pool is None:
             raise HTTPException(status_code=503, detail="Runner PostgreSQL pool is not initialized")
         _validate_backtest_run_id(run_id)
+        if await fetch_backtest_run(active_runner.pg_pool, run_id) is None:
+            raise HTTPException(status_code=404, detail="Backtest run not found")
         return await list_backtest_strategy_runs(active_runner.pg_pool, run_id)
 
     @app.post(
@@ -1339,6 +1341,8 @@ def create_app(
         if active_runner.pg_pool is None:
             raise HTTPException(status_code=503, detail="Runner PostgreSQL pool is not initialized")
         _validate_backtest_run_id(run_id)
+        if await fetch_backtest_run(active_runner.pg_pool, run_id) is None:
+            raise HTTPException(status_code=404, detail="Backtest run not found")
         try:
             raw_payload = await request.json()
             payload = ComparisonRequest.model_validate(raw_payload).model_dump(mode="json")
