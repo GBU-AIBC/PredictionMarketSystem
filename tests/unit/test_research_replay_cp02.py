@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -56,6 +57,112 @@ def _spec(*, market_id: str = "market-cancel") -> BacktestSpec:
         date_range_start=datetime(2026, 3, 1, tzinfo=UTC),
         date_range_end=datetime(2026, 3, 31, 23, 59, tzinfo=UTC),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_trade", [None, 0.9])
+async def test_book_replay_uses_midpoint_before_last_trade(
+    tmp_path: Path, prior_trade: float | None,
+) -> None:
+    from pms.research.replay import MarketUniverseReplayEngine
+
+    rows: list[dict[str, object]] = []
+    if prior_trade is not None:
+        rows.append({
+            "event_type": "trade", "market_id": "market-cancel", "price": prior_trade,
+            "sequence": 1, "ts": "2026-03-01T00:00:00Z",
+        })
+    rows.append({
+        "event_type": "book_snapshot", "market_id": "market-cancel",
+        "sequence": 2, "ts": "2026-03-01T00:00:01Z",
+        "bids": [{"price": 0.4, "size": 10.0}],
+        "asks": [{"price": 0.6, "size": 10.0}],
+    })
+    path = tmp_path / "book.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows))
+    engine = MarketUniverseReplayEngine.from_jsonl(path)
+    signals = [s async for s in engine.stream(_spec(), BacktestExecutionConfig())]
+    assert signals[-1].yes_price == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token_ids_on_first_row", [True, False])
+@pytest.mark.parametrize("no_price", [0.2, 0.002])
+async def test_no_token_replay_is_canonicalized_before_forecasting(
+    tmp_path: Path, token_ids_on_first_row: bool, no_price: float,
+) -> None:
+    from pms.config import PMSSettings
+    from pms.core.enums import RunMode
+    from pms.core.models import MarketSignal, Portfolio
+    from pms.controller.pipeline import ControllerPipeline
+    from pms.research.replay import MarketUniverseReplayEngine
+
+    class Forecaster:
+        def predict(self, signal: MarketSignal) -> tuple[float, float, str]:
+            assert signal.yes_price == pytest.approx(1 - no_price)
+            return (1 - no_price - 0.13, 0.9, "YES probability")
+
+        async def forecast(self, signal: MarketSignal) -> float:
+            return self.predict(signal)[0]
+
+    path = tmp_path / "no-token.jsonl"
+    token_ids = {"yes_token_id": "token-yes", "no_token_id": "token-no"}
+    rows = [
+        {"event_type": "trade", "market_id": "market-cancel", "token_id": "token-no",
+         "price": no_price, "sequence": 1, "ts": "2026-03-01T00:00:00Z",
+         **(token_ids if token_ids_on_first_row else {})},
+        {"event_type": "trade", "market_id": "market-cancel", "token_id": "token-no",
+         "price": no_price, "sequence": 2, "ts": "2026-03-01T00:00:01Z", **token_ids},
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows))
+    engine = MarketUniverseReplayEngine.from_jsonl(path)
+    signals = [s async for s in engine.stream(_spec(), BacktestExecutionConfig())]
+    pipeline = ControllerPipeline(
+        forecasters=[Forecaster()], settings=PMSSettings(mode=RunMode.BACKTEST),
+    )
+    emission = await pipeline.on_signal(
+        signals[0],
+        portfolio=Portfolio(total_usdc=1000.0, free_usdc=1000.0, locked_usdc=0.0, open_positions=[]),
+    )
+    assert emission is not None, pipeline.last_diagnostic
+    _, decision = emission
+    assert decision.outcome == "NO"
+    assert decision.token_id == "token-no"
+    assert decision.limit_price == pytest.approx(no_price)
+    assert decision.prob_estimate == pytest.approx(no_price + 0.13)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_trade", [None, 0.7])
+async def test_book_replay_missing_reference_is_not_a_zero_probability(
+    tmp_path: Path, prior_trade: float | None,
+) -> None:
+    from pms.controller.router import Router
+    from pms.research.replay import MarketUniverseReplayEngine
+
+    rows: list[dict[str, object]] = []
+    if prior_trade is not None:
+        rows.append({
+            "event_type": "trade", "market_id": "market-cancel", "price": prior_trade,
+            "sequence": 1, "ts": "2026-03-01T00:00:00Z",
+        })
+    rows.append({
+        "event_type": "book_snapshot", "market_id": "market-cancel",
+        "sequence": 2, "ts": "2026-03-01T00:00:01Z",
+        "bids": [], "asks": [{"price": 0.6, "size": 10.0}],
+    })
+    path = tmp_path / "book.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows))
+    engine = MarketUniverseReplayEngine.from_jsonl(path)
+    signals = [s async for s in engine.stream(_spec(), BacktestExecutionConfig())]
+    signal = signals[-1]
+    if prior_trade is None:
+        assert math.isnan(signal.yes_price)
+        assert Router(allow_extreme_prices=True).gate_reason(signal) == "yes_price_out_of_band"
+    else:
+        assert signal.yes_price == prior_trade
+    book = await engine.book_state_at(signal.timestamp, market_id=signal.market_id, token_id=signal.token_id)
+    assert book["asks"] == [{"price": 0.6, "size": 10.0}]
 
 
 class _CancellationConnection:

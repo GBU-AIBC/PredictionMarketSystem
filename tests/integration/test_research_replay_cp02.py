@@ -286,6 +286,9 @@ async def test_market_universe_replay_engine_streams_ordered_market_signals(
     token_id = "token-replay-cp02"
     store = PostgresMarketDataStore(pg_pool)
     await _seed_replay_rows(store, market_id=market_id, token_id=token_id)
+    await store.write_token(_md_token(
+        token_id=f"{token_id}-no", condition_id=market_id, outcome="NO",
+    ))
 
     engine = MarketUniverseReplayEngine(pool=pg_pool)
     signals = await _collect_signals(
@@ -306,6 +309,9 @@ async def test_market_universe_replay_engine_streams_ordered_market_signals(
         "bids": [{"price": 0.41, "size": 120.0}],
         "asks": [{"price": 0.59, "size": 95.0}],
     }
+    assert signals[0].yes_price == pytest.approx(0.5)
+    assert signals[0].external_signal["yes_token_id"] == token_id
+    assert signals[0].external_signal["no_token_id"] == f"{token_id}-no"
     assert signals[1].yes_price == pytest.approx(0.5)
     assert signals[2].yes_price == pytest.approx(0.52)
 

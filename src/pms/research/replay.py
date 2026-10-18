@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 import json
+from math import nan
 import os
 from pathlib import Path
 import stat
@@ -55,6 +56,8 @@ class _MarketMetadata:
     resolved_outcome: float | None = None
     resolved_at: datetime | None = None
     observed_at: datetime | None = None
+    yes_token_id: str | None = None
+    no_token_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -276,7 +279,11 @@ class MarketUniverseReplayEngine:
                            resolutions.resolved_outcome,
                            resolutions.resolved_at,
                            resolutions.observed_at,
-                           markets.last_seen_at
+                           markets.last_seen_at,
+                           (SELECT MAX(token_id) FROM tokens WHERE condition_id = markets.condition_id
+                            AND outcome = 'YES') AS yes_token_id,
+                           (SELECT MAX(token_id) FROM tokens WHERE condition_id = markets.condition_id
+                            AND outcome = 'NO') AS no_token_id
                     FROM markets
                     LEFT JOIN market_resolutions AS resolutions
                       ON resolutions.market_id = markets.condition_id
@@ -296,7 +303,11 @@ class MarketUniverseReplayEngine:
                            resolutions.resolved_outcome,
                            resolutions.resolved_at,
                            resolutions.observed_at,
-                           markets.last_seen_at
+                           markets.last_seen_at,
+                           (SELECT MAX(token_id) FROM tokens WHERE condition_id = markets.condition_id
+                            AND outcome = 'YES') AS yes_token_id,
+                           (SELECT MAX(token_id) FROM tokens WHERE condition_id = markets.condition_id
+                            AND outcome = 'NO') AS no_token_id
                     FROM markets
                     LEFT JOIN market_resolutions AS resolutions
                       ON resolutions.market_id = markets.condition_id
@@ -319,6 +330,8 @@ class MarketUniverseReplayEngine:
                     datetime | None,
                     row.get("observed_at") or row.get("last_seen_at"),
                 ),
+                yes_token_id=cast(str | None, row.get("yes_token_id")),
+                no_token_id=cast(str | None, row.get("no_token_id")),
             )
             for row in rows
         }
@@ -495,7 +508,17 @@ def _parse_jsonl_events(path: Path) -> tuple[dict[str, _MarketMetadata], list[_R
                 resolved_outcome=normalize_resolved_outcome(row.get("resolved_outcome")),
                 resolved_at=_optional_datetime(row.get("resolved_at")),
                 observed_at=_optional_datetime(row.get("observed_at")) or ts,
+                yes_token_id=_optional_str(row.get("yes_token_id")),
+                no_token_id=_optional_str(row.get("no_token_id")),
             ),
+        )
+
+        # Token identity is immutable metadata, even when supplied on a later row.
+        metadata = market_metadata[market_id]
+        market_metadata[market_id] = replace(
+            metadata,
+            yes_token_id=metadata.yes_token_id or _optional_str(row.get("yes_token_id")),
+            no_token_id=metadata.no_token_id or _optional_str(row.get("no_token_id")),
         )
 
         event_type = _required_str(row, "event_type", path=path, line_number=line_number)
@@ -673,7 +696,11 @@ def _event_to_signal(
             state=state,
             metadata=market_metadata[snapshot.market_id],
             timestamp=snapshot.ts,
-            price=state.last_trade_price,
+            price=_signal_price(
+                price=state.last_trade_price if state.last_trade_price is not None else nan,
+                best_bid=max(state.bids, default=None),
+                best_ask=min(state.asks, default=None),
+            ),
             event_type="book",
         )
     if isinstance(payload, PriceChange):
@@ -740,6 +767,10 @@ def _market_signal(
     extra: dict[str, Any] | None = None,
 ) -> MarketSignal:
     external_signal: dict[str, Any] = {"raw_event_type": event_type}
+    if metadata.yes_token_id is not None:
+        external_signal["yes_token_id"] = metadata.yes_token_id
+    if metadata.no_token_id is not None:
+        external_signal["no_token_id"] = metadata.no_token_id
     if extra is not None:
         external_signal.update(extra)
     return MarketSignal(
@@ -747,7 +778,7 @@ def _market_signal(
         token_id=state.token_id,
         venue=metadata.venue,
         title=metadata.title,
-        yes_price=price if price is not None else 0.0,
+        yes_price=price if price is not None else nan,
         volume_24h=None,
         resolves_at=metadata.resolves_at,
         orderbook=_orderbook_from_state(state),
