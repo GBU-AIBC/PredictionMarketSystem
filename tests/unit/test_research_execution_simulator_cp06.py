@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from dataclasses import replace
 from typing import Literal
 
 import pytest
@@ -491,6 +492,35 @@ async def test_simulator_gtc_fills_remaining_notional_on_later_signal() -> None:
     assert advanced[0].status == OrderStatus.MATCHED.value
     assert advanced[0].filled_notional_usdc == pytest.approx(100.0)
     assert advanced[0].remaining_notional_usdc == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_ms", [0, 1])
+@pytest.mark.parametrize("other_market", [False, True])
+async def test_gtc_cancels_at_resolution_without_filling_remainder(
+    after_ms: int, other_market: bool,
+) -> None:
+    simulator = BacktestExecutionSimulator()
+    resolved_at = datetime(2026, 4, 20, 12, 0, 1, tzinfo=UTC)
+    model = _execution_model(fill_policy="good_til_cancelled")
+    initial = await simulator.execute(
+        signal=_signal(resolves_at=resolved_at),
+        decision=_decision(time_in_force=TimeInForce.GTC),
+        execution_model=model,
+    )
+    assert initial.status == OrderStatus.PARTIAL.value
+    signal = replace(
+        _signal(fetched_at=resolved_at + timedelta(milliseconds=after_ms)),
+        resolves_at=None,
+        market_id="other-market" if other_market else "sim-market",
+    )
+    results = await simulator.advance(signal=signal, execution_model=model)
+    assert len(results) == 1
+    assert results[0].status == OrderStatus.CANCELED_MARKET_RESOLVED.value
+    assert results[0].filled_notional_usdc == initial.filled_notional_usdc
+    assert results[0].filled_quantity == initial.filled_quantity
+    assert results[0].remaining_notional_usdc == initial.remaining_notional_usdc
+    assert simulator.open_orders_ledger == {}
 
 
 @pytest.mark.asyncio

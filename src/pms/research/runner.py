@@ -670,6 +670,20 @@ class BacktestRunner:
                     prior_filled_quantity=prior_quantity,
                     execution_model=spec.execution_model,
                 )
+                if advanced_state.status in {
+                    OrderStatus.MATCHED.value,
+                    OrderStatus.CANCELLED.value,
+                    OrderStatus.CANCELED_MARKET_RESOLVED.value,
+                    "rejected",
+                }:
+                    order_decisions.pop(advanced_state.order_id, None)
+                    observed_order_totals.pop(advanced_state.order_id, None)
+                    if fill is None:
+                        accumulator.record_execution_rejection(
+                            signal=scoring_signal,
+                            decision=decision_for_fill,
+                            rejection_reason=advanced_state.raw_status,
+                        )
                 if fill is None:
                     continue
                 portfolio = _portfolio_with_fill(portfolio, fill)
@@ -685,12 +699,6 @@ class BacktestRunner:
                         fill=fill,
                         slice_descriptor=slice_descriptor,
                     )
-                if advanced_state.status in {
-                    OrderStatus.MATCHED.value,
-                    OrderStatus.CANCELLED.value,
-                    "rejected",
-                }:
-                    order_decisions.pop(advanced_state.order_id, None)
             emission = await pipeline.on_signal(signal, portfolio=portfolio)
             if emission is None:
                 continue

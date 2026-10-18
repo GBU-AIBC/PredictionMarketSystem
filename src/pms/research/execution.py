@@ -46,6 +46,7 @@ class _OpenOrderState:
     submitted_at: datetime
     last_updated_at: datetime
     requested_notional_usdc: float
+    resolves_at: datetime | None = None
     filled_notional_usdc: float = 0.0
     filled_quantity: float = 0.0
     remaining_notional_usdc: float = 0.0
@@ -159,6 +160,7 @@ class BacktestExecutionSimulator:
                     submitted_at=submitted_at,
                     last_updated_at=submitted_at,
                     requested_notional_usdc=decision.notional_usdc,
+                    resolves_at=signal.resolves_at,
                     remaining_notional_usdc=decision.notional_usdc,
                 )
                 self.open_orders_ledger[order_id] = open_order
@@ -225,6 +227,7 @@ class BacktestExecutionSimulator:
                 submitted_at=submitted_at,
                 last_updated_at=submitted_at,
                 requested_notional_usdc=decision.notional_usdc,
+                resolves_at=signal.resolves_at,
                 filled_notional_usdc=fill.filled_notional_usdc,
                 filled_quantity=fill.filled_quantity,
                 remaining_notional_usdc=fill.remaining_notional_usdc,
@@ -269,6 +272,26 @@ class BacktestExecutionSimulator:
         results: list[OrderState] = []
         for order_id, open_order in list(self.open_orders_ledger.items()):
             evaluated_at = _fill_timestamp(signal, execution_model)
+            if _same_market(open_order.decision, signal) and signal.resolves_at is not None:
+                open_order.resolves_at = signal.resolves_at
+            if open_order.resolves_at is not None and evaluated_at >= open_order.resolves_at:
+                results.append(
+                    _order_state(
+                        order_id=order_id,
+                        decision=open_order.decision,
+                        status=OrderStatus.CANCELED_MARKET_RESOLVED.value,
+                        submitted_at=open_order.submitted_at,
+                        last_updated_at=evaluated_at,
+                        requested_notional_usdc=open_order.requested_notional_usdc,
+                        filled_notional_usdc=open_order.filled_notional_usdc,
+                        remaining_notional_usdc=open_order.remaining_notional_usdc,
+                        filled_quantity=open_order.filled_quantity,
+                        fill_price=open_order.last_fill_price,
+                        raw_status="market_resolved_before_execution",
+                    )
+                )
+                self.open_orders_ledger.pop(order_id, None)
+                continue
             if evaluated_at - open_order.submitted_at >= timedelta(
                 milliseconds=execution_model.order_ttl_ms
             ):

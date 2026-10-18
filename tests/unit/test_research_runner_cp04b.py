@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import re
 from typing import Any, cast
@@ -774,6 +774,32 @@ async def test_backtest_runner_execution_model_staleness_budget_can_prevent_fill
 
     assert accumulator.decision_count == 1
     assert accumulator.fill_count == 0
+
+
+@pytest.mark.asyncio
+async def test_backtest_runner_records_resolution_cancellation_for_gtc_order() -> None:
+    start = datetime(2026, 4, 20, tzinfo=UTC)
+    cutoff = start + timedelta(seconds=1)
+    runner = BacktestRunner(
+        writable_pool=cast(Any, object()),
+        readonly_pool=cast(Any, object()),
+        replay_engine=_ReplayEngine([
+            replace(_signal(start), resolves_at=cutoff),
+            replace(_signal(cutoff), resolves_at=cutoff),
+        ]),
+        controller_factory=_PipelineFactory(_GtcUnfilledPipeline()),
+    )
+    spec = _spec()
+    spec = replace(spec, execution_model=replace(
+        spec.execution_model, fill_policy="good_til_cancelled",
+    ))
+    accumulator = await runner._run_strategy(
+        strategy=_active_strategy(), spec=spec,
+        exec_config=BacktestExecutionConfig(),
+    )
+    assert accumulator.fill_count == 0
+    first = next(row for row in accumulator.execution_rows if row.decision_id == "decision-1")
+    assert first.rejection_reason == "market_resolved_before_execution"
 
 
 @pytest.mark.asyncio
