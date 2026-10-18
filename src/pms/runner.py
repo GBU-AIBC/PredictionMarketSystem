@@ -868,6 +868,12 @@ class Runner:
                 error = exc
 
         try:
+            await self._discard_pending_actuator_work()
+        except BaseException as exc:
+            if error is None:
+                error = exc
+
+        try:
             await self._evaluator_spool.stop()
         except BaseException as exc:  # pragma: no cover - defensive
             if error is None:
@@ -3297,6 +3303,33 @@ class Runner:
     async def _close_pg_pool(self) -> None:
         await self.close_pg_pool()
 
+    async def _discard_pending_actuator_work(self) -> None:
+        error: Exception | None = None
+        while not self._decision_queue.empty():
+            raw_work_item = self._decision_queue.get_nowait()
+            try:
+                work_item = _coerce_actuator_work_item(raw_work_item)
+                decision_id = work_item.decision.decision_id
+                # Only items still in the queue are known not to be submitted.
+                try:
+                    await self._update_decision_status_if_supported(
+                        decision_id, current_status="queued", next_status="cancelled",
+                    )
+                    if work_item.dedup_acquired:
+                        await self.actuator_executor.dedup_store.release(
+                            decision_id, "rejected",
+                        )
+                finally:
+                    self._release_position_exit_key(decision_id)
+                    self._release_position_capacity_reservation(decision_id)
+            except Exception as exc:
+                if error is None:
+                    error = exc
+            finally:
+                self._decision_queue.task_done()
+        if error is not None:
+            raise error
+
     async def _cleanup_after_start_failure(self) -> None:
         self._supervisor.stop()
         stop_error: BaseException | None = None
@@ -3311,8 +3344,8 @@ class Runner:
         resolution_sweep_task = self._resolution_sweep_task
         if resolution_sweep_task is not None and not resolution_sweep_task.done():
             resolution_sweep_task.cancel()
-        for task in self._controller_pipeline_tasks.values():
-            if not task.done():
+        for task in (self._controller_task, *self._controller_pipeline_tasks.values(), self._actuator_task):
+            if task is not None and not task.done():
                 task.cancel()
         reselection_task = self._reselection_task
         self._reselection_requested.set()
@@ -3326,7 +3359,9 @@ class Runner:
                     task
                     for task in (
                         self._factor_service_task,
+                        self._controller_task,
                         *self._controller_pipeline_tasks.values(),
+                        self._actuator_task,
                         decision_expiry_task,
                         runtime_heartbeat_task,
                         resolution_sweep_task,
@@ -3345,6 +3380,12 @@ class Runner:
         try:
             await self.sensor_stream.stop()
         except BaseException as exc:  # pragma: no cover - defensive
+            if stop_error is None:
+                stop_error = exc
+
+        try:
+            await self._discard_pending_actuator_work()
+        except BaseException as exc:
             if stop_error is None:
                 stop_error = exc
 
