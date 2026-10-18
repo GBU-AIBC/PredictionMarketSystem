@@ -199,6 +199,10 @@ def test_token_redaction_covers_adjacent_and_url_encoded_tokens() -> None:
     assert _redact(f"Bearer%20{long_token.replace('/', '%2F')}suffix", long_token) == (
         "Bearer%20[REDACTED]suffix"
     )
+    encoded_token = "sec/ret tok"
+    assert _redact("sec%2fret%20tok", encoded_token) == "[REDACTED]"
+    assert _redact("sec%2Fret%20tok", encoded_token) == "[REDACTED]"
+    assert _redact("sec%2Fret+tok", encoded_token) == "[REDACTED]"
 
 
 @pytest.mark.asyncio

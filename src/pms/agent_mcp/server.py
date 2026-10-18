@@ -6,12 +6,13 @@ import asyncio
 import inspect
 import math
 import os
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal, cast
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus
 
 import httpx
 from pydantic import RootModel
@@ -483,7 +484,16 @@ def _redact(value: str, token: str) -> str:
     if not token:
         return value
     redacted = value.replace(token, "[REDACTED]")
-    encoded_token = quote(token, safe="")
-    if encoded_token != token:
-        redacted = redacted.replace(encoded_token, "[REDACTED]")
+    for encoded_token in (
+        quote(token),
+        quote(token, safe=""),
+        quote_plus(token, safe=""),
+    ):
+        if encoded_token != token:
+            redacted = re.sub(
+                re.escape(encoded_token),
+                "[REDACTED]",
+                redacted,
+                flags=re.IGNORECASE,
+            )
     return redacted
