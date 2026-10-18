@@ -246,7 +246,7 @@ async def test_market_universe_replay_engine_rejects_empty_filter_match() -> Non
 
 
 def test_parse_jsonl_events_rejects_symlink_file(tmp_path: Path) -> None:
-    from pms.research.replay import _parse_jsonl_events
+    from pms.research.replay import _iter_jsonl_events
 
     target_path = tmp_path / "target-replay.jsonl"
     _write_replay_jsonl(target_path)
@@ -254,14 +254,14 @@ def test_parse_jsonl_events_rejects_symlink_file(tmp_path: Path) -> None:
     path.symlink_to(target_path)
 
     with pytest.raises(ValueError, match="replay JSONL cannot be read safely"):
-        _parse_jsonl_events(path)
+        list(_iter_jsonl_events(path, {}))
 
 
 def test_parse_jsonl_events_opens_file_with_no_follow_when_available(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from pms.research.replay import _parse_jsonl_events
+    from pms.research.replay import _iter_jsonl_events
 
     no_follow_flag = getattr(os, "O_NOFOLLOW", 0)
     if no_follow_flag == 0:
@@ -282,7 +282,10 @@ def test_parse_jsonl_events_opens_file_with_no_follow_when_available(
 
     monkeypatch.setattr(os, "open", recording_open)
 
-    metadata, events = _parse_jsonl_events(path)
+    from pms.research.replay import _MarketMetadata
+
+    metadata: dict[str, _MarketMetadata] = {}
+    events = list(_iter_jsonl_events(path, metadata))
 
     observed_by_path = {observed_path: flags for observed_path, flags in observed}
     assert set(metadata) == {"market-cancel"}
@@ -294,7 +297,7 @@ def test_parse_jsonl_events_rejects_hardlink_swap_during_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from pms.research.replay import _parse_jsonl_events
+    from pms.research.replay import _iter_jsonl_events
 
     path = tmp_path / "replay.jsonl"
     _write_replay_jsonl(path)
@@ -319,6 +322,6 @@ def test_parse_jsonl_events_rejects_hardlink_swap_during_read(
     monkeypatch.setattr(os, "open", swapping_open)
 
     with pytest.raises(ValueError, match="replay JSONL cannot be read safely"):
-        _parse_jsonl_events(path)
+        list(_iter_jsonl_events(path, {}))
 
     assert swapped is True

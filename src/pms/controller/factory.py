@@ -32,7 +32,7 @@ from pms.controller.outcome_tokens import (
     NullOutcomeTokenResolver,
     OutcomeTokenResolver,
 )
-from pms.controller.pipeline import ControllerPipeline, DirectBookSnapshotReader
+from pms.controller.pipeline import ControllerPipeline, DirectBookSnapshotReader, HistoricalBookReader
 from pms.controller.router import Router
 from pms.controller.sizers.kelly import KellySizer
 from pms.core.interfaces import IForecaster
@@ -55,6 +55,7 @@ class ControllerPipelineFactory:
         default_factory=NullOutcomeTokenResolver
     )
     direct_book_reader: DirectBookSnapshotReader | None = None
+    historical_book_reader: HistoricalBookReader | None = None
     evidence_reader: EvidenceReader | None = None
     replay_store: LLMReplayStore | None = None
 
@@ -76,6 +77,7 @@ class ControllerPipelineFactory:
             factor_reader=self.factor_reader,
             outcome_token_resolver=self.outcome_token_resolver,
             direct_book_reader=self.direct_book_reader,
+            historical_book_reader=self.historical_book_reader,
             forecasters=self._build_forecasters(strategy),
             calibrator=NetcalCalibrator(),
             sizer=KellySizer(

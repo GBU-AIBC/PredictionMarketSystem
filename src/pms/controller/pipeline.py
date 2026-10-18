@@ -94,6 +94,12 @@ class DirectBookSnapshotReader(Protocol):
     async def read_levels_for_snapshot(self, snapshot_id: int) -> list[BookLevel]: ...
 
 
+class HistoricalBookReader(Protocol):
+    async def signal_at(
+        self, ts: datetime, *, market_id: str, token_id: str | None,
+    ) -> MarketSignal: ...
+
+
 @dataclass(frozen=True, slots=True)
 class _DirectBookRead:
     signal: MarketSignal | None
@@ -149,6 +155,7 @@ class ControllerPipeline:
         default_factory=NullOutcomeTokenResolver
     )
     direct_book_reader: DirectBookSnapshotReader | None = None
+    historical_book_reader: HistoricalBookReader | None = None
     forecasters: Sequence[IForecaster] | None = None
     calibrator: ICalibrator | None = None
     sizer: ISizer | None = None
@@ -750,7 +757,10 @@ class ControllerPipeline:
         if (
             strategy_metadata(self.strategy).get("price_reference") == "best_ask"
         ):
-            direct_required = not _decision_uses_signal_orderbook(
+            direct_required = (
+                self.settings.mode == RunMode.BACKTEST
+                and self.historical_book_reader is not None
+            ) or not _decision_uses_signal_orderbook(
                 execution_signal,
                 token_id=decision_token_id,
                 outcome=decision_outcome,
@@ -1233,35 +1243,56 @@ class ControllerPipeline:
         outcome: Literal["YES", "NO"],
         price_coordinate: Literal["canonical_yes", "target_token"] = "canonical_yes",
     ) -> _DirectBookRead:
-        if token_id is None or self.direct_book_reader is None:
+        historical = self.settings.mode == RunMode.BACKTEST
+        reader = self.historical_book_reader if historical else self.direct_book_reader
+        if token_id is None or reader is None:
             failure = "missing_token_id" if token_id is None else "reader_unavailable"
             return _DirectBookRead(signal=None, failure=failure)
+        historical_signal: MarketSignal | None = None
+        orderbook: dict[str, Any] | None
         try:
-            snapshot = await self.direct_book_reader.read_latest_snapshot(
-                signal.market_id,
-                token_id,
-            )
-            if snapshot is None:
-                return _DirectBookRead(signal=None, failure="snapshot_missing")
-            snapshot_ts = _aware_utc(snapshot.ts)
-            age_ms = max(
-                0.0,
-                (datetime.now(tz=UTC) - snapshot_ts).total_seconds() * 1000.0,
-            )
+            if historical:
+                assert self.historical_book_reader is not None
+                try:
+                    historical_signal = await self.historical_book_reader.signal_at(
+                        signal.fetched_at, market_id=signal.market_id, token_id=token_id,
+                    )
+                except LookupError:
+                    return _DirectBookRead(signal=None, failure="snapshot_missing")
+                snapshot_ts = _aware_utc(
+                    _external_signal_datetime(historical_signal.external_signal.get("book_received_at"))
+                    or historical_signal.fetched_at
+                )
+                if historical_signal.fetched_at > signal.fetched_at or snapshot_ts > signal.fetched_at:
+                    return _DirectBookRead(signal=None, failure="future_snapshot")
+                orderbook = _orderbook_from_levels([
+                    BookLevel(0, signal.market_id, cast(Literal["BUY", "SELL"], side), level["price"], level["size"])
+                    for key, side in (("bids", "BUY"), ("asks", "SELL"))
+                    for level in historical_signal.orderbook.get(key, [])
+                ])
+                source = "replay"
+                now = _aware_utc(signal.fetched_at)
+            else:
+                assert self.direct_book_reader is not None
+                snapshot = await self.direct_book_reader.read_latest_snapshot(signal.market_id, token_id)
+                if snapshot is None:
+                    return _DirectBookRead(signal=None, failure="snapshot_missing")
+                snapshot_ts = _aware_utc(snapshot.ts)
+                levels = await self.direct_book_reader.read_levels_for_snapshot(snapshot.id)
+                orderbook = _orderbook_from_levels(levels)
+                source = snapshot.source
+                now = datetime.now(tz=UTC)
+            age_ms = max(0.0, (now - snapshot_ts).total_seconds() * 1000.0)
             if age_ms > self.settings.controller.max_book_age_ms:
                 return _DirectBookRead(signal=None, failure="stale", age_ms=age_ms)
-            levels = await self.direct_book_reader.read_levels_for_snapshot(snapshot.id)
         except Exception as error:  # noqa: BLE001
             logger.warning(
                 "direct outcome book read failed for %s/%s: %s",
-                signal.market_id,
-                token_id,
-                error,
+                signal.market_id, token_id, error,
             )
             return _DirectBookRead(signal=None, failure="read_failed")
 
-        orderbook = _orderbook_from_levels(levels)
-        if orderbook is None:
+        if orderbook is None or not orderbook.get("asks"):
             return _DirectBookRead(signal=None, failure="levels_missing", age_ms=age_ms)
         external_signal: dict[str, Any] = {
             key: value
@@ -1273,14 +1304,19 @@ class ControllerPipeline:
                 "signal_token_outcome": outcome,
                 "book_age_ms": age_ms,
                 "book_received_at": snapshot_ts.isoformat(),
-                "direct_outcome_book_source": snapshot.source,
+                "direct_outcome_book_source": source,
             }
         )
-        fee_rate_bps = await _read_direct_fee_rate_bps(
-            self.direct_book_reader,
-            market_id=signal.market_id,
-            token_id=token_id,
-        )
+        if historical_signal is not None:
+            raw_fee = historical_signal.external_signal.get("fee_rate_bps")
+            fee_rate_bps = (
+                float(raw_fee) if isinstance(raw_fee, (int, float))
+                and isfinite(raw_fee) and 0.0 <= raw_fee <= 10_000.0 else None
+            )
+        else:
+            fee_rate_bps = await _read_direct_fee_rate_bps(
+                self.direct_book_reader, market_id=signal.market_id, token_id=token_id,
+            )
         if fee_rate_bps is not None:
             external_signal["fee_rate_bps"] = fee_rate_bps
         best_bid = _best_level(orderbook, "bids")

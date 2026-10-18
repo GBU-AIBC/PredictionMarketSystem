@@ -43,6 +43,19 @@ class HistoricalSensor:
             yield signal
             previous = signal.fetched_at
 
+    async def signal_at(
+        self, ts: datetime, *, market_id: str, token_id: str | None,
+    ) -> MarketSignal:
+        latest: MarketSignal | None = None
+        for row in _read_rows(self.data_path):
+            signal = _row_to_signal(row)
+            if signal.market_id == market_id and signal.token_id == token_id and signal.fetched_at <= ts:
+                if latest is None or signal.fetched_at >= latest.fetched_at:
+                    latest = signal
+        if latest is None:
+            raise LookupError(f"no historical book as of {ts} for {market_id!r}/{token_id!r}")
+        return latest
+
     def _load_signals(self) -> list[MarketSignal]:
         rows = [_row_to_signal(row) for row in _read_rows(self.data_path)]
         return sorted(rows, key=lambda signal: signal.fetched_at)

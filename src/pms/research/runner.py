@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+import json
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import aclosing, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -17,9 +19,10 @@ import asyncpg
 
 from pms.actuator.risk import InsufficientLiquidityError
 from pms.controller.factory import ControllerPipelineFactory
+from pms.controller.pipeline import HistoricalBookReader
 from pms.controller.factor_snapshot import PostgresFactorSnapshotReader
 from pms.controller.outcome_tokens import MarketDataOutcomeTokenResolver
-from pms.core.enums import OrderStatus
+from pms.core.enums import OrderStatus, RunMode
 from pms.core.models import (
     FillRecord,
     MarketSignal,
@@ -251,6 +254,7 @@ class _StrategyAccumulator:
     execution_model: ExecutionModel
     started_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
     finished_at: datetime | None = None
+    controller_rejection_counts: dict[str, int] = field(default_factory=dict)
     opportunity_count: int = 0
     decision_count: int = 0
     fill_count: int = 0
@@ -510,6 +514,7 @@ class _StrategyAccumulator:
             serialize_portfolio_target_json(self.portfolio_target()),
             self.started_at,
             self.finished_at,
+            json.dumps(self.controller_rejection_counts, sort_keys=True),
         )
 
 
@@ -537,7 +542,11 @@ class BacktestRunner:
         if replay_target is None and hasattr(self.execution_simulator, "replay_engine"):
             setattr(self.execution_simulator, "replay_engine", self.replay_engine)
         if isinstance(self.controller_factory, ControllerPipelineFactory):
+            self.controller_factory.settings = self.controller_factory.settings.model_copy(
+                update={"mode": RunMode.BACKTEST}
+            )
             market_data_store = PostgresMarketDataStore(self.readonly_pool)
+            self.controller_factory.historical_book_reader = cast(HistoricalBookReader, self.replay_engine)
             self.controller_factory.factor_reader = PostgresFactorSnapshotReader(
                 self.readonly_pool
             )
@@ -634,144 +643,154 @@ class BacktestRunner:
         order_decisions: dict[str, TradeDecision] = {}
 
         evaluation_cutoff = evaluation_as_of or datetime.now(tz=UTC)
-        async for signal in replay_engine.stream(spec, exec_config):
-            scoring_signal = _signal_with_replay_resolution(
-                signal,
-                replay_engine,
-                evaluation_as_of=evaluation_cutoff,
-            )
-            slice_descriptors = _slice_descriptors(
-                signal=signal,
-                spec=spec,
-                exec_config=exec_config,
-            )
-            for advanced_state in await _advance_open_orders(
-                self.execution_simulator,
-                signal=signal,
-                execution_model=spec.execution_model,
-            ):
-                decision_for_fill = order_decisions.get(advanced_state.order_id)
-                if decision_for_fill is None:
-                    msg = f"missing cached decision for order_id={advanced_state.order_id}"
-                    raise AssertionError(msg)
+        stream = replay_engine.stream(spec, exec_config)
+        async with (aclosing(stream) if isinstance(stream, AsyncGenerator) else nullcontext(stream)):
+            async for signal in stream:
+                scoring_signal = _signal_with_replay_resolution(
+                    signal,
+                    replay_engine,
+                    evaluation_as_of=evaluation_cutoff,
+                )
+                slice_descriptors = _slice_descriptors(
+                    signal=signal,
+                    spec=spec,
+                    exec_config=exec_config,
+                )
+                for advanced_state in await _advance_open_orders(
+                    self.execution_simulator,
+                    signal=signal,
+                    execution_model=spec.execution_model,
+                ):
+                    decision_for_fill = order_decisions.get(advanced_state.order_id)
+                    if decision_for_fill is None:
+                        msg = f"missing cached decision for order_id={advanced_state.order_id}"
+                        raise AssertionError(msg)
+                    prior_notional, prior_quantity = observed_order_totals.get(
+                        advanced_state.order_id,
+                        (0.0, 0.0),
+                    )
+                    observed_order_totals[advanced_state.order_id] = (
+                        advanced_state.filled_notional_usdc,
+                        advanced_state.filled_quantity,
+                    )
+                    fill = _fill_from_order(
+                        advanced_state,
+                        decision=decision_for_fill,
+                        signal=scoring_signal,
+                        prior_filled_notional_usdc=prior_notional,
+                        prior_filled_quantity=prior_quantity,
+                        execution_model=spec.execution_model,
+                    )
+                    if advanced_state.status in {
+                        OrderStatus.MATCHED.value,
+                        OrderStatus.CANCELLED.value,
+                        OrderStatus.CANCELED_MARKET_RESOLVED.value,
+                        "rejected",
+                    }:
+                        order_decisions.pop(advanced_state.order_id, None)
+                        observed_order_totals.pop(advanced_state.order_id, None)
+                        if fill is None:
+                            accumulator.record_execution_rejection(
+                                signal=scoring_signal,
+                                decision=decision_for_fill,
+                                rejection_reason=advanced_state.raw_status,
+                            )
+                    if fill is None:
+                        continue
+                    portfolio = _portfolio_with_fill(portfolio, fill)
+                    accumulator.record_fill(
+                        signal=scoring_signal,
+                        decision=decision_for_fill,
+                        fill=fill,
+                    )
+                    for slice_descriptor in slice_descriptors:
+                        accumulator.record_slice_fill(
+                            signal=scoring_signal,
+                            decision=decision_for_fill,
+                            fill=fill,
+                            slice_descriptor=slice_descriptor,
+                        )
+                if hasattr(pipeline, "last_diagnostic"):
+                    setattr(pipeline, "last_diagnostic", None)
+                emission = await pipeline.on_signal(signal, portfolio=portfolio)
+                if emission is None:
+                    diagnostic = getattr(pipeline, "last_diagnostic", None)
+                    code = getattr(diagnostic, "code", None)
+                    if isinstance(code, str) and code:
+                        accumulator.controller_rejection_counts[code] = (
+                            accumulator.controller_rejection_counts.get(code, 0) + 1
+                        )
+                    continue
+                opportunity, decision = emission
+                accumulator.record_decision(
+                    signal=scoring_signal,
+                    opportunity=opportunity,
+                    decision=decision,
+                )
+                for slice_descriptor in slice_descriptors:
+                    accumulator.record_slice_decision(
+                        signal=scoring_signal,
+                        opportunity=opportunity,
+                        decision=decision,
+                        slice_descriptor=slice_descriptor,
+                    )
+                try:
+                    order_state = await self.execution_simulator.execute(
+                        signal=signal,
+                        decision=cast(Any, decision),
+                        portfolio=portfolio,
+                        execution_model=spec.execution_model,
+                    )
+                except InsufficientLiquidityError:
+                    accumulator.record_execution_rejection(
+                        signal=signal,
+                        decision=cast(TradeDecision, decision),
+                        rejection_reason="insufficient_liquidity",
+                    )
+                    continue
+                order_decisions[order_state.order_id] = cast(TradeDecision, decision)
                 prior_notional, prior_quantity = observed_order_totals.get(
-                    advanced_state.order_id,
+                    order_state.order_id,
                     (0.0, 0.0),
                 )
-                observed_order_totals[advanced_state.order_id] = (
-                    advanced_state.filled_notional_usdc,
-                    advanced_state.filled_quantity,
+                observed_order_totals[order_state.order_id] = (
+                    order_state.filled_notional_usdc,
+                    order_state.filled_quantity,
                 )
                 fill = _fill_from_order(
-                    advanced_state,
-                    decision=decision_for_fill,
+                    order_state,
+                    decision=cast(TradeDecision, decision),
                     signal=scoring_signal,
                     prior_filled_notional_usdc=prior_notional,
                     prior_filled_quantity=prior_quantity,
                     execution_model=spec.execution_model,
                 )
-                if advanced_state.status in {
-                    OrderStatus.MATCHED.value,
-                    OrderStatus.CANCELLED.value,
-                    OrderStatus.CANCELED_MARKET_RESOLVED.value,
-                    "rejected",
-                }:
-                    order_decisions.pop(advanced_state.order_id, None)
-                    observed_order_totals.pop(advanced_state.order_id, None)
-                    if fill is None:
-                        accumulator.record_execution_rejection(
-                            signal=scoring_signal,
-                            decision=decision_for_fill,
-                            rejection_reason=advanced_state.raw_status,
-                        )
                 if fill is None:
+                    accumulator.record_execution_rejection(
+                        signal=signal,
+                        decision=cast(TradeDecision, decision),
+                        rejection_reason=order_state.raw_status,
+                    )
                     continue
                 portfolio = _portfolio_with_fill(portfolio, fill)
                 accumulator.record_fill(
                     signal=scoring_signal,
-                    decision=decision_for_fill,
+                    decision=decision,
                     fill=fill,
                 )
                 for slice_descriptor in slice_descriptors:
                     accumulator.record_slice_fill(
                         signal=scoring_signal,
-                        decision=decision_for_fill,
+                        decision=decision,
                         fill=fill,
                         slice_descriptor=slice_descriptor,
                     )
-            emission = await pipeline.on_signal(signal, portfolio=portfolio)
-            if emission is None:
-                continue
-            opportunity, decision = emission
-            accumulator.record_decision(
-                signal=scoring_signal,
-                opportunity=opportunity,
-                decision=decision,
-            )
-            for slice_descriptor in slice_descriptors:
-                accumulator.record_slice_decision(
-                    signal=scoring_signal,
-                    opportunity=opportunity,
-                    decision=decision,
-                    slice_descriptor=slice_descriptor,
-                )
-            try:
-                order_state = await self.execution_simulator.execute(
-                    signal=signal,
-                    decision=cast(Any, decision),
-                    portfolio=portfolio,
-                    execution_model=spec.execution_model,
-                )
-            except InsufficientLiquidityError:
-                accumulator.record_execution_rejection(
-                    signal=signal,
-                    decision=cast(TradeDecision, decision),
-                    rejection_reason="insufficient_liquidity",
-                )
-                continue
-            order_decisions[order_state.order_id] = cast(TradeDecision, decision)
-            prior_notional, prior_quantity = observed_order_totals.get(
-                order_state.order_id,
-                (0.0, 0.0),
-            )
-            observed_order_totals[order_state.order_id] = (
-                order_state.filled_notional_usdc,
-                order_state.filled_quantity,
-            )
-            fill = _fill_from_order(
-                order_state,
-                decision=cast(TradeDecision, decision),
-                signal=scoring_signal,
-                prior_filled_notional_usdc=prior_notional,
-                prior_filled_quantity=prior_quantity,
-                execution_model=spec.execution_model,
-            )
-            if fill is None:
-                accumulator.record_execution_rejection(
-                    signal=signal,
-                    decision=cast(TradeDecision, decision),
-                    rejection_reason=order_state.raw_status,
-                )
-                continue
-            portfolio = _portfolio_with_fill(portfolio, fill)
-            accumulator.record_fill(
-                signal=scoring_signal,
-                decision=decision,
-                fill=fill,
-            )
-            for slice_descriptor in slice_descriptors:
-                accumulator.record_slice_fill(
-                    signal=scoring_signal,
-                    decision=decision,
-                    fill=fill,
-                    slice_descriptor=slice_descriptor,
-                )
-            if order_state.status in {
-                OrderStatus.MATCHED.value,
-                OrderStatus.CANCELLED.value,
-                "rejected",
-            }:
-                order_decisions.pop(order_state.order_id, None)
+                if order_state.status in {
+                    OrderStatus.MATCHED.value,
+                    OrderStatus.CANCELLED.value,
+                    "rejected",
+                }:
+                    order_decisions.pop(order_state.order_id, None)
 
         for final_state in await _cancel_open_orders(
             self.execution_simulator,
@@ -902,10 +921,11 @@ class BacktestRunner:
                             fill_count,
                             portfolio_target_json,
                             started_at,
-                            finished_at
+                            finished_at,
+                            controller_rejection_counts_json
                         ) VALUES (
                             $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9,
-                            $10, $11, $12, $13::jsonb, $14, $15
+                            $10, $11, $12, $13::jsonb, $14, $15, $16::jsonb
                         )
                         """,
                         *accumulator.as_insert_args(run_id=run_id),

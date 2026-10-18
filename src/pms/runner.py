@@ -1621,6 +1621,10 @@ class Runner:
                 factor_reader=PostgresFactorSnapshotReader(self._pg_pool),
                 outcome_token_resolver=MarketDataOutcomeTokenResolver(market_data_store),
                 direct_book_reader=direct_book_reader,
+                historical_book_reader=(
+                    HistoricalSensor(self.historical_data_path)
+                    if self.config.mode == RunMode.BACKTEST else None
+                ),
                 evidence_reader=AgentEvidenceObservationSource(
                     AgentEvidenceStore(self._pg_pool)
                 ),
@@ -5452,7 +5456,9 @@ def _controller_can_refresh_queued_book(controller: object) -> bool:
 def _controller_direct_book_reader(
     settings: PMSSettings,
     market_data_store: PostgresMarketDataStore,
-) -> PostgresMarketDataStore | RefreshingDirectBookSnapshotReader:
+) -> PostgresMarketDataStore | RefreshingDirectBookSnapshotReader | None:
+    if settings.mode == RunMode.BACKTEST:
+        return None
     if not settings.controller.venue_book_refresh_enabled:
         return market_data_store
     return RefreshingDirectBookSnapshotReader(

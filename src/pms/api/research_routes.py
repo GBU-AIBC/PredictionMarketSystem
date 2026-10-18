@@ -27,6 +27,7 @@ _ORPHANED_FAILURE_REASON = "orphaned (worker process gone)"
 _JSON_COLUMN_NAMES = frozenset(
     {
         "benchmark_rows",
+        "controller_rejection_counts",
         "equity_delta_json",
         "exec_config_json",
         "portfolio_target_json",
@@ -143,6 +144,7 @@ async def list_backtest_strategy_runs(
                 decision_count,
                 fill_count,
                 portfolio_target_json,
+                controller_rejection_counts_json AS controller_rejection_counts,
                 started_at,
                 finished_at
             FROM strategy_runs
