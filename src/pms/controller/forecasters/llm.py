@@ -62,6 +62,8 @@ class _BudgetTracker:
     daily_cost_usdc: Decimal = Decimal("0")
     ledger_path: Path | None = None
     ledger_loaded: bool = False
+    ledger_file_day: date | None = None
+    reservation_days: dict[Decimal, list[date]] = field(default_factory=dict)
 
 
 _BUDGET_TRACKERS: dict[str, tuple[ReferenceType[LLMSettings], _BudgetTracker]] = {}
@@ -739,8 +741,15 @@ class LLMForecaster:
     def _settle_budget(self, reserved: Decimal, actual: Decimal) -> None:
         tracker = self._budget_tracker()
         with tracker.lock:
+            reservation_day = _take_reservation_day(tracker, reserved)
             with _budget_ledger_lock(tracker):
-                _refresh_budget_ledger(tracker)
+                _refresh_budget_ledger(tracker, today=reservation_day)
+                if (
+                    tracker.ledger_path is not None
+                    and tracker.ledger_file_day is not None
+                    and tracker.ledger_file_day != reservation_day
+                ):
+                    return
                 tracker.daily_cost_usdc = max(
                     Decimal("0"), tracker.daily_cost_usdc - reserved + actual
                 )
@@ -771,13 +780,21 @@ class LLMForecaster:
                     return False
                 tracker.daily_cost_usdc += estimated_cost_usdc
                 _write_budget_ledger(tracker)
+                tracker.reservation_days.setdefault(estimated_cost_usdc, []).append(today)
                 return True
 
     def _refund_budget(self, estimated_cost_usdc: Decimal) -> None:
         tracker = self._budget_tracker()
         with tracker.lock:
+            reservation_day = _take_reservation_day(tracker, estimated_cost_usdc)
             with _budget_ledger_lock(tracker):
-                _refresh_budget_ledger(tracker)
+                _refresh_budget_ledger(tracker, today=reservation_day)
+                if (
+                    tracker.ledger_path is not None
+                    and tracker.ledger_file_day is not None
+                    and tracker.ledger_file_day != reservation_day
+                ):
+                    return
                 tracker.daily_cost_usdc = max(
                     Decimal("0"),
                     tracker.daily_cost_usdc - estimated_cost_usdc,
@@ -1193,6 +1210,7 @@ def _load_budget_ledger(tracker: _BudgetTracker, today: date) -> None:
         if parsed_date == today:
             tracker.cost_day = today
             tracker.daily_cost_usdc = cost
+        tracker.ledger_file_day = parsed_date
         tracker.ledger_loaded = True
     except (OSError, ValueError, TypeError, InvalidOperation, json.JSONDecodeError) as exc:
         raise LLMProviderUnavailableError(
@@ -1212,10 +1230,21 @@ def _refresh_budget_ledger(
             tracker.daily_cost_usdc = Decimal("0")
         return
     tracker.ledger_loaded = False
+    tracker.ledger_file_day = None
     refresh_day = _today_utc() if today is None else today
     tracker.cost_day = refresh_day
     tracker.daily_cost_usdc = Decimal("0")
     _load_budget_ledger(tracker, refresh_day)
+
+
+def _take_reservation_day(tracker: _BudgetTracker, reserved: Decimal) -> date:
+    days = tracker.reservation_days.get(reserved)
+    if days:
+        reservation_day = days.pop(0)
+        if not days:
+            del tracker.reservation_days[reserved]
+        return reservation_day
+    return _today_utc()
 
 
 @contextmanager
