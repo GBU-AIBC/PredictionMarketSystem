@@ -125,6 +125,9 @@ async def test_create_strategy_and_list_strategies(
     assert isinstance(rows[0], strategy_row_cls)
     assert rows[0].strategy_id == "default"
     assert rows[0].active_version_id is None
+    assert await db_conn.fetchval(
+        "SELECT share_enabled FROM strategies WHERE strategy_id = 'default'"
+    ) is False
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -169,13 +172,15 @@ async def test_create_version_and_get_by_id_round_trip_strategy(
     registry = registry_cls(pool=cast(Any, _SingleConnectionPool(db_conn)))
     strategy = _strategy("default", owner="system", drawdown_pct=2.5)
 
-    await registry.create_strategy("default", metadata={"owner": "system"})
     created_version = await registry.create_version(strategy)
     fetched_strategy = await registry.get_by_id("default")
 
     assert isinstance(created_version, strategy_version_cls)
     assert created_version.strategy_version_id == compute_strategy_version_id(*strategy.snapshot())
     assert fetched_strategy == strategy
+    assert await db_conn.fetchval(
+        "SELECT share_enabled FROM strategies WHERE strategy_id = 'default'"
+    ) is False
 
 
 @pytest.mark.asyncio(loop_scope="session")

@@ -12,6 +12,7 @@ import pytest
 from pms.api.app import create_app
 from pms.config import DatabaseSettings, PMSSettings
 from pms.runner import Runner
+from pms.storage.strategy_registry import PostgresStrategyRegistry
 from pms.strategies.projections import (
     EvalSpec,
     ForecasterSpec,
@@ -77,7 +78,7 @@ async def _seed_strategy(
     title: str,
     description: str,
     archived: bool = False,
-    share_enabled: bool = True,
+    share_enabled: bool = False,
     metadata_json: dict[str, object] | None = None,
     secret_api_key: str | None = None,
 ) -> None:
@@ -226,6 +227,7 @@ async def test_share_route_returns_safe_allowlist_projection_and_hides_secrets(
             strategy_version_id="alpha-v1234567",
             title="Alpha Theory",
             description="Buy dislocations when liquidity is deep.",
+            share_enabled=True,
             metadata_json={
                 "api_key": "SECRET_AK",
                 "private_key": "SECRET_PK",
@@ -299,6 +301,7 @@ async def test_share_route_returns_neutral_404_for_unknown_archived_and_unshared
             title="Archived Theory",
             description="Old idea.",
             archived=True,
+            share_enabled=True,
         )
         await _seed_strategy(
             connection,
@@ -319,3 +322,35 @@ async def test_share_route_returns_neutral_404_for_unknown_archived_and_unshared
         assert response.json() == {
             "detail": "This strategy doesn't exist or has been unshared"
         }
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_new_strategy_is_private_until_explicitly_shared(
+    pg_pool: asyncpg.Pool,
+) -> None:
+    registry = PostgresStrategyRegistry(pg_pool)
+    await registry.create_strategy("private")
+
+    async with _client(pg_pool) as client:
+        response = await client.get("/share/private")
+        assert response.status_code == 404
+        assert response.json() == {
+            "detail": "This strategy doesn't exist or has been unshared"
+        }
+
+        async with pg_pool.acquire() as connection:
+            await connection.execute(
+                "UPDATE strategies SET share_enabled = TRUE WHERE strategy_id = 'private'"
+            )
+
+        shared = await client.get("/share/private")
+
+    assert shared.status_code == 200
+    assert shared.json() == {
+        "strategy_id": "private",
+        "title": None,
+        "description": None,
+        "brier_overall": None,
+        "trade_count": 0,
+        "version_id_short": None,
+    }

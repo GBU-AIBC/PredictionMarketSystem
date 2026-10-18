@@ -137,6 +137,19 @@ def test_schema_sql_applies_strategy_identity_tables() -> None:
 
         assert actual_columns == EXPECTED_COLUMNS
 
+        share_default = _run_psql(
+            temp_database_url,
+            "-At",
+            "-c",
+            "INSERT INTO strategies (strategy_id) VALUES ('private') RETURNING share_enabled",
+        )
+        assert share_default.stdout.splitlines()[0] == "f"
+        _run_psql(
+            temp_database_url,
+            "-c",
+            "DELETE FROM strategies WHERE strategy_id = 'private'",
+        )
+
         counts_result = _run_psql(
             temp_database_url,
             "-At",

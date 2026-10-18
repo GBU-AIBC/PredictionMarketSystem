@@ -247,7 +247,7 @@ CREATE TABLE IF NOT EXISTS strategies (
     title TEXT,
     description TEXT,
     archived BOOLEAN NOT NULL DEFAULT FALSE,
-    share_enabled BOOLEAN NOT NULL DEFAULT TRUE
+    share_enabled BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 -- strategy_versions: immutable hash-keyed version rows (Invariant 3)
